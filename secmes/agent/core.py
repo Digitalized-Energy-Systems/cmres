@@ -293,9 +293,15 @@ class AgentController(Controller):
                 for j, (k, v) in enumerate(agent_states.items()):
                     if len(x) <= j:
                         x.append([])
-                        y.append([])
+                        if isinstance(v, tuple):
+                            y.append({})
+                        else:
+                            y.append([])
                         txt.append(k)
                     x[j].append(time)
-                    y[j].append(v)
+                    if isinstance(v, tuple):
+                        y[j].append(v)
+                    else:
+                        y[j][v[0]] = v[1]
             result[aid] = (x, y, txt)
         return result

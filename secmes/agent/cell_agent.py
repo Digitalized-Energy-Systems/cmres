@@ -239,9 +239,9 @@ class CellAgentRole(SyncAgentRole, ABC):
                 attraction = self.calc_agent_attraction(
                     neighbor, calculated_region_balance
                 )
-                agent_control_values[f"attraction_{neighbor}_power"] = attraction[0]
-                agent_control_values[f"attraction_{neighbor}_heat"] = attraction[1]
-                agent_control_values[f"attraction_{neighbor}_gas"] = attraction[2]
+                agent_control_values[f"attraction_power"] = (neighbor, attraction[0])
+                agent_control_values[f"attraction_heat"] = (neighbor, attraction[1])
+                agent_control_values[f"attraction_gas"] = (neighbor, attraction[2])
                 if neighbor in region_agents:
                     continue
                 if (attraction <= calculated_region_balance).all():
