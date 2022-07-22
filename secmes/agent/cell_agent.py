@@ -8,6 +8,7 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from threading import local
 
 import numpy as np
 
@@ -19,7 +20,16 @@ from secmes.da.dgd import (
 )
 
 import peext.network as pn
-from peext.node import RegulatableMESModel
+from peext.node import (
+    RegulatableMESModel,
+    PowerLoadNode,
+    P2GNode,
+    P2HNode,
+    CHPNode,
+    G2PNode,
+    SinkNode,
+    HeatExchangerNode,
+)
 
 
 @dataclass
@@ -44,6 +54,10 @@ class CalcOperationPointIteration:
     w: object
     alpha: object
     x: object
+
+
+INVERT_POWER_BALANCE_RATE = {PowerLoadNode, P2GNode, P2HNode}
+INVERT_GAS_BALANCE_RATE = {CHPNode, G2PNode, SinkNode}
 
 
 class CellAgentRole(SyncAgentRole, ABC):
@@ -89,8 +103,7 @@ class CellAgentRole(SyncAgentRole, ABC):
                     if region_m.get_agent_region(neighbor) is not None
                 ]
             )
-            region_id = region_m.register_region(neighbor_regions)
-            region_m.register_agent(self.context.aid, region_id)
+            region_id = region_m.register_region(neighbor_regions, self.context.aid)
             return region_id
         return None
 
@@ -147,9 +160,22 @@ class CellAgentRole(SyncAgentRole, ABC):
                 sum += self.get_or_request_balance(region_agent)
         return sum / len(region_agents)
 
-    def calc_agent_attraction(self, neighbor, calculated_balance):
-        neighbor_balance = self.get_or_request_balance(neighbor)
-        return neighbor_balance + calculated_balance - self.calc_cost_gradient(neighbor)
+    def rate(self, balance):
+        rate_flip = np.array([1, 1, 1])
+        if type(self._local_model) in INVERT_POWER_BALANCE_RATE:
+            rate_flip[0] *= -1
+        if type(self._local_model) in INVERT_GAS_BALANCE_RATE:
+            rate_flip[2] *= -1
+        if type(self._local_model) == HeatExchangerNode:
+            if self._local_model.qext_w() > 0:
+                rate_flip[1] *= -1
+        return rate_flip * balance
+
+    def calc_agent_attraction(self, other, calculated_balance):
+        other_balance = self.get_or_request_balance(other)
+        return self.rate(calculated_balance - other_balance) - self.calc_cost_gradient(
+            other
+        )
 
     def project(self, x, r):
         # cons_x = self._common_nc_data_access.define_local_constraints()(x/(r/10 + 1))
@@ -233,18 +259,24 @@ class CellAgentRole(SyncAgentRole, ABC):
             agent_control_values["region_balance_heat"] = calculated_region_balance[1]
             agent_control_values["region_balance_gas"] = calculated_region_balance[2]
 
+            agent_control_values["attraction_power"] = []
+            agent_control_values["attraction_heat"] = []
+            agent_control_values["attraction_gas"] = []
             neighbors = router.lookup_neighbors(aid)
             for neighbor in neighbors:
-                # TODO für Last bei 0 cutten, Genüberschuss ist positiv!
                 attraction = self.calc_agent_attraction(
                     neighbor, calculated_region_balance
                 )
-                agent_control_values[f"attraction_power"] = (neighbor, attraction[0])
-                agent_control_values[f"attraction_heat"] = (neighbor, attraction[1])
-                agent_control_values[f"attraction_gas"] = (neighbor, attraction[2])
+                agent_control_values["attraction_power"].append(
+                    (neighbor, attraction[0])
+                )
+                agent_control_values["attraction_heat"].append(
+                    (neighbor, attraction[1])
+                )
+                agent_control_values["attraction_gas"].append((neighbor, attraction[2]))
                 if neighbor in region_agents:
                     continue
-                if (attraction <= calculated_region_balance).all():
+                if (attraction >= 0).all():
                     router.dispatch_message_sync(
                         JoinRequest(region, attraction), neighbor, aid
                     )
@@ -325,6 +357,15 @@ class CommonNetworkComponentAccess(ABC):
         pass
 
 
+INVERT_CA_POWER = {PowerLoadNode, P2GNode, P2HNode}
+
+
+def calc_power_balance(local_model):
+    if type(local_model) in INVERT_CA_POWER:
+        return -local_model.active_power()
+    return local_model.active_power()
+
+
 class PowerCA(CommonNetworkComponentAccess):
     def max_energy(self):
         return to_multi_energy(self._local_model.active_power_capability())
@@ -336,8 +377,18 @@ class PowerCA(CommonNetworkComponentAccess):
 
     def calc_balance(self):
         model = self._local_model
-        data_set = pn.get_bus_junc_res_data(model)["power"][0]
-        return to_multi_energy(power=data_set["p_mw"])
+        return to_multi_energy(power=calc_power_balance(model))
+
+
+class GasCA(CommonNetworkComponentAccess):
+    def max_energy(self):
+        return to_multi_energy(gas=self._local_model.mdot_kg_per_s_capability())
+
+    def define_local_constraints(self):
+        return lambda r: gas_constraint(pn.get_bus_junc_res_data(self._local_model), r)
+
+    def calc_balance(self):
+        return to_multi_energy(gas=self._local_model.mdot_kg_per_s())
 
 
 class DummyHeatCA(CommonNetworkComponentAccess):
@@ -377,10 +428,10 @@ class PowerGasCA(CommonNetworkComponentAccess):
         return lambda r: gas_constraint(data, r) and power_constraint(data, r)
 
     def calc_balance(self):
-        data = pn.get_bus_junc_res_data(self._local_model)
 
         return to_multi_energy(
-            power=data["power"][0]["p_mw"], gas=self._local_model.mdot_kg_per_s()
+            power=calc_power_balance(self._local_model),
+            gas=self._local_model.mdot_kg_per_s(),
         )
 
 
@@ -406,7 +457,7 @@ class PowerGasHeatCA(CommonNetworkComponentAccess):
         from_data_set_heat = data_heat[0]
         to_data_set_heat = data_heat[1]
         return to_multi_energy(
-            power=data["power"][0]["p_mw"],
+            power=calc_power_balance(self._local_model),
             heat=from_data_set_heat["t_k"] - to_data_set_heat["t_k"],
             gas=self._local_model.mdot_kg_per_s(),
         )
@@ -429,17 +480,6 @@ class PowerHeatCA(CommonNetworkComponentAccess):
         from_data_set_heat = data_heat[0]
         to_data_set_heat = data_heat[1]
         return to_multi_energy(
-            power=data["power"][0]["p_mw"],
+            power=calc_power_balance(self._local_model),
             heat=from_data_set_heat["t_k"] - to_data_set_heat["t_k"],
         )
-
-
-class GasCA(CommonNetworkComponentAccess):
-    def max_energy(self):
-        return to_multi_energy(gas=self._local_model.mdot_kg_per_s_capability())
-
-    def define_local_constraints(self):
-        return lambda r: gas_constraint(pn.get_bus_junc_res_data(self._local_model), r)
-
-    def calc_balance(self):
-        return to_multi_energy(gas=self._local_model.mdot_kg_per_s())

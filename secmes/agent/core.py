@@ -28,14 +28,14 @@ class SecmesRegionManager:
     def __init__(self) -> None:
         self._region_graph = nx.Graph()
 
-    def register_region(self, neighbor_regions):
+    def register_region(self, neighbor_regions, initial_aid):
         region_id = (
             0
             if len(self._region_graph.nodes) == 0
             else max(self._region_graph.nodes.keys()) + 1
         )
 
-        self._region_graph.add_node(region_id, assigned_agents=[])
+        self._region_graph.add_node(region_id, assigned_agents=[initial_aid])
         for region_neighbor in neighbor_regions:
             self._region_graph.add_edge(region_id, region_neighbor)
         return region_id
@@ -138,6 +138,16 @@ class SecmesAgentRouter:
     def exists(self, agent_id):
         return agent_id in self._agent_topology.nodes
 
+    def get_data_as_copy(self):
+        copy = self._agent_topology.copy()
+
+        # remove agents to enable serializability
+        for node_key in copy.nodes:
+            copy.nodes[node_key]["agent"] = None
+            copy.nodes[node_key]["roles"] = None
+
+        return copy
+
 
 class SecmesRoleAgentContext(RoleAgentContext):
     def __init__(
@@ -222,6 +232,7 @@ class AgentController(Controller):
         names,
         agents,
         region_manager: SecmesRegionManager = None,
+        router: SecmesAgentRouter = None,
         in_service=True,
         order=0,
         level=0,
@@ -244,6 +255,8 @@ class AgentController(Controller):
         self._region_manager = region_manager
         self._region_history = [None, None]
         self._agent_state_data_list = {}
+        self._router = router
+        self._topology_graph_history = []
 
     def initialize_control(self, _):
         self.applied = False
@@ -272,6 +285,8 @@ class AgentController(Controller):
                     agent.post_control(time)
             if self._region_manager is not None:
                 self._region_history.append(self._region_manager.get_data_as_copy())
+        if self._router is not None:
+            self._topology_graph_history.append(self._router.get_data_as_copy())
 
     def control_step(self, _):
         self.applied = True
@@ -281,27 +296,55 @@ class AgentController(Controller):
 
     @property
     def result(self):
-        return self._region_history, self.get_agent_state_data()
+        return (
+            self._region_history,
+            self.get_agent_state_data(),
+            self._topology_graph_history,
+        )
 
     def get_agent_state_data(self):
         result = {}
         for aid, agent_state_list in self._agent_state_data_list.items():
-            x = []
-            y = []
+            x = {}
+            y = {}
             txt = []
             for time, agent_states in agent_state_list:
-                for j, (k, v) in enumerate(agent_states.items()):
-                    if len(x) <= j:
-                        x.append([])
-                        if isinstance(v, tuple):
-                            y.append({})
+                if len(agent_states) <= 0:
+                    continue
+                for k, v in agent_states.items():
+                    if k not in x:
+                        x[k] = []
+                        if isinstance(v, list):
+                            y[k] = {}
+                            for v_el in v:
+                                y[k][v_el[0]] = []
                         else:
-                            y.append([])
+                            y[k] = []
                         txt.append(k)
-                    x[j].append(time)
-                    if isinstance(v, tuple):
-                        y[j].append(v)
+                    x[k].append(time)
+                    if isinstance(v, list):
+                        for v_el in v:
+                            if v_el[0] in y[k]:
+                                y[k][v_el[0]].append(v_el[1])
+                            else:
+                                y[k][v_el[0]] = [None for _ in range(len(x[k]) - 1)] + [
+                                    v_el[1]
+                                ]
+                        for _, vyk in y[k].items():
+                            if len(vyk) != len(x[k]):
+                                vyk.append(None)
                     else:
-                        y[j][v[0]] = v[1]
-            result[aid] = (x, y, txt)
+                        y[k].append(v)
+            result[aid] = to_list_datas(x, y, txt)
         return result
+
+
+def to_list_datas(x, y, label):
+    x_l = []
+    y_l = []
+    label_l = []
+    for k in label:
+        x_l.append(x[k])
+        y_l.append(y[k])
+        label_l.append(k)
+    return x_l, y_l, label_l

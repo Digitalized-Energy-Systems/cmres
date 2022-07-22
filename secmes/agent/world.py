@@ -16,7 +16,12 @@ import pandapipes.multinet.control as ppmc
 import peext.network as network
 from peext.network import MENetwork
 from peext.world.core import MASWorld
-from secmes.agent.core import AgentController, SecmesAgent, SecmesAgentRouter, SecmesRegionManager
+from secmes.agent.core import (
+    AgentController,
+    SecmesAgent,
+    SecmesAgentRouter,
+    SecmesRegionManager,
+)
 from peext.data.core import DataSink, StaticPlottingController
 
 from secmes.rl.drl.dqn import DQNAgent
@@ -25,15 +30,17 @@ from datetime import datetime
 
 from secmes.scenario.fault import Fault, FaultInjector
 
-class AsyncWorld(MASWorld):
 
-    def __init__(self, 
-                    mas_coro_func,
-                    multinet, 
-                    faults: List[Fault] = None,
-                    async_step_time=1/60, 
-                    max_steps=None, 
-                    name='MASWorld') -> None:
+class AsyncWorld(MASWorld):
+    def __init__(
+        self,
+        mas_coro_func,
+        multinet,
+        faults: List[Fault] = None,
+        async_step_time=1 / 60,
+        max_steps=None,
+        name="MASWorld",
+    ) -> None:
         self.__mas_coro_func = mas_coro_func
         self.__multinet = multinet
         self._me_network = None
@@ -48,25 +55,35 @@ class AsyncWorld(MASWorld):
     async def prepare(self):
         self._me_network: MENetwork = network.from_panda_multinet(self.__multinet)
         self._region_manager = SecmesRegionManager()
-        
-        mn_names = self._me_network.multinet['nets'].keys()
+
+        mn_names = self._me_network.multinet["nets"].keys()
 
         # initial single run for initial observation
-        ppmc.run_control_multinet.run_control(self.__multinet, max_iter = 30, mode='all')
-        
+        ppmc.run_control_multinet.run_control(self.__multinet, max_iter=30, mode="all")
+
         # create learning agents and initialize models with network data
-        self._agents = await self.__mas_coro_func(self._me_network, self._region_manager)
+        self._agents, router = await self.__mas_coro_func(
+            self._me_network, self._region_manager
+        )
 
         # create main controller
-        self._plotting_controller = StaticPlottingController(self.__multinet, 
-                                                              mn_names, 
-                                                              self._me_network, 
-                                                              self._max_steps-1,
-                                                              only_collect=True)
-        self._agent_controller = AgentController(self._me_network.multinet, mn_names, self._agents, region_manager=self._region_manager)
+        self._plotting_controller = StaticPlottingController(
+            self.__multinet,
+            mn_names,
+            self._me_network,
+            self._max_steps - 1,
+            only_collect=True,
+        )
+        self._agent_controller = AgentController(
+            self._me_network.multinet,
+            mn_names,
+            self._agents,
+            region_manager=self._region_manager,
+            router=router,
+        )
         self._fault_controller = FaultInjector(self._me_network.multinet, self._faults)
-        
-        # Drop them, they will be called manually 
+
+        # Drop them, they will be called manually
         self.__multinet.controller.drop(self._plotting_controller.index, inplace=True)
         self.__multinet.controller.drop(self._agent_controller.index, inplace=True)
         self.__multinet.controller.drop(self._fault_controller.index, inplace=True)
@@ -82,9 +99,15 @@ class AsyncWorld(MASWorld):
 
     async def step(self):
         try:
-            ppmc.run_control_multinet.run_control(self.__multinet, max_iter = 30, mode='all')
+            ppmc.run_control_multinet.run_control(
+                self.__multinet, max_iter=30, mode="all"
+            )
         except (NetCalculationNotConverged, LoadflowNotConverged) as ex:
-            print("Multi-Net did not converge. This may be caused by invalid controller states: {0}".format(ex))
+            print(
+                "Multi-Net did not converge. This may be caused by invalid controller states: {0}".format(
+                    ex
+                )
+            )
 
         # step time for mango
         await asyncio.sleep(self._async_step_time)
@@ -108,21 +131,24 @@ class AsyncWorld(MASWorld):
             self._agent_controller.time_step(self.__multinet, step_num)
             self._fault_controller.time_step(self.__multinet, step_num)
             step_num += 1
-        
+
         self.write_results()
 
+
 class SyncWorld:
-    """Base for any simulation in secmes. Defines the simulation steps.
-    """
-    def __init__(self, 
-                    agents: List[SecmesAgent], 
-                    router: SecmesAgentRouter, 
-                    me_network: MENetwork, 
-                    faults: List[Fault] = None,
-                    region_manager: SecmesRegionManager = None,
-                    steps = 96 * 30, 
-                    data_sink: DataSink = None, 
-                    name = None) -> None:
+    """Base for any simulation in secmes. Defines the simulation steps."""
+
+    def __init__(
+        self,
+        agents: List[SecmesAgent],
+        router: SecmesAgentRouter,
+        me_network: MENetwork,
+        faults: List[Fault] = None,
+        region_manager: SecmesRegionManager = None,
+        steps=96 * 30,
+        data_sink: DataSink = None,
+        name=None,
+    ) -> None:
         self._agents = agents
         self._router = router
         self._region_manager = region_manager
@@ -131,7 +157,7 @@ class SyncWorld:
         self._steps = steps
         self._name = f"sim-{datetime.now()}" if name is None else name
         self._faults = faults
-        
+
     @property
     def agents(self):
         return self._agents
@@ -139,17 +165,36 @@ class SyncWorld:
     @property
     def name(self):
         return self._name
-        
+
     def step(self):
-        try:        
+        try:
             time_steps = range(self._steps)
-            OutputWriter(self._me_network.multinet['nets']['heat'], time_steps=time_steps, output_path=tempfile.gettempdir(), log_variables=[])
+            OutputWriter(
+                self._me_network.multinet["nets"]["heat"],
+                time_steps=time_steps,
+                output_path=tempfile.gettempdir(),
+                log_variables=[],
+            )
 
-            multinettimeseries.run_timeseries(self._me_network.multinet, time_steps=time_steps, continue_on_divergence=True, mode='all', verbose=False)
+            multinettimeseries.run_timeseries(
+                self._me_network.multinet,
+                time_steps=time_steps,
+                continue_on_divergence=True,
+                mode="all",
+                verbose=False,
+            )
         except (NetCalculationNotConverged, LoadflowNotConverged) as ex:
-            print("Multi-Net did not converge. This may be caused by invalid controller states: {0}".format(ex))
+            print(
+                "Multi-Net did not converge. This may be caused by invalid controller states: {0}".format(
+                    ex
+                )
+            )
 
-    def write_results(self, static_plotting_controller: StaticPlottingController, agent_controller: AgentController):
+    def write_results(
+        self,
+        static_plotting_controller: StaticPlottingController,
+        agent_controller: AgentController,
+    ):
         if not os.path.isdir(self.name):
             os.mkdir(self.name)
         pandapipes.to_pickle(self._me_network.multinet, f"{self.name}/network.p")
@@ -159,12 +204,23 @@ class SyncWorld:
             pickle.dump(agent_controller.result, output_file)
 
     def run(self):
-        """Running the world simulation
-        """
+        """Running the world simulation"""
         # include controller to execute agents
-        mn_names = self._me_network.multinet['nets'].keys()
-        agent_controller = AgentController(self._me_network.multinet, mn_names, self._agents, region_manager=self._region_manager)
-        static_plotting_controller = StaticPlottingController(self._me_network.multinet, mn_names, self._me_network, self._steps-1, only_collect=True)
+        mn_names = self._me_network.multinet["nets"].keys()
+        agent_controller = AgentController(
+            self._me_network.multinet,
+            mn_names,
+            self._agents,
+            region_manager=self._region_manager,
+            router=self._router,
+        )
+        static_plotting_controller = StaticPlottingController(
+            self._me_network.multinet,
+            mn_names,
+            self._me_network,
+            self._steps - 1,
+            only_collect=True,
+        )
         fault_controller = FaultInjector(self._me_network.multinet, self._faults)
 
         # calculate new network results
@@ -172,14 +228,16 @@ class SyncWorld:
 
         # write result to filesystem
         # Remove plotting controller first, as it contains the me_network, which we dont want to serialize
-        self._me_network.multinet.controller.drop(static_plotting_controller.index, inplace=True)
+        self._me_network.multinet.controller.drop(
+            static_plotting_controller.index, inplace=True
+        )
         self._me_network.multinet.controller.drop(agent_controller.index, inplace=True)
         self._me_network.multinet.controller.drop(fault_controller.index, inplace=True)
         self.write_results(static_plotting_controller, agent_controller)
 
 
 class DRLWorld(MASWorld):
-    """World for simulating multiple agents using deep reinforcement learning to tackle some kind of control problem in 
+    """World for simulating multiple agents using deep reinforcement learning to tackle some kind of control problem in
     multi-energy context.
     """
 
@@ -195,9 +253,9 @@ class DRLWorld(MASWorld):
                 if isinstance(role, DQNRole):
                     learning_roles.append(role)
                     break
-                    
+
         return learning_roles
-    
+
     def calc_reward(self, obs, set_points):
         """Calculate the reward for some observation given the set points.
 
@@ -211,7 +269,7 @@ class DRLWorld(MASWorld):
         fitness = 0
 
         for i in range(len(set_points)):
-            fitness -= abs(obs[i]- set_points[i][0])
+            fitness -= abs(obs[i] - set_points[i][0])
         return fitness
 
     def train_agents(self, episodes=10000, duration=200):
@@ -225,16 +283,16 @@ class DRLWorld(MASWorld):
         learning_roles = self.learning_agents()
         for episode in range(episodes):
             obs = {}
-            print('new episode')
+            print("new episode")
             for i in range(duration):
                 for role in learning_roles:
                     drl_agent: DQNAgent = role.drl_agent
-                    
-                    # before episode start 
+
+                    # before episode start
                     # initial observation
                     if i == 0:
                         obs[role] = [value for _, value in role.observation.items()]
-                    
+
                     # best learned action
                     action = drl_agent.predict(obs[role])
                     # set action to agent and step environment
@@ -247,6 +305,6 @@ class DRLWorld(MASWorld):
 
                     drl_agent.train_one_step(reward, new_obs, obs[role], action)
                     obs[role] = new_obs
-                    
+
                     # after episode ends
                     drl_agent.on_after(i, duration, episode)
