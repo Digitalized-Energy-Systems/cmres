@@ -63,7 +63,12 @@ class SecmesRegionManager:
         return self._region_graph.nodes[region_id]["assigned_agents"]
 
     def get_data_as_copy(self):
-        return self._region_graph.copy()
+        region_graph_copy = self._region_graph.copy()
+        for node in region_graph_copy.nodes:
+            region_graph_copy.nodes[node]["assigned_agents"] = region_graph_copy.nodes[
+                node
+            ]["assigned_agents"].copy()
+        return region_graph_copy
 
     def remove_region(self, region_id):
         self._region_graph.remove_node(region_id)

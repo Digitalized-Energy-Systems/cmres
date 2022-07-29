@@ -58,7 +58,7 @@ class AsyncWorld(MASWorld):
 
         mn_names = self._me_network.multinet["nets"].keys()
 
-        # initial single run for initial observation
+        # single run for initial observation
         ppmc.run_control_multinet.run_control(self.__multinet, max_iter=30, mode="all")
 
         # create learning agents and initialize models with network data
@@ -97,8 +97,14 @@ class AsyncWorld(MASWorld):
         with open(f"{self._name}/agent-result.p", "wb") as output_file:
             pickle.dump(self._agent_controller.result, output_file)
 
-    async def step(self):
+    async def step(self, step_num):
         try:
+            # Call ConstControl Controllers
+            for _, net in self.__multinet["nets"].items():
+                for _, row in net.controller.iterrows():
+                    controller = row.object
+                    controller.time_step(net, step_num)
+
             ppmc.run_control_multinet.run_control(
                 self.__multinet, max_iter=30, mode="all"
             )
@@ -125,7 +131,7 @@ class AsyncWorld(MASWorld):
         step_num = 0
         while step_num < self._max_steps:
             # calculate new network results
-            await self.step()
+            await self.step(step_num)
 
             self._plotting_controller.time_step(self.__multinet, step_num)
             self._agent_controller.time_step(self.__multinet, step_num)
