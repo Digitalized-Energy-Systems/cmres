@@ -51,6 +51,7 @@ class AsyncWorld(MASWorld):
         self._name = name
         self._faults = faults
         self._region_manager = None
+        self._container = None
 
     async def prepare(self):
         self._me_network: MENetwork = network.from_panda_multinet(self.__multinet)
@@ -62,7 +63,7 @@ class AsyncWorld(MASWorld):
         ppmc.run_control_multinet.run_control(self.__multinet, max_iter=30, mode="all")
 
         # create learning agents and initialize models with network data
-        self._agents, router = await self.__mas_coro_func(
+        self._agents, router, self._container = await self.__mas_coro_func(
             self._me_network, self._region_manager
         )
 
@@ -138,6 +139,7 @@ class AsyncWorld(MASWorld):
             self._fault_controller.time_step(self.__multinet, step_num)
             step_num += 1
 
+        await self._container.shutdown()
         self.write_results()
 
 

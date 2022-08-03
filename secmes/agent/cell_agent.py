@@ -28,12 +28,16 @@ from peext.node import (
     CHPNode,
     G2PNode,
     SinkNode,
-    HeatExchangerNode,
 )
 
 
 @dataclass
-class BalanceSumRequest:
+class AgentBalanceSumRequest:
+    pass
+
+
+@dataclass
+class RegionBalanceSumRequest:
     pass
 
 
@@ -44,7 +48,12 @@ class JoinRequest:
 
 
 @dataclass
-class BalanceSumAnswer:
+class AgentBalanceSumAnswer:
+    sum: float
+
+
+@dataclass
+class RegionBalanceSumAnswer:
     sum: float
 
 
@@ -75,13 +84,23 @@ class CellAgentRole(SyncAgentRole, ABC):
         )
         self.context.subscribe_message(
             self,
-            self.handle_balance_answer,
-            lambda c, _: isinstance(c, BalanceSumAnswer),
+            self.handle_region_balance_answer,
+            lambda c, _: isinstance(c, RegionBalanceSumAnswer),
         )
         self.context.subscribe_message(
             self,
-            self.handle_balance_request,
-            lambda c, _: isinstance(c, BalanceSumRequest),
+            self.handle_region_balance_request,
+            lambda c, _: isinstance(c, RegionBalanceSumRequest),
+        )
+        self.context.subscribe_message(
+            self,
+            self.handle_agent_balance_answer,
+            lambda c, _: isinstance(c, AgentBalanceSumAnswer),
+        )
+        self.context.subscribe_message(
+            self,
+            self.handle_agent_balance_request,
+            lambda c, _: isinstance(c, AgentBalanceSumRequest),
         )
         self.context.subscribe_message(
             self,
@@ -94,7 +113,10 @@ class CellAgentRole(SyncAgentRole, ABC):
     def create_initial_region(self):
         region_m: SecmesRegionManager = self.region_manager
         router: SecmesAgentRouter = self.router
-        if router.exists(self.context.aid):
+        if (
+            router.exists(self.context.aid)
+            and region_m.get_agent_region(self.context.aid) == None
+        ):
             neighbors = router.lookup_neighbors(self.context.aid)
             neighbor_regions = set(
                 [
@@ -139,24 +161,65 @@ class CellAgentRole(SyncAgentRole, ABC):
             self._environment_perceptions[id] = {}
         self._environment_perceptions[id][key] = value
 
-    def handle_balance_answer(self, content, meta):
-        self._assign_perception(self._get_sender_id(meta), "balance", content.sum)
+    def handle_agent_balance_answer(self, content, meta):
+        self._assign_perception(self._get_sender_id(meta), "agent_balance", content.sum)
 
-    def handle_balance_request(self, _, meta):
+    def handle_region_balance_answer(self, content, meta):
+        self._assign_perception(
+            self.region_manager.get_agent_region(self._get_sender_id(meta)),
+            "region_balance",
+            content.sum,
+        )
+
+    def handle_region_balance_request(self, _, meta):
         router: SecmesAgentRouter = self.router
+        region_m: SecmesRegionManager = self.region_manager
+        region = region_m.get_agent_region(self.context.aid)
+
+        # Request can happen before control initialization
+        if region is None:
+            region = self.create_initial_region()
+
+        region_agents = region_m.get_agents_region(region)
         router.dispatch_message_sync(
-            BalanceSumAnswer(self._common_nc_data_access.calc_balance()),
+            RegionBalanceSumAnswer(self.calc_region_balance(region_agents)),
             self._get_sender_id(meta),
             self.context.aid,
         )
-        pass
 
-    def get_or_request_balance(self, agent_id):
+    def handle_agent_balance_request(self, _, meta):
+        router: SecmesAgentRouter = self.router
+        router.dispatch_message_sync(
+            AgentBalanceSumAnswer(self._common_nc_data_access.calc_balance()),
+            self._get_sender_id(meta),
+            self.context.aid,
+        )
+
+    def get_or_request_agent_balance(self, agent_id):
         if agent_id == self.context.aid:
             return self._common_nc_data_access.calc_balance()
         router: SecmesAgentRouter = self.router
-        router.dispatch_message_sync(BalanceSumRequest(), agent_id, self.context.aid)
-        return self._environment_perceptions[agent_id]["balance"]
+        router.dispatch_message_sync(
+            AgentBalanceSumRequest(), agent_id, self.context.aid
+        )
+        return self._environment_perceptions[agent_id]["agent_balance"]
+
+    def get_or_request_region_balance(self, agent_id):
+        region_m: SecmesRegionManager = self.region_manager
+        router: SecmesAgentRouter = self.router
+        region = region_m.get_agent_region(agent_id)
+
+        # Request can happen before control initialization
+        if region is None:
+            return self.get_or_request_agent_balance(agent_id)
+
+        if agent_id == self.context.aid:
+            return self.calc_region_balance(region_m.get_agents_region(region))
+
+        router.dispatch_message_sync(
+            RegionBalanceSumRequest(), agent_id, self.context.aid
+        )
+        return self._environment_perceptions[region]["region_balance"]
 
     def calc_region_balance(self, region_agents):
         sum = 0
@@ -164,11 +227,11 @@ class CellAgentRole(SyncAgentRole, ABC):
             if region_agent == self.context.aid:
                 sum += self._common_nc_data_access.calc_balance()
             else:
-                sum += self.get_or_request_balance(region_agent)
+                sum += self.get_or_request_agent_balance(region_agent)
         return sum
 
     def calc_agent_attraction(self, other, calculated_balance):
-        other_balance = self.get_or_request_balance(other)
+        other_balance = self.get_or_request_region_balance(other)
         return -np.sign(calculated_balance) * other_balance - self.calc_cost_gradient(
             other
         )

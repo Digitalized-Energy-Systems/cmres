@@ -1,11 +1,11 @@
 from abc import abstractmethod
-from cgitb import lookup
 import itertools
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 from mango.role.api import Role
 from mango.role.core import RoleAgentContext
 from pandapower.control.basic_controller import Controller
 import networkx as nx
+
 
 NETS_ACCESS = "nets"
 
@@ -28,14 +28,25 @@ class SecmesRegionManager:
     def __init__(self) -> None:
         self._region_graph = nx.Graph()
 
-    def register_region(self, neighbor_regions, initial_aid):
-        region_id = (
+    def _generate_region_id(self):
+        return (
             0
             if len(self._region_graph.nodes) == 0
             else max(self._region_graph.nodes.keys()) + 1
         )
 
-        self._region_graph.add_node(region_id, assigned_agents=[initial_aid])
+    def register_region(self, neighbor_regions, initial_aid):
+        region_id = self._generate_region_id()
+
+        self._region_graph.add_node(region_id, assigned_agents={initial_aid})
+        for region_neighbor in neighbor_regions:
+            self._region_graph.add_edge(region_id, region_neighbor)
+        return region_id
+
+    def add_region(self, neighbor_regions, aid_set):
+        region_id = self._generate_region_id()
+
+        self._region_graph.add_node(region_id, assigned_agents=aid_set)
         for region_neighbor in neighbor_regions:
             self._region_graph.add_edge(region_id, region_neighbor)
         return region_id
@@ -43,14 +54,14 @@ class SecmesRegionManager:
     def register_agent(self, agent_id, region_id):
         # remove agent from current region and delete region if empty
         for node in self._region_graph.nodes:
-            assigend_agents = self._region_graph.nodes[node]["assigned_agents"]
+            assigend_agents: Set = self._region_graph.nodes[node]["assigned_agents"]
             if agent_id in assigend_agents:
                 assigend_agents.remove(agent_id)
                 if not assigend_agents:
                     self._region_graph.remove_node(node)
                     break
 
-        self._region_graph.nodes[region_id]["assigned_agents"] += [agent_id]
+        self._region_graph.nodes[region_id]["assigned_agents"] |= {agent_id}
         # print(f"{agent_id} registered as member of {region_id}")
 
     def get_agent_region(self, agent_id):
@@ -59,7 +70,7 @@ class SecmesRegionManager:
                 return node
         return None
 
-    def get_agents_region(self, region_id):
+    def get_agents_region(self, region_id) -> Set:
         return self._region_graph.nodes[region_id]["assigned_agents"]
 
     def get_data_as_copy(self):
@@ -82,7 +93,7 @@ VIRTUAL_NODE_CONTAIN_STR = ["junction", "bus"]
 
 class SecmesAgentRouter:
     def __init__(self, agent_topology) -> None:
-        self._agent_topology = agent_topology
+        self._agent_topology: nx.Graph = agent_topology
         self._neighbors_removed_cp = {}
         self._cp_agent = {}
 
@@ -142,6 +153,9 @@ class SecmesAgentRouter:
 
     def exists(self, agent_id):
         return agent_id in self._agent_topology.nodes
+
+    def get_agents_as_subgraph(self, agent_ids: List[str]):
+        return self._agent_topology.subgraph(agent_ids)
 
     def get_data_as_copy(self):
         copy = self._agent_topology.copy()
