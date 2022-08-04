@@ -1,6 +1,7 @@
 """Module for simulating the world. Contains the main loop and asyncio loop handling.
 """
 import asyncio
+from pathlib import Path
 import pickle
 import os
 import tempfile
@@ -90,8 +91,8 @@ class AsyncWorld(MASWorld):
         self.__multinet.controller.drop(self._fault_controller.index, inplace=True)
 
     def write_results(self):
-        if not os.path.isdir(self._name):
-            os.mkdir(self._name)
+        Path(self._name).mkdir(parents=True, exist_ok=True)
+
         pandapipes.to_pickle(self._me_network.multinet, f"{self._name}/network.p")
         with open(f"{self._name}/network-result.p", "wb") as output_file:
             pickle.dump(self._plotting_controller.result, output_file)
