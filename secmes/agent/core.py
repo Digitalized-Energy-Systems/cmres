@@ -81,6 +81,9 @@ class SecmesRegionManager:
             ]["assigned_agents"].copy()
         return region_graph_copy
 
+    def remove_assigned_agent(self, aid, region_id):
+        self._region_graph.nodes[region_id]["assigned_agents"] -= {aid}
+
     def remove_region(self, region_id):
         self._region_graph.remove_node(region_id)
 

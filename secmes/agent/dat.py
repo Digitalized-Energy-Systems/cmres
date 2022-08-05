@@ -32,20 +32,26 @@ def execute_splitting_strategy(
     time: int,
 ):
     if strategy == SplittingStrategy.DISINTEGRATE:
-        # The region will be closed to avoid unoptimal region
+        # The region will be closed to avoid not optimal region
         # structures.
         region = region_manager.get_agent_region(cp_aid)
         agents_in_own_region = region_manager.get_agents_region(region)
+        agents_in_own_region.remove(cp_aid)
 
         # shut down CP, remove region, remove self from agent
         # topology
         router.unlink_cp(cp_aid)
-        region_manager.remove_own_region(cp_aid)
+        agents_as_subgraph = router.get_agents_as_subgraph(agents_in_own_region)
 
-        # All agents will be notified
-        # to give them a chance to join another region asap
-        for aid in agents_in_own_region:
-            if aid != cp_aid:
+        # It is possible that the region is still a connected component
+        if len(list(nx.connected_components(agents_as_subgraph))) == 1:
+            region_manager.remove_assigned_agent(cp_aid, region)
+        else:
+            region_manager.remove_own_region(cp_aid)
+
+            # All agents will be notified
+            # to give them a chance to join another region asap
+            for aid in agents_in_own_region:
                 router.dispatch_message_sync(
                     RegionDisbandedMessage(region, time), aid, cp_aid
                 )
