@@ -47,7 +47,7 @@ def execute_splitting_strategy(
         if len(list(nx.connected_components(agents_as_subgraph))) == 1:
             region_manager.remove_assigned_agent(cp_aid, region)
         else:
-            region_manager.remove_own_region(cp_aid)
+            region_manager.remove_region(region)
 
             # All agents will be notified
             # to give them a chance to join another region asap
