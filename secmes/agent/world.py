@@ -41,6 +41,7 @@ class AsyncWorld(MASWorld):
         async_step_time=1 / 60,
         max_steps=None,
         name="MASWorld",
+        no_energy_flow=False,
     ) -> None:
         self.__mas_coro_func = mas_coro_func
         self.__multinet = multinet
@@ -53,6 +54,7 @@ class AsyncWorld(MASWorld):
         self._faults = faults
         self._region_manager = None
         self._container = None
+        self._no_energy_flow = no_energy_flow
 
     async def prepare(self):
         self._me_network: MENetwork = network.from_panda_multinet(self.__multinet)
@@ -94,8 +96,9 @@ class AsyncWorld(MASWorld):
         Path(self._name).mkdir(parents=True, exist_ok=True)
 
         pandapipes.to_pickle(self._me_network.multinet, f"{self._name}/network.p")
-        with open(f"{self._name}/network-result.p", "wb") as output_file:
-            pickle.dump(self._plotting_controller.result, output_file)
+        if not self._no_energy_flow:
+            with open(f"{self._name}/network-result.p", "wb") as output_file:
+                pickle.dump(self._plotting_controller.result, output_file)
         with open(f"{self._name}/agent-result.p", "wb") as output_file:
             pickle.dump(self._agent_controller.result, output_file)
 
@@ -106,10 +109,10 @@ class AsyncWorld(MASWorld):
                 for _, row in net.controller.iterrows():
                     controller = row.object
                     controller.time_step(net, step_num)
-
-            ppmc.run_control_multinet.run_control(
-                self.__multinet, max_iter=30, mode="all"
-            )
+            if not self._no_energy_flow:
+                ppmc.run_control_multinet.run_control(
+                    self.__multinet, max_iter=30, mode="all"
+                )
         except (NetCalculationNotConverged, LoadflowNotConverged) as ex:
             print(
                 "Multi-Net did not converge. This may be caused by invalid controller states: {0}".format(
