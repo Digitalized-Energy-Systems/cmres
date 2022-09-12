@@ -8,7 +8,6 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from threading import local
 
 import numpy as np
 
@@ -28,6 +27,7 @@ from peext.node import (
     CHPNode,
     G2PNode,
     SinkNode,
+    CouplingPoint,
 )
 
 
@@ -117,7 +117,12 @@ class CellAgentRole(SyncAgentRole, ABC):
             router.exists(self.context.aid)
             and region_m.get_agent_region(self.context.aid) == None
         ):
-            neighbors = router.lookup_neighbors(self.context.aid)
+            if isinstance(self._local_model, CouplingPoint):
+                neighbors = router.calc_cp_neighborhood(
+                    self.context.aid, self._local_model.networks
+                )
+            else:
+                neighbors = router.calc_neighborhood(self.context.aid)
             neighbor_regions = set(
                 [
                     region_m.get_agent_region(neighbor)
@@ -321,7 +326,12 @@ class CellAgentRole(SyncAgentRole, ABC):
             agent_control_values["attraction_power"] = []
             agent_control_values["attraction_heat"] = []
             agent_control_values["attraction_gas"] = []
-            neighbors = router.lookup_neighbors(aid)
+            if isinstance(self._local_model, CouplingPoint):
+                neighbors = router.calc_cp_neighborhood(
+                    self.context.aid, self._local_model.networks
+                )
+            else:
+                neighbors = router.calc_neighborhood(self.context.aid)
             for neighbor in neighbors:
                 attraction = self.calc_agent_attraction(
                     neighbor, calculated_region_balance

@@ -32,6 +32,25 @@ from datetime import datetime
 from secmes.scenario.fault import Fault, FaultInjector
 
 
+def gen_id(el):
+    return f"{el.network.name}:{el.component_type()}:{el.id}"
+
+
+def calc_loss(edge):
+    if edge.network.name == "heat":
+        return edge.loss_perc()[1]
+    elif edge.network.name == "gas":
+        return edge.loss_perc()[0]
+    return edge.loss_perc()
+
+
+def to_eid_edge_map(me_network):
+    edge_map = {}
+    for edge in me_network.edges:
+        edge_map[gen_id(edge)] = edge
+    return edge_map
+
+
 class AsyncWorld(MASWorld):
     def __init__(
         self,
@@ -55,6 +74,7 @@ class AsyncWorld(MASWorld):
         self._region_manager = None
         self._container = None
         self._no_energy_flow = no_energy_flow
+        self._router = None
 
     async def prepare(self):
         self._me_network: MENetwork = network.from_panda_multinet(self.__multinet)
@@ -66,7 +86,7 @@ class AsyncWorld(MASWorld):
         ppmc.run_control_multinet.run_control(self.__multinet, max_iter=30, mode="all")
 
         # create learning agents and initialize models with network data
-        self._agents, router, self._container = await self.__mas_coro_func(
+        self._agents, self._router, self._container = await self.__mas_coro_func(
             self._me_network, self._region_manager
         )
 
@@ -83,7 +103,7 @@ class AsyncWorld(MASWorld):
             mn_names,
             self._agents,
             region_manager=self._region_manager,
-            router=router,
+            router=self._router,
         )
         self._fault_controller = FaultInjector(self._me_network.multinet, self._faults)
 
@@ -92,10 +112,11 @@ class AsyncWorld(MASWorld):
         self.__multinet.controller.drop(self._agent_controller.index, inplace=True)
         self.__multinet.controller.drop(self._fault_controller.index, inplace=True)
 
-    def write_results(self):
+    def write_results(self, with_network=False):
         Path(self._name).mkdir(parents=True, exist_ok=True)
 
-        pandapipes.to_pickle(self._me_network.multinet, f"{self._name}/network.p")
+        if with_network:
+            pandapipes.to_pickle(self._me_network.multinet, f"{self._name}/network.p")
         if not self._no_energy_flow:
             with open(f"{self._name}/network-result.p", "wb") as output_file:
                 pickle.dump(self._plotting_controller.result, output_file)
@@ -135,6 +156,8 @@ class AsyncWorld(MASWorld):
         """
         step_num = 0
         while step_num < self._max_steps:
+            self.update_topology()
+
             # calculate new network results
             await self.step(step_num)
 
@@ -145,6 +168,16 @@ class AsyncWorld(MASWorld):
 
         await self._container.shutdown()
         self.write_results()
+
+    def update_topology(self):
+        network_topology = self._router.get_data_as_ref()
+        eid_edge_map = to_eid_edge_map(self._me_network)
+
+        for from_node, to_node, me_eid in network_topology.edges.data("edge_id"):
+            if me_eid is None:
+                continue
+            loss = calc_loss(eid_edge_map[me_eid])
+            network_topology.edges[from_node, to_node]["weight"] = loss
 
 
 class SyncWorld:
@@ -206,10 +239,12 @@ class SyncWorld:
         self,
         static_plotting_controller: StaticPlottingController,
         agent_controller: AgentController,
+        with_network=False,
     ):
         if not os.path.isdir(self.name):
             os.mkdir(self.name)
-        pandapipes.to_pickle(self._me_network.multinet, f"{self.name}/network.p")
+        if with_network:
+            pandapipes.to_pickle(self._me_network.multinet, f"{self.name}/network.p")
         with open(f"{self.name}/network-result.p", "wb") as output_file:
             pickle.dump(static_plotting_controller.result, output_file)
         with open(f"{self.name}/agent-result.p", "wb") as output_file:

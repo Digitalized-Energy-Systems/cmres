@@ -94,34 +94,115 @@ class SecmesRegionManager:
 VIRTUAL_NODE_CONTAIN_STR = ["junction", "bus"]
 
 
+def to_aid(node_id):
+    return node_id.split("#")[0] if node_id.find("#") != -1 else node_id
+
+
+def to_node_ids(aid, network_names):
+    return [aid + "#" + network_name for network_name in network_names]
+
+
+def merge_length_dicts(first, second):
+    shortest_path_length_dict = {}
+    for node in first.keys() | second.keys():
+        if node in second and node in first:
+            shortest_path_length_dict[node] = min(first[node], second[node])
+        else:
+            shortest_path_length_dict[node] = (
+                second[node] if node in second else first[node]
+            )
+    return shortest_path_length_dict
+
+
+def is_virtual_node(agent_id):
+    for contain_str in VIRTUAL_NODE_CONTAIN_STR:
+        if contain_str in agent_id:
+            return True
+    return False
+
+
+def calc_k_nearest_neighbors_excluding_virtual(node_to_shortest_length_map, k):
+    shortest_path_length_tuple_list: List = list(node_to_shortest_length_map.items())
+    shortest_path_length_tuple_list.sort(key=lambda v: v[1])
+    return [
+        to_aid(node)
+        for node, _ in shortest_path_length_tuple_list[:k]
+        if not is_virtual_node(node)
+    ]
+
+
 class SecmesAgentRouter:
-    def __init__(self, agent_topology) -> None:
+    def __init__(self, agent_topology, neighborhood_size=10) -> None:
         self._agent_topology: nx.Graph = agent_topology
         self._neighbors_removed_cp = {}
+        self._subgraph_removed_cp = {}
         self._cp_agent = {}
+        self._neighborhood_size = neighborhood_size
 
     def dispatch_message_sync(self, content, agent_id, sender_agent_id):
-        agent: SecmesAgent = self._agent_topology.nodes[agent_id]["agent"]
+        all_nodes = self._agent_topology.nodes
+        if agent_id not in all_nodes:
+            for nid in all_nodes:
+                if "aid" in all_nodes[nid] and all_nodes[nid]["aid"] == agent_id:
+                    agent = all_nodes[nid]["agent"]
+                    break
+        else:
+            agent: SecmesAgent = all_nodes[agent_id]["agent"]
         agent.get_context().handle_msg(content, {"sender_agent_id": sender_agent_id})
 
-    def unlink_cp(self, cp_id):
-        self._neighbors_removed_cp[cp_id] = nx.neighbors(self._agent_topology, cp_id)
-        self._cp_agent[cp_id] = self._agent_topology.nodes[cp_id]["agent"]
-        self._agent_topology.remove_node(cp_id)
+    def unlink_cp(self, cp_id, network_names=None):
+        all_cp_ids = to_node_ids(cp_id, network_names)
+        self._subgraph_removed_cp[cp_id] = nx.Graph(
+            self._agent_topology.subgraph(all_cp_ids)
+        )
+
+        self._neighbors_removed_cp[cp_id] = {}
+        for actual_cp_id in all_cp_ids:
+            self._neighbors_removed_cp[cp_id][actual_cp_id] = list(
+                nx.neighbors(self._agent_topology, actual_cp_id)
+            )
+        self._agent_topology.remove_nodes_from(all_cp_ids)
 
     def link_cp(self, cp_id):
-        self._agent_topology.add_node(cp_id, agent=self._cp_agent[cp_id])
-        for n in self._neighbors_removed_cp[cp_id]:
-            if n in self._agent_topology.nodes:
-                self._agent_topology.add_edge(cp_id, n)
+        self._agent_topology = nx.compose(
+            self._subgraph_removed_cp[cp_id], self._agent_topology
+        )
 
-    def is_virtual_node(self, agent_id):
-        for contain_str in VIRTUAL_NODE_CONTAIN_STR:
-            if contain_str in agent_id:
-                return True
-        return False
+        for actual_cp_id, neighbors in self._neighbors_removed_cp[cp_id].items():
+            for n in neighbors:
+                if n in self._agent_topology.nodes:
+                    self._agent_topology.add_edge(actual_cp_id, n)
 
-    def lookup_neighbors(self, agent_id, include_virtual_nodes=False, blacklist=None):
+    def calc_cp_neighborhood(self, cp_id, network_names, cutoff_length=0.1):
+        if not cp_id is self._agent_topology:
+            return []
+        node_ids = to_node_ids(cp_id, network_names)
+        shortest_path_length_dict = None
+        last_dict = None
+        for node_id in node_ids:
+            shortest_path_length_dict = nx.single_source_dijkstra_path_length(
+                self._agent_topology, node_id, cutoff=cutoff_length, weight="weight"
+            )
+            if last_dict is not None:
+                current_dict = shortest_path_length_dict
+                shortest_path_length_dict = merge_length_dicts(current_dict, last_dict)
+            last_dict = shortest_path_length_dict
+
+        return calc_k_nearest_neighbors_excluding_virtual(
+            shortest_path_length_dict, self._neighborhood_size
+        )
+
+    def calc_neighborhood(self, agent_id, cutoff_length=0.1):
+        shortest_path_length_dict = nx.single_source_dijkstra_path_length(
+            self._agent_topology, agent_id, cutoff=cutoff_length, weight="weight"
+        )
+        return calc_k_nearest_neighbors_excluding_virtual(
+            shortest_path_length_dict, self._neighborhood_size
+        )
+
+    def lookup_direct_neighbors(
+        self, agent_id, include_virtual_nodes=False, blacklist=None
+    ):
         if blacklist is None:
             blacklist = []
         direct_neighbors = set(
@@ -131,9 +212,7 @@ class SecmesAgentRouter:
                 if n not in blacklist
             ]
         )
-        virtual_neighbors = set(
-            [n for n in direct_neighbors if self.is_virtual_node(n)]
-        )
+        virtual_neighbors = set([n for n in direct_neighbors if is_virtual_node(n)])
         direct_neighbors_with_indirect_virtual_neighbors = (
             direct_neighbors
             if include_virtual_nodes
@@ -141,7 +220,7 @@ class SecmesAgentRouter:
             | set(
                 itertools.chain.from_iterable(
                     [
-                        self.lookup_neighbors(
+                        self.lookup_direct_neighbors(
                             vn,
                             include_virtual_nodes=include_virtual_nodes,
                             blacklist=blacklist + [vn],
@@ -155,7 +234,7 @@ class SecmesAgentRouter:
         return direct_neighbors_with_indirect_virtual_neighbors
 
     def exists(self, agent_id):
-        return agent_id in self._agent_topology.nodes
+        return any([agent_id in node for node in self._agent_topology.nodes])
 
     def get_agents_as_subgraph(self, agent_ids: List[str]):
         return self._agent_topology.subgraph(agent_ids)
@@ -169,6 +248,9 @@ class SecmesAgentRouter:
             copy.nodes[node_key]["roles"] = None
 
         return copy
+
+    def get_data_as_ref(self):
+        return self._agent_topology
 
 
 class SecmesRoleAgentContext(RoleAgentContext):

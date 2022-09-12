@@ -4,6 +4,7 @@ from abc import ABC
 from dataclasses import dataclass
 from enum import Enum
 import random
+from typing import List
 
 from overrides import overrides
 
@@ -29,6 +30,7 @@ def execute_splitting_strategy(
     router: SecmesAgentRouter,
     region_manager: SecmesRegionManager,
     cp_aid: str,
+    networks: List[str],
     time: int,
 ):
     if strategy == SplittingStrategy.DISINTEGRATE:
@@ -40,7 +42,7 @@ def execute_splitting_strategy(
 
         # shut down CP, remove region, remove self from agent
         # topology
-        router.unlink_cp(cp_aid)
+        router.unlink_cp(cp_aid, network_names=networks)
         agents_as_subgraph = router.get_agents_as_subgraph(agents_in_own_region)
 
         # It is possible that the region is still a connected component
@@ -61,7 +63,7 @@ def execute_splitting_strategy(
         agents_in_own_region.remove(cp_aid)
 
         region_manager.remove_region(region)
-        router.unlink_cp(cp_aid)
+        router.unlink_cp(cp_aid, network_names=networks)
 
         agents_as_subgraph = router.get_agents_as_subgraph(agents_in_own_region)
 
@@ -126,5 +128,6 @@ class DATCouplingPointRole(SyncAgentRole):
                         router,
                         region_m,
                         self.context.aid,
+                        self._local_model.networks,
                         time,
                     )
