@@ -70,7 +70,7 @@ def execute_splitting_strategy(
         for component in nx.connected_components(agents_as_subgraph):
             neighbor_regions = set()
             for node in component:
-                for neighbor in router.lookup_neighbors(node):
+                for neighbor in router.lookup_direct_neighbors(node):
                     neighbor_region = region_manager.get_agent_region(neighbor)
                     if neighbor_region is not None:
                         neighbor_regions |= {neighbor_region}
