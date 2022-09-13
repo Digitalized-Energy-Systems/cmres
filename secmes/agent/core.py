@@ -174,9 +174,10 @@ class SecmesAgentRouter:
                     self._agent_topology.add_edge(actual_cp_id, n)
 
     def calc_cp_neighborhood(self, cp_id, network_names, cutoff_length=0.1):
-        if not cp_id is self._agent_topology:
-            return []
         node_ids = to_node_ids(cp_id, network_names)
+        for node_id in node_ids:
+            if not node_id in self._agent_topology.nodes:
+                raise Exception(f"Controller-{node_id} is not presented although active!")
         shortest_path_length_dict = None
         last_dict = None
         for node_id in node_ids:
