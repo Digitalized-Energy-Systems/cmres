@@ -177,7 +177,7 @@ class SecmesAgentRouter:
         node_ids = to_node_ids(cp_id, network_names)
         for node_id in node_ids:
             if not node_id in self._agent_topology.nodes:
-                raise Exception(f"Controller-{node_id} is not presented although active!")
+                return []
         shortest_path_length_dict = None
         last_dict = None
         for node_id in node_ids:
