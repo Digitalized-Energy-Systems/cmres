@@ -102,18 +102,6 @@ def to_node_ids(aid, network_names):
     return [aid + "#" + network_name for network_name in network_names]
 
 
-def merge_length_dicts(first, second):
-    shortest_path_length_dict = {}
-    for node in first.keys() | second.keys():
-        if node in second and node in first:
-            shortest_path_length_dict[node] = min(first[node], second[node])
-        else:
-            shortest_path_length_dict[node] = (
-                second[node] if node in second else first[node]
-            )
-    return shortest_path_length_dict
-
-
 def is_virtual_node(agent_id):
     for contain_str in VIRTUAL_NODE_CONTAIN_STR:
         if contain_str in agent_id:
@@ -126,9 +114,9 @@ def calc_k_nearest_neighbors_excluding_virtual(node_to_shortest_length_map, k):
     shortest_path_length_tuple_list.sort(key=lambda v: v[1])
     return [
         to_aid(node)
-        for node, _ in shortest_path_length_tuple_list[:k]
+        for node, _ in shortest_path_length_tuple_list
         if not is_virtual_node(node)
-    ]
+    ][:k]
 
 
 class SecmesAgentRouter:
@@ -178,20 +166,16 @@ class SecmesAgentRouter:
         for node_id in node_ids:
             if not node_id in self._agent_topology.nodes:
                 return []
-        shortest_path_length_dict = None
-        last_dict = None
+        nearest_neighbors = []
         for node_id in node_ids:
             shortest_path_length_dict = nx.single_source_dijkstra_path_length(
                 self._agent_topology, node_id, cutoff=cutoff_length, weight="weight"
             )
-            if last_dict is not None:
-                current_dict = shortest_path_length_dict
-                shortest_path_length_dict = merge_length_dicts(current_dict, last_dict)
-            last_dict = shortest_path_length_dict
+            nearest_neighbors += calc_k_nearest_neighbors_excluding_virtual(
+                shortest_path_length_dict, self._neighborhood_size
+            )
 
-        return calc_k_nearest_neighbors_excluding_virtual(
-            shortest_path_length_dict, self._neighborhood_size
-        )
+        return nearest_neighbors
 
     def calc_neighborhood(self, agent_id, cutoff_length=0.1):
         shortest_path_length_dict = nx.single_source_dijkstra_path_length(

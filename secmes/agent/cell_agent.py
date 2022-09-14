@@ -307,6 +307,9 @@ class CellAgentRole(SyncAgentRole, ABC):
     def calc_cost_gradient(self, neighbor):
         return [0, 0, 0]
 
+    # Resistance = 0.021 / 0.095
+    # 1/(alpha*d*pi*l)
+
     def control(self, time):
         region_m: SecmesRegionManager = self.region_manager
         router: SecmesAgentRouter = self.router
