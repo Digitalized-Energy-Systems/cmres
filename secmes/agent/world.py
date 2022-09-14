@@ -173,9 +173,11 @@ class AsyncWorld(MASWorld):
         network_topology = self._router.get_data_as_ref()
         eid_edge_map = to_eid_edge_map(self._me_network)
 
-        for from_node, to_node, me_eid in network_topology.edges.data("edge_id"):
-            if me_eid is None:
+        for from_node, to_node, key in list(network_topology.edges):
+            data_dict = network_topology.edges[from_node][to_node][key]
+            if not "edge_id" in data_dict:
                 continue
+            me_eid = data_dict["edge_id"]
             loss = calc_loss(eid_edge_map[me_eid])
             network_topology.edges[from_node, to_node]["weight"] = loss
 
