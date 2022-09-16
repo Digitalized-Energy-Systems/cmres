@@ -140,7 +140,7 @@ class SecmesAgentRouter:
 
     def unlink_cp(self, cp_id, network_names=None):
         all_cp_ids = to_node_ids(cp_id, network_names)
-        self._subgraph_removed_cp[cp_id] = nx.Graph(
+        self._subgraph_removed_cp[cp_id] = nx.MultiGraph(
             self._agent_topology.subgraph(all_cp_ids)
         )
 
