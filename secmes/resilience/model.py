@@ -28,6 +28,7 @@ FAILURE_PROBABILITY_MODEL = lambda base_prob: base_prob * np.random.normal(1, sc
 FAILURE_TIME_MODEL = lambda incident_time_steps, time: stats.norm.pdf(
     time, loc=incident_time_steps / 2
 )
+FAILURE_SPATIAL_MODEL = None
 
 
 class SimpleResilienceModel(ResilienceModel):
@@ -42,6 +43,7 @@ class SimpleResilienceModel(ResilienceModel):
         base_fail_probability_map=FAIL_BASE_PROBABILITY_MAP,
         fail_probability_model=FAILURE_PROBABILITY_MODEL,
         time_model=FAILURE_TIME_MODEL,
+        spatial_model=FAILURE_SPATIAL_MODEL,
     ) -> None:
         self._incident_shift = incident_shift
         self._incident_timesteps = incident_timesteps
@@ -54,6 +56,7 @@ class SimpleResilienceModel(ResilienceModel):
         self._time_model = lambda time: time_model(
             self._incident_timesteps + incident_shift, time
         )
+        self._spatial_model = spatial_model
 
     def _read_impact(self, model):
         if model.network.name == "heat":
