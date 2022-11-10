@@ -29,7 +29,7 @@ from secmes.rl.drl.dqn import DQNAgent
 from secmes.rl.drl.role import DQNRole
 from datetime import datetime
 
-from secmes.scenario.fault import Fault, FaultInjector
+from secmes.simulation.fault import Fault, FaultInjector
 
 
 def gen_id(el):
@@ -49,6 +49,108 @@ def to_eid_edge_map(me_network):
     for edge in me_network.edges:
         edge_map[gen_id(edge)] = edge
     return edge_map
+
+
+class CentralFaultyWorld:
+    def __init__(
+        self,
+        iteration_func,
+        init_func,
+        multinet,
+        max_steps=None,
+        name="CentralWorld",
+        fault_generator=None,
+    ) -> None:
+        self._iteration_func = iteration_func
+        self._fault_generator = fault_generator
+        self._init_func = init_func
+        self.__multinet = multinet
+        self._me_network = None
+        self._plotting_controller = None
+        self._max_steps = max_steps
+        self._name = name
+
+    def run(self):
+        """start asyncio event loop"""
+
+        self.prepare()
+        self.run_loop()
+
+    def prepare(self):
+        self._me_network: network.MENetwork = network.from_panda_multinet(
+            self.__multinet
+        )
+
+        mn_names = self._me_network.multinet["nets"].keys()
+        self._plotting_controller = StaticPlottingController(
+            self.__multinet,
+            mn_names,
+            self._me_network,
+            self._max_steps - 1,
+            only_collect=True,
+        )
+
+        self.faults = self._fault_generator.generate(self._me_network)
+        if self._fault_generator is not None:
+            self._fault_controller = FaultInjector(
+                self._me_network.multinet,
+                self.faults,
+            )
+            self.__multinet.controller.drop(self._fault_controller.index, inplace=True)
+
+        self.__multinet.controller.drop(self._plotting_controller.index, inplace=True)
+
+        # initial single run for initial observation
+        ppmc.run_control_multinet.run_control(self.__multinet, max_iter=30, mode="all")
+
+        # create learning agents and initialize models with network data
+        self._init_func(self._me_network)
+
+    def write_results(self):
+        if not os.path.isdir(self._name):
+            os.mkdir(self._name)
+        pandapipes.to_pickle(self._me_network.multinet, f"{self._name}/network.p")
+        with open(f"{self._name}/network-result.p", "wb") as output_file:
+            pickle.dump(self._plotting_controller.result, output_file)
+
+    def step(self, step_num):
+        try:
+            for _, net in self.__multinet["nets"].items():
+                for _, row in net.controller.iterrows():
+                    controller = row.object
+                    controller.time_step(net, step_num)
+            ppmc.run_control_multinet.run_control(
+                self.__multinet, max_iter=30, mode="all"
+            )
+        except (NetCalculationNotConverged, LoadflowNotConverged) as ex:
+            print(
+                "Multi-Net did not converge. This may be caused by invalid controller states: {0}".format(
+                    ex
+                )
+            )
+
+        # step time for mango
+        self._iteration_func(self._me_network, step_num)
+
+    def run_loop(self):
+        """Mainloop of the world simulation
+
+        :param me_network: the MES network
+        :type me_network: network.MENetwork
+        :param panda_multinet: panda multinet
+        :type panda_multinet: multinet
+        :param plot_config: configuration of the plotting
+        :type plot_config: Dict
+        """
+        step_num = 0
+        while step_num < self._max_steps:
+            # calculate new network results
+            self._fault_controller.time_step(self.__multinet, step_num)
+            self.step(step_num)
+            self._plotting_controller.time_step(self.__multinet, step_num)
+            step_num += 1
+
+        self.write_results()
 
 
 class AsyncWorld(MASWorld):
