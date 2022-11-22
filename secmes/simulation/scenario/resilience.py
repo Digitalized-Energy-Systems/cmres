@@ -51,8 +51,8 @@ def start_resilience_simulation(
     )
     sim.run()
 
-    print(fault_gen.failures)
     # write
+    print(fault_gen.failures)
     figs = []
     for label, data in resilience_measurement_model.calc():
         fig = go.Figure()

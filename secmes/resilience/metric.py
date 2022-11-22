@@ -3,6 +3,14 @@ from secmes.resilience.core import ResilienceMetric
 from peext.network import *
 
 
+class GeneralCascadingResilience(ResilienceMetric):
+    pass
+
+
+class ResilienceRegardingOtherNetworkMetric(ResilienceMetric):
+    pass
+
+
 class SimpleResilienceMetric(ResilienceMetric):
     def __init__(self) -> None:
         self.gas_balance_measurements = []

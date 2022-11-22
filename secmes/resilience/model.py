@@ -21,6 +21,10 @@ FAIL_BASE_PROBABILITY_MAP = {
     LineEdge: 0.05,
     TrafoEdge: 0.05,
     PipeEdge: 0.05,
+    EmptyBusNode: 0,
+    EmptyJunctionNode: 0,
+    BusNode: 0.05,
+    JunctionNode: 0.05,
 }
 
 FAILURE_PROBABILITY_MODEL = lambda base_prob: base_prob * np.random.normal(1, scale=0.1)
@@ -28,7 +32,7 @@ FAILURE_PROBABILITY_MODEL = lambda base_prob: base_prob * np.random.normal(1, sc
 FAILURE_TIME_MODEL = lambda incident_time_steps, time: stats.norm.pdf(
     time, loc=incident_time_steps / 2
 )
-FAILURE_SPATIAL_MODEL = None
+FAILURE_SPATIAL_MODEL = lambda coords: 1
 
 
 class SimpleResilienceModel(ResilienceModel):
@@ -56,7 +60,9 @@ class SimpleResilienceModel(ResilienceModel):
         self._time_model = lambda time: time_model(
             self._incident_timesteps + incident_shift, time
         )
-        self._spatial_model = spatial_model
+        self._spatial_model = (
+            lambda coords: spatial_model(coords) if coords is not None else 1
+        )
 
     def _read_impact(self, model):
         if model.network.name == "heat":
@@ -72,10 +78,12 @@ class SimpleResilienceModel(ResilienceModel):
         if model_type not in self._base_fail_probability_map:
             return 0
         base_failure_probability = self._base_fail_probability_map[model_type]
+        coords = model.coords()
         return (
             self._fail_probability_model(base_failure_probability)
             * self._read_impact(model)
             * self._time_model(time)
+            * self._spatial_model(coords)
         )
 
     def has_failed(self, model, time):
@@ -89,6 +97,12 @@ class SimpleResilienceModel(ResilienceModel):
                 fail_prob = self.calc_fail(node, time)
                 if random.random() < fail_prob:
                     failures.append(Failure(time, node, fail_prob, Effect.DEAD, -1))
+            for virtual_node in me_network.virtual_nodes:
+                fail_prob = self.calc_fail(virtual_node, time)
+                if random.random() < fail_prob:
+                    failures.append(
+                        Failure(time, virtual_node, fail_prob, Effect.DEAD, -1)
+                    )
             for edge in me_network.edges:
                 fail_prob = self.calc_fail(edge, time)
                 if random.random() < fail_prob:
