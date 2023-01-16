@@ -9,8 +9,6 @@ from secmes.omef.eval import OMEFEvaluator
 import secmes.data.observer as observer
 import plotly.graph_objects as go
 
-import networkx.drawing.nx_agraph as nxd
-
 from secmes.cn.network import (
     to_phys_bus_junc_networkx_graph,
     create_networkx_topology_plot,
@@ -73,24 +71,3 @@ def start_resilience_simulation(
     sim.add_post_step_hook(lambda _, __: flush_observed_data())
     sim.run()
     observer.clear()
-
-    # write
-    figs = []
-    for label, data in resilience_measurement_model.calc():
-        fig = go.Figure()
-        fig.add_trace(
-            go.Scatter(x=list(range(len(data))), y=data, mode="lines", name="lines")
-        )
-        fig.update_layout(
-            title=f"Resilience Metric {type(resilience_measurement_model)}",
-            xaxis_title="time",
-            yaxis_title=f"resilience ({label})",
-        )
-        figs.append(fig)
-    write_in_one_html(figs, name + "/Resilience")
-
-    graph_figs = []
-    pos = nxd.pygraphviz_layout(networks[0], prog="neato")
-    for network in networks:
-        graph_figs.append(create_networkx_topology_plot(network, pos=pos))
-    write_in_one_html(graph_figs, name + "/Graph")
