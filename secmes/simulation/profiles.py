@@ -8,6 +8,8 @@ import simbench as sb
 import glob
 import pandas
 
+from secmes.mes.common import conversion_factor_kgps_to_mw
+
 
 def create_random_profile(
     element_len, time_steps, center=0, dev=0.1, only_positive=False
@@ -149,10 +151,13 @@ def create_usa_heat_profiles(heat_net, time_steps):
 
 
 def create_and_attach_usa_heat_profiles(heat_net, time_steps):
-    load_mat = create_demand_mat_usa(
-        ["Heating:Gas [kW](Hourly)", "Heating:Electricity [kW](Hourly)"],
-        element_len=len(heat_net.heat_exchanger.index),
-        time_steps=time_steps,
+    load_mat = (
+        create_demand_mat_usa(
+            ["Heating:Gas [kW](Hourly)", "Heating:Electricity [kW](Hourly)"],
+            element_len=len(heat_net.heat_exchanger.index),
+            time_steps=time_steps,
+        )
+        * 1000
     )
     attach_he_profiles(heat_net, load_mat, time_steps)
 
@@ -170,7 +175,7 @@ def create_and_attach_usa_gas_profiles(gas_net, time_steps):
         ["Gas:Facility [kW](Hourly)"],
         element_len=len(gas_net.sink.index),
         time_steps=time_steps,
-    )
+    ) / (conversion_factor_kgps_to_mw(gas_net) * 1000)
     attach_sink_profiles(gas_net, load_mat, time_steps)
 
 

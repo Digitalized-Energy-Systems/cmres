@@ -1,10 +1,9 @@
-from peext.network import MENetwork
-from peext.node import RegulatableMESModel
+from peext.network import MENetwork, from_panda_multinet
 
 import numpy as np
 import copy
 
-from secmes.omef.eval import Evaluator
+from secmes.omef.eval import Evaluator, is_productive
 
 INDEX_SIGMA = -1
 INDEX_FITNESS = -2
@@ -66,25 +65,28 @@ class EASolver:
         raw_mutation[INDEX_SIGMA] = 0
         raw_mutation[INDEX_FITNESS] = 0
         mutation = (raw_mutation - 0.5) * 0.3 * solution[INDEX_SIGMA]
-        mutated_solution = np.clip(solution + mutation, -1, 1)
+        mutated_solution = np.clip(solution + mutation, 0, 1)
         mutated_solution[INDEX_SIGMA] = solution[INDEX_SIGMA]
         mutated_solution[INDEX_FITNESS] = solution[INDEX_FITNESS]
         return mutated_solution
 
-    def _evaluate(self, solution, me_network, step):
+    def _evaluate(self, solution, me_network, all_regulatable_nodes, step):
         solution[INDEX_FITNESS] = self._fitness_evaluator.evaluate(
-            solution[0:-2], me_network, step
+            solution[0:-2], me_network, all_regulatable_nodes, step
         )
 
     def _select(self, population):
         start = len(population) - self._population_size
         return population[population[:, INDEX_FITNESS].argsort()][start:]
 
-    def solve(self, me_network: MENetwork, step: int):
-        me_network = copy.deepcopy(me_network)
+    def solve(self, me_network: MENetwork, step: int, without_load=False):
+        mn = copy.deepcopy(me_network.multinet)
+        me_network = from_panda_multinet(mn)
 
         all_regulatable_nodes = [
-            node for node in me_network.nodes if isinstance(node, RegulatableMESModel)
+            node
+            for node in me_network.nodes
+            if is_productive(node, without_load=without_load)
         ]
 
         population = self._init_population(len(all_regulatable_nodes))
@@ -97,7 +99,9 @@ class EASolver:
                 parents = self._select_parents(population)
                 new_solution = self._recombine(parents)
                 mutated_solution = self._mutate(new_solution)
-                self._evaluate(mutated_solution, me_network, step)
+                self._evaluate(
+                    mutated_solution, me_network, all_regulatable_nodes, step
+                )
 
                 if generation is None:
                     generation = mutated_solution

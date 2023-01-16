@@ -1,9 +1,11 @@
 from abc import ABC, abstractmethod
-from typing import List, Tuple
+from typing import List
 from pandapower.control.basic_controller import Controller
 from secmes.resilience.core import *
+from secmes.cn.network import name_of
 
 from peext.node import RegulatableController
+import secmes.data.observer as observer
 
 
 class FaultExecutor(ABC):
@@ -21,7 +23,7 @@ class DeadEffectFaultExecutor(FaultExecutor):
         self._affected_node = node
         self._severity = severity
 
-    def inject_fault(self, _):
+    def inject_fault(self, _, time):
         if isinstance(self._affected_node, RegulatableController):
             self._affected_node.regulate(0)
             return
@@ -29,13 +31,23 @@ class DeadEffectFaultExecutor(FaultExecutor):
             self._affected_node.id, "in_service"
         ] = False
 
-    def reverse_fault(self, _):
+        observer.gather(
+            "failure",
+            {"step": time, "node": name_of(self._affected_node), "type": "failure"},
+        )
+
+    def reverse_fault(self, _, time):
         if isinstance(self._affected_node, RegulatableController):
             self._affected_node.regulate(1)
             return
         self._affected_node.network[self._affected_node.component_type()].at[
             self._affected_node.id, "in_service"
         ] = True
+
+        observer.gather(
+            "repair",
+            {"step": time, "node": name_of(self._affected_node), "type": "repair"},
+        )
 
 
 class Fault:
@@ -128,9 +140,9 @@ class FaultInjector(Controller):
         if self._faults is not None:
             for fault in self._faults:
                 if time == fault.start_time:
-                    fault.fault_executor.inject_fault(mn)
+                    fault.fault_executor.inject_fault(mn, time)
                 if time == fault.stop_time:
-                    fault.fault_executor.reverse_fault(mn)
+                    fault.fault_executor.reverse_fault(mn, time)
 
     def control_step(self, _):
         self.applied = True

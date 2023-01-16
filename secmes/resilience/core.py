@@ -4,10 +4,18 @@ from typing import List
 
 from peext.core import MESModel
 
+from peext.network import MENetwork
+
+
+class PerformanceMetric(ABC):
+    @abstractmethod
+    def calc(self, me_network: MENetwork):
+        pass
+
 
 class ResilienceMetric(ABC):
     @abstractmethod
-    def gather(self, me_network):
+    def gather(self, me_network: MENetwork, step, **kwargs):
         pass
 
     @abstractmethod
@@ -41,4 +49,10 @@ class RepairModel(ABC):
 class ResilienceModel(ABC):
     @abstractmethod
     def generate_failures(self, me_network):
+        pass
+
+
+class StepModel(ABC):
+    @abstractmethod
+    def step(self, me_network, step):
         pass

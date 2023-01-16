@@ -27,9 +27,10 @@ from peext.data.core import DataSink, StaticPlottingController
 
 from secmes.rl.drl.dqn import DQNAgent
 from secmes.rl.drl.role import DQNRole
+import secmes.data.observer as observer
 from datetime import datetime
 
-from secmes.simulation.fault import Fault, FaultInjector
+from secmes.resilience.fault import Fault, FaultInjector
 
 
 def gen_id(el):
@@ -69,6 +70,10 @@ class CentralFaultyWorld:
         self._plotting_controller = None
         self._max_steps = max_steps
         self._name = name
+        self._post_step_hooks = []
+
+    def add_post_step_hook(self, step_hook):
+        self._post_step_hooks.append(step_hook)
 
     def run(self):
         """start asyncio event loop"""
@@ -129,8 +134,9 @@ class CentralFaultyWorld:
                 )
             )
 
-        # step time for mango
         self._iteration_func(self._me_network, step_num)
+        for custom_step in self._post_step_hooks:
+            custom_step(self._me_network, step_num)
 
     def run_loop(self):
         """Mainloop of the world simulation
@@ -147,6 +153,14 @@ class CentralFaultyWorld:
             # calculate new network results
             self._fault_controller.time_step(self.__multinet, step_num)
             self.step(step_num)
+            observer.gather(
+                "balance_power",
+                self.__multinet["nets"]["power"].res_ext_grid.at[0, "p_mw"],
+            )
+            observer.gather(
+                "balance_gas",
+                self.__multinet["nets"]["gas"].res_ext_grid.at[0, "mdot_kg_per_s"],
+            )
             self._plotting_controller.time_step(self.__multinet, step_num)
             step_num += 1
 
