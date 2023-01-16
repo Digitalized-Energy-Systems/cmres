@@ -7,11 +7,9 @@ from secmes.resilience.model import CascadingModel
 from secmes.omef.eval import OMEFEvaluator
 
 import secmes.data.observer as observer
-import plotly.graph_objects as go
 
 from secmes.cn.network import (
     to_phys_bus_junc_networkx_graph,
-    create_networkx_topology_plot,
 )
 
 
@@ -68,6 +66,6 @@ def start_resilience_simulation(
         fault_generator=fault_gen,
     )
     sim.add_post_step_hook(cascading_model.step)
-    sim.add_post_step_hook(lambda _, __: flush_observed_data())
+    sim.add_post_step_hook(lambda _, __: flush_observed_data(name))
     sim.run()
     observer.clear()
