@@ -1,3 +1,5 @@
+import logging
+
 from pandapower.timeseries.data_sources.frame_data import DFData
 
 import pandapower.control as powercontrol
@@ -113,6 +115,11 @@ def create_and_attach_random_profiles_all_demands(
 def create_demand_mat_usa(column_names, element_len, time_steps, sub_column=None):
     path_to_data = "data/input/profiles/RESIDENTIAL_LOAD_DATA_E_PLUS_OUTPUT/RESIDENTIAL_LOAD_DATA_E_PLUS_OUTPUT/BASE/"
     profile_names_csv = glob.glob(path_to_data + "*.csv")[:element_len]
+    if len(profile_names_csv) == 0:
+        logging.warn(
+            "The expected datasets for heat and gas demands are not available. The simulation will fallback to random data."
+        )
+        return create_random_profile(element_len, time_steps, only_positive=False)
 
     big_df = None
     column_names_full = list(
