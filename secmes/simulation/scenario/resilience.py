@@ -4,7 +4,7 @@ from secmes.agent.world import CentralFaultyWorld
 from secmes.resilience.fault import FaultGenerator
 from secmes.resilience.core import ResilienceMetric, ResilienceModel, RepairModel
 from secmes.resilience.model import CascadingModel
-from secmes.omef.eval import OMEFEvaluator
+from secmes.omef.solver.eval import OMEFEvaluator
 
 import secmes.data.observer as observer
 

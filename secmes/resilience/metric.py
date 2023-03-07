@@ -2,7 +2,7 @@ from secmes.resilience.core import ResilienceMetric, PerformanceMetric
 
 from peext.network import *
 from secmes.mes.common import conversion_factor_kgps_to_mw
-from secmes.omef.eval import is_productive, is_broken
+from secmes.omef.solver.eval import is_productive, is_broken
 
 
 class rlist(list):
@@ -33,7 +33,9 @@ class GeneralResiliencePerformanceMetric(PerformanceMetric):
         ]
 
     def get_broken_nodes(self, me_network):
-        return [node for node in me_network.nodes if is_broken(node) and is_load_node(node)]
+        return [
+            node for node in me_network.nodes if is_broken(node) and is_load_node(node)
+        ]
 
     def calc_using_setpoints(self, me_network, set_points, without_load=False):
         load_nodes = self.get_relevant_nodes(me_network, without_load=without_load)

@@ -9,7 +9,7 @@ from secmes.resilience.metric import (
     GeneralResiliencePerformanceMetric,
     CascadingResilienceMetric,
 )
-from secmes.omef.eval import OMEFEvaluator, calc_relative_violation, is_productive
+from secmes.omef.solver.eval import OMEFEvaluator, calc_relative_violation, is_productive
 from secmes.omef.solver.ea import EASolver
 from secmes.cn.network import name_of
 from typing import List
