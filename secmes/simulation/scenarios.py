@@ -12,6 +12,7 @@ from secmes.agent.dat import (
     DynamicCoalitionAdaptionTopologyAgent,
     SplittingStrategy,
 )
+from monee import Network, TimeseriesData
 
 CP_CHANGE_PROB = 0.2
 TIME_STEPS = 96
@@ -74,18 +75,17 @@ def start_dat_simulation(
 
 
 def start_res_simulation(
-    multinet,
+    net: Network,
+    timeseries_data: TimeseriesData,
     resilience_model: ResilienceModel,
     repair_model: RepairModel,
     resilience_measurement_model: ResilienceMetric,
-    demand_attacher_function=ssp.create_and_attach_random_profiles_all_demands_mn,
     time_steps=TIME_STEPS,
     name=RES_SIM_NAME,
 ):
-    if demand_attacher_function is not None:
-        demand_attacher_function(multinet, time_steps)
     ssr.start_resilience_simulation(
-        multinet,
+        net,
+        timeseries_data,
         resilience_model,
         repair_model,
         resilience_measurement_model,

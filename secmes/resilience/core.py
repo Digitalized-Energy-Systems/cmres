@@ -2,20 +2,18 @@ from dataclasses import dataclass
 from abc import abstractmethod, ABC
 from typing import List
 
-from peext.core import MESModel
-
-from peext.network import MENetwork
+from monee.model import Component, Network
 
 
 class PerformanceMetric(ABC):
     @abstractmethod
-    def calc(self, me_network: MENetwork):
+    def calc(self, network: Network):
         pass
 
 
 class ResilienceMetric(ABC):
     @abstractmethod
-    def gather(self, me_network: MENetwork, step, **kwargs):
+    def gather(self, network: Network, step, **kwargs):
         pass
 
     @abstractmethod
@@ -31,28 +29,28 @@ class Effect(enumerate):
 @dataclass
 class Failure:
     time: int
-    node: MESModel
+    component: Component
     severity: float
     effect: Effect
     repaired_time: int
 
     def __str__(self) -> str:
-        return f"{self.time}-{self.repaired_time}.{self.severity}.{self.effect}: {self.node.network.name}.{self.node.component_type()}.{self.node.id}"
+        return f"{self.time}-{self.repaired_time}.{self.severity}.{self.effect}: {self.component.grid.name}.{type(self.component.model)}.{self.component.id}"
 
 
 class RepairModel(ABC):
     @abstractmethod
-    def generate_repairs(self, me_network, failures: List[Failure]):
+    def generate_repairs(self, network, failures: List[Failure]):
         pass
 
 
 class ResilienceModel(ABC):
     @abstractmethod
-    def generate_failures(self, me_network):
+    def generate_failures(self, network):
         pass
 
 
 class StepModel(ABC):
     @abstractmethod
-    def step(self, me_network, step):
+    def step(self, network, step):
         pass

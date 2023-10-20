@@ -11,6 +11,8 @@ import glob
 import pandas
 
 from secmes.mes.common import conversion_factor_kgps_to_mw
+from monee import Network, TimeseriesData
+import monee.model as md
 
 
 def create_random_profile(
@@ -193,3 +195,29 @@ def create_simbench_profiles(power_net):
 
 def create_and_attach_all_simbench_profiles(power_net):
     sb.apply_const_controllers(power_net, create_simbench_profiles(power_net))
+
+
+def create_usa_gas_profiles_td(net: Network, time_steps):
+    sink_components = net.childs_by_type(md.Sink)
+    demand_mat = create_demand_mat_usa(
+        ["Gas:Facility [kW](Hourly)"],
+        element_len=len(sink_components),
+        time_steps=time_steps,
+    )
+    td = TimeseriesData()
+    for i, sink_component in enumerate(sink_components):
+        td.add_child_series(sink_component.id, "mass_flow", demand_mat[:, i])
+    return td
+
+
+def attach_usa_heat_profiles_td(net: Network, time_steps):
+    he_components = net.branches_by_type(md.HeatExchanger)
+    demand_mat = create_demand_mat_usa(
+        ["Heating:Gas [kW](Hourly)", "Heating:Electricity [kW](Hourly)"],
+        element_len=len(he_components),
+        time_steps=time_steps,
+    )
+    td = TimeseriesData()
+    for i, sink_component in enumerate(he_components):
+        td.add_child_series(sink_component.id, "mass_flow", demand_mat[:, i])
+    return td

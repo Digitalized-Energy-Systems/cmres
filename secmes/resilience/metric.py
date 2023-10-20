@@ -1,8 +1,9 @@
 from secmes.resilience.core import ResilienceMetric, PerformanceMetric
 
-from peext.network import *
 from secmes.mes.common import conversion_factor_kgps_to_mw
-from secmes.omef.solver.eval import is_productive, is_broken
+
+from monee import Network
+import monee.model as md
 
 
 class rlist(list):
@@ -15,66 +16,48 @@ class rlist(list):
         super(rlist, self).__setitem__(key, value)
 
 
-def is_load_node(node):
+def is_load(component):
+    model = component.model
+    grid = component.grid
     return (
-        isinstance(node, PowerLoadNode)
-        or isinstance(node, SinkNode)
-        or isinstance(node, HeatExchangerNode)
-        and node.qext_w() > 0
+        isinstance(model, md.PowerLoad)
+        or isinstance(model, md.Sink)
+        and isinstance(grid, md.GasGrid)
+        or isinstance(model, md.HeatExchanger)
+        and model.q_w > 0
     )
 
 
 class GeneralResiliencePerformanceMetric(PerformanceMetric):
-    def get_relevant_nodes(self, me_network, without_load=False):
+    def get_relevant_components(self, network: Network):
         return [
-            node
-            for node in me_network.nodes
-            if is_productive(node, without_load=without_load)
+            component
+            for component in network.childs + network.branches
+            if is_load(component)
         ]
 
-    def get_broken_nodes(self, me_network):
-        return [
-            node for node in me_network.nodes if is_broken(node) and is_load_node(node)
-        ]
-
-    def calc_using_setpoints(self, me_network, set_points, without_load=False):
-        load_nodes = self.get_relevant_nodes(me_network, without_load=without_load)
-        broken_nodes = self.get_broken_nodes(me_network)
+    def calc(self, network):
+        relevant_components = self.get_relevant_components(network)
         power_load_curtailed = 0
         heat_load_curtailed = 0
         gas_load_curtailed = 0
 
-        assert len(set_points) == len(load_nodes)
-
-        for i, node in enumerate(load_nodes + broken_nodes):
-
-            # if broken (out of service or not connectable),
-            # set_point of 0 is assumed
-            if i >= len(load_nodes):
-                set_point = 0
-            else:
-                set_point = set_points[i]
-
-            curtailment_rel = 1 - set_point
-            if isinstance(node, PowerLoadNode):
-                power_load_curtailed += node.active_power_capability() * curtailment_rel
-            if isinstance(node, SinkNode):
+        for component in relevant_components:
+            model = component.model
+            if component.ignored or not component.active:
+                continue
+            if isinstance(model, md.PowerLoad):
+                power_load_curtailed += md.upper(model.p_mw) - md.value(model.p_mw)
+            if isinstance(model, md.Sink):
                 gas_load_curtailed += (
-                    node.mdot_kg_per_s_capability()
-                    * conversion_factor_kgps_to_mw(node.network)[0]
-                    * curtailment_rel
+                    (md.upper(model.mass_flow) - md.value(model.mass_flow))
+                    * 3.6
+                    * component.grid.higher_heating_value
                 )
-            if isinstance(node, HeatExchangerNode) and node.q_capability() >= 0:
-                heat_load_curtailed += node.q_capability() * 1e-6 * curtailment_rel
+            if isinstance(model, md.HeatExchanger):
+                heat_load_curtailed += md.upper(model.q_w) - md.value(model.q_w)
 
         return (power_load_curtailed, heat_load_curtailed, gas_load_curtailed)
-
-    def calc(self, me_network: MENetwork):
-        current_set_points = [
-            load_node.regulation_factor()
-            for load_node in self.get_load_nodes(me_network)
-        ]
-        return self.calc_using_setpoints(me_network, current_set_points)
 
 
 class CascadingResilienceMetric(ResilienceMetric):
@@ -95,23 +78,14 @@ class SimpleResilienceMetric(ResilienceMetric):
         self.gas_balance_measurements = []
         self.power_balance_measurements = []
 
-    def gather(self, me_network, time):
-        nodes_as_dict = me_network.nodes_as_dict
-        gas_nodes = nodes_as_dict["gas"]
-        for gas_node in gas_nodes:
-            if type(gas_node) == ExtGasGrid:
-                self.gas_balance_measurements.append(
-                    gas_node.values_as_dict()["mdot_kg_per_s"]
-                )
-                break
+    def gather(self, network: Network, time):
+        ext_hydr_grids = network.childs_by_type(md.ExtHydrGrid)
+        for grid in ext_hydr_grids:
+            self.gas_balance_measurements.append(grid.model.mass_flow)
 
-        power_nodes = nodes_as_dict["power"]
-        for power_node in power_nodes:
-            if type(power_node) == ExtPowerGrid:
-                self.power_balance_measurements.append(
-                    power_node.values_as_dict()["p_mw"]
-                )
-                break
+        ext_power_grids = network.childs_by_type(md.ExtPowerGrid)
+        for grid in ext_power_grids:
+            self.power_balance_measurements.append(grid.model.p_mw)
 
     def calc(self):
         return ("power_balance", self.power_balance_measurements), (

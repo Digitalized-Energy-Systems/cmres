@@ -1,11 +1,10 @@
 from abc import ABC, abstractmethod
 from typing import List
-from pandapower.control.basic_controller import Controller
 from secmes.resilience.core import *
 from secmes.cn.network import name_of
-
-from peext.node import RegulatableController
 import secmes.data.observer as observer
+
+from monee import StepHook
 
 
 class FaultExecutor(ABC):
@@ -19,34 +18,28 @@ class FaultExecutor(ABC):
 
 
 class DeadEffectFaultExecutor(FaultExecutor):
-    def __init__(self, node, severity) -> None:
-        self._affected_node = node
+    def __init__(self, component, severity) -> None:
+        self._affected_component = component
         self._severity = severity
 
-    def inject_fault(self, _, time):
-        if isinstance(self._affected_node, RegulatableController):
-            self._affected_node.regulate(0)
-            return
-        self._affected_node.network[self._affected_node.component_type()].at[
-            self._affected_node.id, "in_service"
-        ] = False
+    def inject_fault(self, net: Network, time):
+        net.deactivate(self._affected_component)
 
         observer.gather(
             "failure",
-            {"step": time, "node": name_of(self._affected_node), "type": "failure"},
+            {
+                "step": time,
+                "node": name_of(self._affected_component),
+                "type": "failure",
+            },
         )
 
-    def reverse_fault(self, _, time):
-        if isinstance(self._affected_node, RegulatableController):
-            self._affected_node.regulate(1)
-            return
-        self._affected_node.network[self._affected_node.component_type()].at[
-            self._affected_node.id, "in_service"
-        ] = True
+    def reverse_fault(self, net: Network, time):
+        net.activate(self._affected_component)
 
         observer.gather(
             "repair",
-            {"step": time, "node": name_of(self._affected_node), "type": "repair"},
+            {"step": time, "node": name_of(self._affected_component), "type": "repair"},
         )
 
 
@@ -79,73 +72,37 @@ class FaultGenerator:
         self._repair_model = repair_model
 
     @staticmethod
-    def create_fault_executor(effect: Effect, severity: float, node: MESModel) -> Fault:
+    def create_fault_executor(effect: Effect, severity: float, component) -> Fault:
         if effect == Effect.DEAD:
-            return DeadEffectFaultExecutor(node=node, severity=severity)
+            return DeadEffectFaultExecutor(component=component, severity=severity)
 
     @staticmethod
     def to_fault_obj(failure: Failure) -> Fault:
         return Fault(
             FaultGenerator.create_fault_executor(
-                failure.effect, failure.severity, failure.node
+                failure.effect, failure.severity, failure.component
             ),
             failure.time,
             failure.repaired_time,
         )
 
-    def generate(self, me_network) -> List[Fault]:
-        failures = self.failures = self._resilience_model.generate_failures(me_network)
-        self._repair_model.generate_repairs(me_network, failures)
+    def generate(self, network) -> List[Fault]:
+        failures = self.failures = self._resilience_model.generate_failures(network)
+        self._repair_model.generate_repairs(network, failures)
         return [FaultGenerator.to_fault_obj(failure) for failure in failures]
 
 
-class FaultInjector(Controller):
-    """Interface to the pandapipes/power controller system to overcome the need to have
-    a mango agent. Useful for time-series simulations without the need of communication
-    between real agents.
-    """
-
+class FaultInjector(StepHook):
     def __init__(
         self,
-        multinet,
         faults: List[Fault],
-        in_service=True,
-        order=0,
-        level=0,
-        drop_same_existing_ctrl=False,
-        initial_run=True,
-        **kwargs
     ):
-        super().__init__(
-            multinet,
-            in_service,
-            order,
-            level,
-            drop_same_existing_ctrl=drop_same_existing_ctrl,
-            initial_run=initial_run,
-            **kwargs
-        )
-
         self._faults = faults
-        self._names = multinet["nets"].keys()
 
-    def initialize_control(self, _):
-        self.applied = False
-
-    def get_all_net_names(self):
-        return self._names
-
-    def time_step(self, mn, time):
-
+    def pre_run(self, base_net, step):
         if self._faults is not None:
             for fault in self._faults:
-                if time == fault.start_time:
-                    fault.fault_executor.inject_fault(mn, time)
-                if time == fault.stop_time:
-                    fault.fault_executor.reverse_fault(mn, time)
-
-    def control_step(self, _):
-        self.applied = True
-
-    def is_converged(self, _):
-        return self.applied
+                if step == fault.start_time:
+                    fault.fault_executor.inject_fault(base_net, step)
+                if step == fault.stop_time:
+                    fault.fault_executor.reverse_fault(base_net, step)

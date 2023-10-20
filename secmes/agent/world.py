@@ -32,6 +32,9 @@ from datetime import datetime
 
 from secmes.resilience.fault import Fault, FaultInjector
 
+from monee import Network, TimeseriesData, run_energy_flow, run_timeseries, StepHook
+import monee.model as mm
+
 
 def gen_id(el):
     return f"{el.network.name}:{el.component_type()}:{el.id}"
@@ -52,91 +55,62 @@ def to_eid_edge_map(me_network):
     return edge_map
 
 
-class CentralFaultyWorld:
+class CentralFaultyMoneeWorldStepHook(StepHook):
+    def pre_run(self, base_net, step):
+        pass
+
+    def post_run(self, net, base_net, step):
+        observer.gather(
+            "balance_power",
+            net.childs_by_type(mm.ExtPowerGrid)[0].model.p_mw,
+        )
+        observer.gather(
+            "balance_gas",
+            net.childs_by_type(mm.ExtHydrGrid)[1].model.mass_flow,
+        )
+
+
+class CentralFaultyMoneeWorld:
     def __init__(
         self,
-        iteration_func,
+        iteration_step_hook: StepHook,
         init_func,
-        multinet,
+        net: Network,
+        timeseries_data: TimeseriesData,
         max_steps=None,
-        name="CentralWorld",
+        name="CentralFaultyMoneeWorld",
         fault_generator=None,
     ) -> None:
-        self._iteration_func = iteration_func
+        self._iteration_step_hook = iteration_step_hook
         self._fault_generator = fault_generator
         self._init_func = init_func
-        self.__multinet = multinet
-        self._me_network = None
-        self._plotting_controller = None
+        self.__net = net
+        self.__td = timeseries_data
         self._max_steps = max_steps
         self._name = name
-        self._post_step_hooks = []
+        self._step_hooks = []
 
-    def add_post_step_hook(self, step_hook):
-        self._post_step_hooks.append(step_hook)
+    def add_step_hook(self, step_hook: StepHook):
+        self._step_hooks.append(step_hook)
 
     def run(self):
         """start asyncio event loop"""
 
-        self.prepare()
         self.run_loop()
 
     def prepare(self):
-        self._me_network: network.MENetwork = network.from_panda_multinet(
-            self.__multinet
-        )
-
-        mn_names = self._me_network.multinet["nets"].keys()
-        self._plotting_controller = StaticPlottingController(
-            self.__multinet,
-            mn_names,
-            self._me_network,
-            self._max_steps - 1,
-            only_collect=True,
-        )
-
-        self.faults = self._fault_generator.generate(self._me_network)
+        self.faults = self._fault_generator.generate(self.__net)
         if self._fault_generator is not None:
-            self._fault_controller = FaultInjector(
-                self._me_network.multinet,
-                self.faults,
-            )
-            self.__multinet.controller.drop(self._fault_controller.index, inplace=True)
-
-        self.__multinet.controller.drop(self._plotting_controller.index, inplace=True)
-
-        # initial single run for initial observation
-        ppmc.run_control_multinet.run_control(self.__multinet, max_iter=30, mode="all")
-
-        # create learning agents and initialize models with network data
-        self._init_func(self._me_network)
-
-    def write_results(self):
-        if not os.path.isdir(self._name):
-            os.mkdir(self._name)
-        pandapipes.to_pickle(self._me_network.multinet, f"{self._name}/network.p")
-        with open(f"{self._name}/network-result.p", "wb") as output_file:
-            pickle.dump(self._plotting_controller.result, output_file)
-
-    def step(self, step_num):
-        try:
-            for _, net in self.__multinet["nets"].items():
-                for _, row in net.controller.iterrows():
-                    controller = row.object
-                    controller.time_step(net, step_num)
-            ppmc.run_control_multinet.run_control(
-                self.__multinet, max_iter=30, mode="all"
-            )
-        except (NetCalculationNotConverged, LoadflowNotConverged) as ex:
-            print(
-                "Multi-Net did not converge. This may be caused by invalid controller states: {0}".format(
-                    ex
+            self._step_hooks.append(
+                FaultInjector(
+                    self.faults,
                 )
             )
 
-        self._iteration_func(self._me_network, step_num)
-        for custom_step in self._post_step_hooks:
-            custom_step(self._me_network, step_num)
+        # initial single run for initial observation
+        run_energy_flow(self.__net)
+
+        self._init_func(self.__net)
 
     def run_loop(self):
         """Mainloop of the world simulation
@@ -148,23 +122,12 @@ class CentralFaultyWorld:
         :param plot_config: configuration of the plotting
         :type plot_config: Dict
         """
-        step_num = 0
-        while step_num < self._max_steps:
-            # calculate new network results
-            self._fault_controller.time_step(self.__multinet, step_num)
-            self.step(step_num)
-            observer.gather(
-                "balance_power",
-                self.__multinet["nets"]["power"].res_ext_grid.at[0, "p_mw"],
-            )
-            observer.gather(
-                "balance_gas",
-                self.__multinet["nets"]["gas"].res_ext_grid.at[0, "mdot_kg_per_s"],
-            )
-            self._plotting_controller.time_step(self.__multinet, step_num)
-            step_num += 1
-
-        self.write_results()
+        run_timeseries(
+            self.__net,
+            self.__td,
+            self._max_steps,
+            [self._iteration_step_hook] + self._step_hooks,
+        )
 
 
 class AsyncWorld(MASWorld):

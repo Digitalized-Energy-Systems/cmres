@@ -9,39 +9,35 @@ from secmes.resilience.metric import (
     GeneralResiliencePerformanceMetric,
     CascadingResilienceMetric,
 )
-from secmes.omef.solver.eval import OMEFEvaluator, calc_relative_violation, is_productive
-from secmes.omef.solver.ea import EASolver
 from secmes.cn.network import name_of
 from typing import List
 import random
-
-from peext.node import *
-from peext.edge import *
-from peext.network import MENetwork
 
 import numpy as np
 import scipy.stats as stats
 
 import secmes.data.observer as observer
+import secmes.omef.solver.monee as ms
+
+import monee.model as mm
+from monee import Network
+
 
 FAIL_BASE_PROBABILITY_MAP = {
-    SourceNode: 0.2,
-    SinkNode: 0.05,
-    P2GNode: 0.2,
-    P2HNode: 0.2,
-    CHPNode: 0.2,
-    G2PNode: 0.2,
-    SGeneratorNode: 0.2,
-    GeneratorNode: 0.2,
-    HeatExchangerNode: 0.2,
-    LineEdge: 0.1,
-    TrafoEdge: 0.00,
-    PipeEdge: 0.1,
-    PumpEdge: 0.03,
-    EmptyBusNode: 0,
-    EmptyJunctionNode: 0,
-    BusNode: 0.01,
-    JunctionNode: 0.01,
+    mm.Source: 0.2,
+    mm.Sink: 0.0,
+    mm.PowerToGas: 0.2,
+    mm.PowerToHeat: 0.2,
+    mm.CHP: 0.2,
+    mm.GasToPower: 0.2,
+    mm.PowerGenerator: 0.3,
+    mm.HeatExchanger: 0.2,
+    mm.GenericPowerBranch: 0.01,
+    mm.Trafo: 0.00,
+    mm.WaterPipe: 0.01,
+    mm.GasPipe: 0.01,
+    mm.Bus: 0.00,
+    mm.Junction: 0.00,
 }
 
 FAILURE_PROBABILITY_MODEL = lambda base_prob: base_prob * np.random.normal(1, scale=0.1)
@@ -81,24 +77,32 @@ class SimpleResilienceModel(ResilienceModel):
             lambda coords: spatial_model(coords) if coords is not None else 1
         )
 
-    def _read_impact(self, model):
-        if model.network.name == "heat":
+    def _read_impact(self, component):
+        if (
+            not hasattr(component, "grid")
+            or component.grid == None
+            or type(component.grid) == dict
+        ):
+            return self._mes_impact
+
+        if component.grid.name == "heat":
             return self._heat_impact
-        elif model.network.name == "power":
+        elif component.grid.name == "power":
             return self._power_impact
-        elif model.network.name == "gas":
+        elif component.grid.name == "gas":
             return self._gas_impact
+
         return self._mes_impact
 
-    def calc_fail(self, model, time):
-        model_type = type(model)
+    def calc_fail(self, network: Network, component, time):
+        model_type = type(component.model)
         if model_type not in self._base_fail_probability_map:
             return 0
         base_failure_probability = self._base_fail_probability_map[model_type]
-        coords = model.coords()
+        coords = mm.calc_coordinates(network, component)
         return (
             self._fail_probability_model(base_failure_probability)
-            * self._read_impact(model)
+            * self._read_impact(component)
             * self._time_model(time)
             * self._spatial_model(coords)
         )
@@ -106,43 +110,50 @@ class SimpleResilienceModel(ResilienceModel):
     def has_failed(self, model, time):
         return random.random() < self.calc_fail(model, time)
 
-    def generate_failures(self, me_network):
+    def generate_failures(self, net: Network):
         failures = []
         for i in range(self._incident_timesteps):
             time = i + self._incident_shift
-            for node in me_network.nodes:
-                fail_prob = self.calc_fail(node, time)
+            for node in net.nodes:
+                if not node.independent:
+                    continue
+                fail_prob = self.calc_fail(net, node, time)
                 if random.random() < fail_prob:
                     failures.append(Failure(time, node, fail_prob, Effect.DEAD, -1))
-            for virtual_node in me_network.virtual_nodes:
-                fail_prob = self.calc_fail(virtual_node, time)
+            for branch in net.branches:
+                if not branch.independent:
+                    continue
+                fail_prob = self.calc_fail(net, branch, time)
                 if random.random() < fail_prob:
-                    failures.append(
-                        Failure(time, virtual_node, fail_prob, Effect.DEAD, -1)
-                    )
-            for edge in me_network.edges:
-                fail_prob = self.calc_fail(edge, time)
+                    failures.append(Failure(time, branch, fail_prob, Effect.DEAD, -1))
+            for child in net.childs:
+                if not child.independent:
+                    continue
+                fail_prob = self.calc_fail(net, child, time)
                 if random.random() < fail_prob:
-                    failures.append(Failure(time, edge, fail_prob, Effect.DEAD, -1))
+                    failures.append(Failure(time, child, fail_prob, Effect.DEAD, -1))
+            for compound in net.compounds:
+                fail_prob = self.calc_fail(net, compound, time)
+                if random.random() < fail_prob:
+                    failures.append(Failure(time, compound, fail_prob, Effect.DEAD, -1))
         return failures
 
 
 DMG_COEFF_FUNC_MAP = {
-    SourceNode: lambda source: source.mdot_kg_per_s_capability(),
-    SinkNode: lambda sink: sink.mdot_kg_per_s_capability(),
-    P2GNode: lambda p2g: p2g.active_power_capability(),
-    P2HNode: lambda p2h: p2h.active_power_capability(),
-    CHPNode: lambda chp: chp.mdot_kg_per_s_capability(),
-    G2PNode: lambda g2p: g2p.mdot_kg_per_s_capability(),
-    SGeneratorNode: lambda sgen: sgen.active_power_capability(),
-    GeneratorNode: lambda sgen: sgen.active_power_capability(),
-    HeatExchangerNode: lambda he: he.q_capability(),
-    LineEdge: lambda line: line.properties_as_dict()["length_km"],
-    TrafoEdge: lambda _: 1,
-    PipeEdge: lambda pipe: pipe.properties_as_dict()["length_km"],
-    PumpEdge: lambda _: 1,
-    BusNode: lambda _: 1,
-    JunctionNode: lambda _: 1,
+    mm.Source: lambda model: mm.upper(model.mass_flow),
+    mm.Sink: lambda model: mm.upper(model.mass_flow),
+    mm.PowerToGas: lambda model: mm.upper(model.to_mass_flow),
+    mm.PowerToHeat: lambda model: mm.upper(model.heat_energy_mw),
+    mm.CHP: lambda model: mm.upper(model.mass_flow),
+    mm.GasToPower: lambda model: mm.upper(model.from_mass_flow),
+    mm.PowerGenerator: lambda model: mm.upper(model.p_mw),
+    mm.HeatExchanger: lambda model: mm.upper(model.q_w),
+    mm.GenericPowerBranch: lambda model: model.br_r,
+    mm.Trafo: lambda _: 1,
+    mm.WaterPipe: lambda model: model.length_m,
+    mm.GasPipe: lambda model: model.length_m,
+    mm.Bus: lambda _: 1,
+    mm.Junction: lambda _: 1,
 }
 DMG_COEFF_VARIANCE_MODEL = lambda dmg_coeff: dmg_coeff * np.random.normal(1, scale=0.1)
 
@@ -163,9 +174,13 @@ class SimpleRepairModel(RepairModel):
     def generate_repairs(self, _, failures: List[Failure]):
         for failure in failures:
             f: Failure = failure
+            if not type(f.component.model) in self._dmg_coeff_func_map:
+                raise Exception(
+                    f"There is no dmg coeff defined for {type(f.component.model)}!"
+                )
             dmg = (
                 self._dmg_coeff_variance_model(
-                    self._dmg_coeff_func_map[type(f.node)](f.node)
+                    self._dmg_coeff_func_map[type(f.component.model)](f.component.model)
                 )
                 * f.severity
             )
@@ -181,61 +196,57 @@ def to_failure_probability(relative_violation, ramp=0, steepness=1, exponent=1.5
     return steepness * ((relative_violation - ramp) * 100) ** exponent / 100
 
 
-def deactivate_node(node):
-    node.network[node.component_type()].at[node.id, "in_service"] = False
+def deactivate_node(network: Network, node):
+    for child_id in node.child_ids:
+        child = network.child_by_id(child_id)
+        network.deactivate(child)
 
 
-def activate_node(node):
-    node.network[node.component_type()].at[node.id, "in_service"] = True
+def activate_node(network: Network, node):
+    for child_id in node.child_ids:
+        child = network.child_by_id(child_id)
+        network.activate(child)
+
+
+def calc_relative_violation(component, attribute, target, rel_allowed_diff):
+    return max(
+        (
+            abs((mm.value(getattr(component.model, attribute)) - target))
+            - rel_allowed_diff * target
+        )
+        / (target * rel_allowed_diff),
+        0,
+    )
 
 
 class CascadingModel(StepModel):
     def __init__(self, performance_accuracy=100) -> None:
         self._cascading_metric = CascadingResilienceMetric()
         self._performance_metric = GeneralResiliencePerformanceMetric()
-        self._omef = OMEFEvaluator()
         self._current_failures = []
         self._iteration_number_omef = performance_accuracy
+        self._faults = None
+        self._last_performance = None
 
-    def calc_performance(self, me_network, step, omef: OMEFEvaluator):
-        solver = EASolver(
-            omef,
-            iteration_number=self._iteration_number_omef,
-            population_size=16,
-            generation_size=8,
-            parent_number=2,
-        )
-        best, _, _ = solver.solve(me_network, step, without_load=omef._without_load)
+    def calc_performance(self, network: Network, without_load=False):
+        result = ms.solve(network, without_load=without_load)
         return (
-            self._performance_metric.calc_using_setpoints(
-                me_network, best, without_load=omef._without_load
-            ),
-            best,
+            self._performance_metric.calc(result.network),
+            result,
         )
 
-    def apply_setpoints(self, me_network, new_setpoints, without_load=False):
-        all_regulatable_nodes = [
-            node
-            for node in me_network.nodes
-            if is_productive(node, without_load=without_load)
-        ]
-        for i, node in enumerate(all_regulatable_nodes):
-            node.regulate(new_setpoints[i])
-
-    def process_nodes(self, nodes, attribute, target, allowed_diff, step, network_name):
+    def check_repairs(self, network, bound_tuple, step, network_name):
+        attribute, target, allowed_diff = bound_tuple
         for i in range(len(self._current_failures) - 1, -1, -1):
             node, failure = self._current_failures[i]
-            if (
-                node.network.name != network_name
-                or attribute not in node.values_as_dict()
-            ):
+            if node.grid.name != network_name or attribute not in node.values_as_dict():
                 continue
             if failure["step"] + failure["min_duration"] >= step:
                 relative_violation = to_failure_probability(
                     calc_relative_violation(node, attribute, target, allowed_diff)
                 )
                 if relative_violation < np.random.random():
-                    activate_node(node)
+                    activate_node(network, node)
                     del self._current_failures[i]
                     observer.gather(
                         "cascading repair",
@@ -248,63 +259,77 @@ class CascadingModel(StepModel):
                         },
                     )
 
-        for node in nodes:
-            relative_violation = to_failure_probability(
-                calc_relative_violation(node, attribute, target, allowed_diff)
+    def process_node(self, network: Network, node, bound_tuple, step):
+        attribute, target, allowed_diff = bound_tuple
+        relative_violation = to_failure_probability(
+            calc_relative_violation(node, attribute, target, allowed_diff)
+        )
+        if relative_violation > np.random.random():
+            min_duration = int(relative_violation * np.random.random() * 10)
+            deactivate_node(network, node)
+            failure_description = {
+                "step": step,
+                "node": name_of(node),
+                "probability": relative_violation,
+                "min_duration": min_duration,
+                "type": "failure",
+            }
+            self._current_failures.append((node, failure_description))
+
+            observer.gather(
+                "cascading failure",
+                failure_description,
             )
-            if relative_violation > np.random.random():
-                min_duration = int(relative_violation * np.random.random() * 10)
-                deactivate_node(node)
-                failure_description = {
-                    "step": step,
-                    "node": name_of(node),
-                    "probability": relative_violation,
-                    "min_duration": min_duration,
-                    "type": "failure",
-                }
-                self._current_failures.append((node, failure_description))
 
-                observer.gather(
-                    "cascading failure",
-                    failure_description,
-                )
+    def process_network_state(self, network: Network, step):
+        self.check_repairs(network, ms.BOUND_GAS, step, "gas")
+        self.check_repairs(network, ms.BOUND_HEAT, step, "heat")
+        self.check_repairs(network, ms.BOUND_EL, step, "power")
 
-    def process_network_state(self, me_network: MENetwork, step):
-        for network, nodes in me_network.virtual_nodes_as_dict.items():
-            if network == "gas":
-                self.process_nodes(nodes, "p_bar", 60, 0.3, step, network)
-            if network == "heat":
-                self.process_nodes(nodes, "t_k", 360, 0.2, step, network)
-            if network == "power":
-                self.process_nodes(nodes, "vm_pu", 1, 0.2, step, network)
+        for node in network.nodes:
+            if not node.independent:
+                continue
+            if node.grid.name == "gas":
+                self.process_node(network, node, ms.BOUND_GAS, step)
+            if node.grid.name == "heat":
+                self.process_node(network, node, ms.BOUND_HEAT, step)
+            if node.grid.name == "power":
+                self.process_node(network, node, ms.BOUND_EL, step)
 
-        for network, edges in me_network.edges_as_dict.items():
-            if network == "power":
-                self.process_nodes(
-                    edges, "loading_percent", 50, 1, step=step, network_name=network
-                )
+        for branch in network.branches_by_type(mm.GenericPowerBranch):
+            if not branch.independent:
+                continue
+            self.process_node(network, branch, ms.BOUND_LP, step)
 
-    def step(self, me_network, step):
-        performance, _ = self.calc_performance(me_network, step, self._omef)
+    def fault_delta_exists(self, step):
+        for fault in self._faults:
+            if fault.start_time == step or fault.stop_time == step:
+                return True
+        return False
+
+    def step(self, net, base_net, step):
+        if self.fault_delta_exists(step) or self._last_performance is None:
+            performance, _ = self.calc_performance(net)
+            self._last_performance = performance
+        else:
+            performance = self._last_performance
+            print("skipping new calculation")
 
         observer.gather("performance", performance)
 
-        self.process_network_state(me_network, step)
+        """
+        self.process_network_state(net, step)
 
         # calc performance and base performance
-        performance_after_cascade, new_setpoints = self.calc_performance(
-            me_network, step, self._omef
-        )
-        observer.gather("performance_after_cascade", performance_after_cascade)
-
-        # apply new setpoints
-        self.apply_setpoints(me_network, new_setpoints)
+        performance_after_cascade, _ = self.calc_performance(net)
+        """
+        observer.gather("performance_after_cascade", performance)
 
         self._cascading_metric.gather(
-            me_network,
+            net,
             step,
             performance=performance,
-            performance_after_cascade=performance_after_cascade,
+            performance_after_cascade=performance,
         )
 
     def calc_metric(self):

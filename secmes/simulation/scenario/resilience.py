@@ -1,16 +1,13 @@
 from pathlib import Path
 
-from secmes.agent.world import CentralFaultyWorld
+from secmes.agent.world import CentralFaultyMoneeWorld
 from secmes.resilience.fault import FaultGenerator
 from secmes.resilience.core import ResilienceMetric, ResilienceModel, RepairModel
 from secmes.resilience.model import CascadingModel
-from secmes.omef.solver.eval import OMEFEvaluator
 
 import secmes.data.observer as observer
 
-from secmes.cn.network import (
-    to_phys_bus_junc_networkx_graph,
-)
+from monee import Network, TimeseriesData
 
 
 def write_in_one_html(figures, name):
@@ -31,7 +28,8 @@ def flush_observed_data(experiment_name):
 
 
 def start_resilience_simulation(
-    multinet,
+    net: Network,
+    timeseries_data: TimeseriesData,
     resilience_model: ResilienceModel,
     repair_model: RepairModel,
     resilience_measurement_model: ResilienceMetric,
@@ -40,32 +38,32 @@ def start_resilience_simulation(
 ):
     networks = []
 
-    def iteration_step(me_network, time):
-        resilience_measurement_model.gather(me_network, time)
-        networks.append(
-            to_phys_bus_junc_networkx_graph(
-                me_network, only_include_active_elements=True
-            )
-        )
+    def iteration_step(net, _, time):
+        resilience_measurement_model.gather(net, time)
+        networks.append(net)
 
     cascading_model = CascadingModel()
 
-    def init_func(me_network):
-        _, best = cascading_model.calc_performance(
-            me_network, 0, OMEFEvaluator(without_load=True)
-        )
-        cascading_model.apply_setpoints(me_network, best, without_load=True)
+    def init_func(net):
+        _, __ = cascading_model.calc_performance(net, 0)
 
     fault_gen = FaultGenerator(resilience_model, repair_model)
-    sim = CentralFaultyWorld(
+    sim = CentralFaultyMoneeWorld(
         iteration_step,
         init_func,
-        multinet,
+        net,
+        timeseries_data,
         max_steps=time_steps,
         name=name,
         fault_generator=fault_gen,
     )
-    sim.add_post_step_hook(cascading_model.step)
-    sim.add_post_step_hook(lambda _, __: flush_observed_data(name))
-    sim.run()
+    sim.add_step_hook(cascading_model.step)
+    sim.add_step_hook(lambda _, __, ___: flush_observed_data(name))
+    try:
+        sim.prepare()
+        cascading_model._faults = sim.faults
+        sim.run()
+    finally:
+        flush_observed_data(name)
+
     observer.clear()
