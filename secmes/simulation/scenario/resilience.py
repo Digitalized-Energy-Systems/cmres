@@ -1,4 +1,5 @@
 from pathlib import Path
+import os
 
 from secmes.agent.world import CentralFaultyMoneeWorld
 from secmes.resilience.fault import FaultGenerator
@@ -8,6 +9,7 @@ from secmes.resilience.model import CascadingModel
 import secmes.data.observer as observer
 
 from monee import Network, TimeseriesData
+import pandas
 
 
 def write_in_one_html(figures, name):
@@ -19,12 +21,23 @@ def write_in_one_html(figures, name):
             file.write(fig.to_html(full_html=False, include_plotlyjs=False))
 
 
-def flush_observed_data(experiment_name):
-    import json
+def flush_observed_data(experiment_name, id):
+    for key, value_list in observer.data().items():
+        out_path = Path(experiment_name)
+        out_path.mkdir(parents=True, exist_ok=True)
+        out_file = out_path / Path(f"{key}.csv")
+        dataframe = []
+        for value in value_list:
+            if type(value) == dict:
+                for item in value.items():
+                    dataframe[-1].append({**item, **{"id": id}})
+            if type(value) == list:
+                for i, item in enumerate(value):
+                    dataframe[-1].append({i: item, "id": id})
 
-    Path(experiment_name).mkdir(parents=True, exist_ok=True)
-    with open(experiment_name + "/readable_result.json", "w") as fp:
-        json.dump(observer.data(), fp)
+        pandas.DataFrame(dataframe).to_csv(
+            out_file, mode="a", header=not os.path.exists(out_file)
+        )
 
 
 def start_resilience_simulation(
@@ -35,6 +48,8 @@ def start_resilience_simulation(
     resilience_measurement_model: ResilienceMetric,
     time_steps=96,
     name="RES_SIM",
+    out_name="RES_SIM",
+    id=0,
 ):
     networks = []
 
@@ -58,12 +73,11 @@ def start_resilience_simulation(
         fault_generator=fault_gen,
     )
     sim.add_step_hook(cascading_model.step)
-    sim.add_step_hook(lambda _, __, ___: flush_observed_data(name))
     try:
         sim.prepare()
         cascading_model._faults = sim.faults
         sim.run()
     finally:
-        flush_observed_data(name)
+        flush_observed_data(out_name, id)
 
     observer.clear()

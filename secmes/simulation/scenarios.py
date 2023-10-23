@@ -82,6 +82,8 @@ def start_res_simulation(
     resilience_measurement_model: ResilienceMetric,
     time_steps=TIME_STEPS,
     name=RES_SIM_NAME,
+    out_name=RES_SIM_NAME,
+    id=0,
 ):
     ssr.start_resilience_simulation(
         net,
@@ -91,4 +93,6 @@ def start_res_simulation(
         resilience_measurement_model,
         time_steps=time_steps,
         name=name,
+        out_name=out_name,
+        id=id,
     )
