@@ -31,7 +31,9 @@ def flush_observed_data(experiment_name, id):
             if type(value) == dict:
                 dataframe.append({**value, **{"id": id}})
             if isinstance(value, (list, tuple)):
-                dataframe.append(**{i: v for i, v in enumerate(value)}, **{"id": id})
+                dataframe.append(
+                    **{str(i): v for i, v in enumerate(value)}, **{"id": id}
+                )
 
         pandas.DataFrame(dataframe).to_csv(
             out_file, mode="a", header=not os.path.exists(out_file)
