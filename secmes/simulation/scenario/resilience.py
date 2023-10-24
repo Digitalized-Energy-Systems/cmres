@@ -32,7 +32,7 @@ def flush_observed_data(experiment_name, id):
                 dataframe.append({**value, **{"id": id}})
             if isinstance(value, (list, tuple)):
                 dataframe.append(
-                    **{str(i): v for i, v in enumerate(value)}, **{"id": id}
+                    {**{str(i): v for i, v in enumerate(value)}, **{"id": id}}
                 )
 
         pandas.DataFrame(dataframe).to_csv(

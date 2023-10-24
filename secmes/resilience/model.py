@@ -309,7 +309,10 @@ class CascadingModel(StepModel):
 
     def step(self, net, base_net, step):
         if self.fault_delta_exists(step) or self._last_performance is None:
-            performance, _ = self.calc_performance(net)
+            try:
+                performance, _ = self.calc_performance(net)
+            except:
+                performance = float("inf")
             self._last_performance = performance
         else:
             performance = self._last_performance
