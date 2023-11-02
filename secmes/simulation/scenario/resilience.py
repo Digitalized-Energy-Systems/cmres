@@ -1,5 +1,6 @@
 from pathlib import Path
 import os
+import fcntl
 
 from secmes.agent.world import CentralFaultyMoneeWorld
 from secmes.resilience.fault import FaultGenerator
@@ -35,9 +36,13 @@ def flush_observed_data(experiment_name, id):
                     {**{str(i): v for i, v in enumerate(value)}, **{"id": id}}
                 )
 
-        pandas.DataFrame(dataframe).to_csv(
-            out_file, mode="a", header=not os.path.exists(out_file)
-        )
+        out_file_lock = out_path / Path(f".{key}.lock")
+        with open(out_file_lock, "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            pandas.DataFrame(dataframe).to_csv(
+                out_file, mode="a", header=not os.path.exists(out_file)
+            )
+            fcntl.flock(lock, fcntl.LOCK_UN)
 
 
 def start_resilience_simulation(
