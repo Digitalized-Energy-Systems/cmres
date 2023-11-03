@@ -23,7 +23,7 @@ def is_load(component):
         isinstance(model, md.PowerLoad)
         or isinstance(model, md.Sink)
         and isinstance(grid, md.GasGrid)
-        or isinstance(model, md.HeatExchanger)
+        or isinstance(model, (md.HeatExchanger, md.HeatExchangerLoad))
         and model.q_w > 0
     )
 
