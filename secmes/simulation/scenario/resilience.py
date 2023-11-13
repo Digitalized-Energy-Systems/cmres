@@ -65,7 +65,7 @@ def start_resilience_simulation(
     cascading_model = CascadingModel()
 
     def init_func(net):
-        _, __ = cascading_model.calc_performance(net, 0)
+        _, res = cascading_model.calc_performance(net, 0)
 
     fault_gen = FaultGenerator(resilience_model, repair_model)
     sim = CentralFaultyMoneeWorld(
