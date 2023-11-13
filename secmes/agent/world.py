@@ -127,6 +127,7 @@ class CentralFaultyMoneeWorld:
             self.__td,
             self._max_steps,
             [self._iteration_step_hook] + self._step_hooks,
+            solve=False,
         )
 
 
