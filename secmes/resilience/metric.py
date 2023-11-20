@@ -54,7 +54,7 @@ class GeneralResiliencePerformanceMetric(PerformanceMetric):
                     * 3.6
                     * component.grid.higher_heating_value
                 )
-            if isinstance(model, md.HeatExchanger):
+            if isinstance(model, (md.HeatExchanger, md.HeatExchangerLoad)):
                 heat_load_curtailed += md.upper(model.q_w) - md.value(model.q_w)
 
         return (power_load_curtailed, heat_load_curtailed, gas_load_curtailed)

@@ -19,6 +19,18 @@ pio.templates["publish3"] = go.layout.Template(
         titlefont=dict(family="sans-serif", size=19),
     )
 )
+pio.templates["publish2"] = go.layout.Template(
+    layout=go.Layout(
+        font=dict(family="sans-serif", size=13),
+        titlefont=dict(family="sans-serif", size=13),
+    )
+)
+pio.templates["publish1"] = go.layout.Template(
+    layout=go.Layout(
+        font=dict(family="sans-serif", size=9),
+        titlefont=dict(family="sans-serif", size=9),
+    )
+)
 
 YlGnBuDark = [
     "rgb(199,233,180)",
