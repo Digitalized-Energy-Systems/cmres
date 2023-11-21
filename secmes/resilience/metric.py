@@ -23,8 +23,7 @@ def is_load(component):
         isinstance(model, md.PowerLoad)
         or isinstance(model, md.Sink)
         and isinstance(grid, md.GasGrid)
-        or isinstance(model, (md.HeatExchanger, md.HeatExchangerLoad))
-        and model.q_w > 0
+        or isinstance(model, md.HeatExchangerLoad)
     )
 
 
@@ -45,7 +44,18 @@ class GeneralResiliencePerformanceMetric(PerformanceMetric):
         for component in relevant_components:
             model = component.model
             if component.ignored or not component.active:
+                if isinstance(model, md.PowerLoad):
+                    power_load_curtailed += md.upper(model.p_mw)
+                if isinstance(model, md.Sink):
+                    gas_load_curtailed += (
+                        (md.upper(model.mass_flow))
+                        * 3.6
+                        * component.grid.higher_heating_value
+                    )
+                if isinstance(model, (md.HeatExchangerLoad)):
+                    heat_load_curtailed += md.upper(model.q_w) / 10**6
                 continue
+
             if isinstance(model, md.PowerLoad):
                 power_load_curtailed += md.upper(model.p_mw) - md.value(model.p_mw)
             if isinstance(model, md.Sink):
@@ -54,8 +64,10 @@ class GeneralResiliencePerformanceMetric(PerformanceMetric):
                     * 3.6
                     * component.grid.higher_heating_value
                 )
-            if isinstance(model, (md.HeatExchanger, md.HeatExchangerLoad)):
-                heat_load_curtailed += md.upper(model.q_w) - md.value(model.q_w)
+            if isinstance(model, (md.HeatExchangerLoad)):
+                heat_load_curtailed += (
+                    md.upper(model.q_w) - md.value(model.q_w)
+                ) / 10**6
 
         return (power_load_curtailed, heat_load_curtailed, gas_load_curtailed)
 

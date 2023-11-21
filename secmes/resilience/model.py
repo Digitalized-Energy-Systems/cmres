@@ -32,9 +32,10 @@ FAIL_BASE_PROBABILITY_MAP = {
     mm.GasToPower: 0.2,
     mm.PowerGenerator: 0.3,
     mm.HeatExchanger: 0.2,
+    mm.HeatExchangerGenerator: 0.2,
     mm.GenericPowerBranch: 0.01,
     mm.Trafo: 0.00,
-    mm.WaterPipe: 0.01,
+    mm.WaterPipe: 0.005,
     mm.GasPipe: 0.01,
     mm.Bus: 0.00,
     mm.Junction: 0.00,
@@ -122,7 +123,8 @@ class SimpleResilienceModel(ResilienceModel):
                     failures.append(Failure(time, node, fail_prob, Effect.DEAD, -1))
             for branch in net.branches:
                 if not branch.independent:
-                    continue
+                    if type(branch.model) != mm.HeatExchanger:
+                        continue
                 fail_prob = self.calc_fail(net, branch, time)
                 if random.random() < fail_prob:
                     failures.append(Failure(time, branch, fail_prob, Effect.DEAD, -1))

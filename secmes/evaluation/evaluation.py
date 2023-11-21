@@ -327,3 +327,180 @@ def create_scatter_with_df(
     if mode is not None:
         fig.data[0].mode = mode
     return fig
+
+
+import networkx.drawing.nx_agraph as nxd
+import networkx as nx
+
+
+def create_networkx_plot(
+    network,
+    df,
+    color_name,
+    color_legend_text=None,
+    title=None,
+    template="plotly_white+publish2",
+):
+    graph: nx.Graph = network._network_internal
+    pos = nxd.pygraphviz_layout(graph, prog="neato")
+    edge_x = []
+    edge_y = []
+    for from_node, to_node, _ in graph.edges:
+        x0, y0 = pos[from_node]
+        x1, y1 = pos[to_node]
+        edge_x.append(x0)
+        edge_x.append(x1)
+        edge_x.append(None)
+        edge_y.append(y0)
+        edge_y.append(y1)
+        edge_y.append(None)
+
+    edge_trace = go.Scatter(
+        x=edge_x,
+        y=edge_y,
+        line=dict(width=0.5, color="#888"),
+        hoverinfo="none",
+        mode="lines",
+    )
+
+    node_x_power = []
+    node_y_power = []
+    node_color_power = []
+    node_text_power = []
+    node_x_heat = []
+    node_y_heat = []
+    node_color_heat = []
+    node_text_heat = []
+    node_x_gas = []
+    node_y_gas = []
+    node_color_gas = []
+    node_text_gas = []
+    node_cp_x = []
+    node_cp_y = []
+    node_color_cp = []
+    node_text_cp = []
+    for node in graph.nodes:
+        node_id = f"node:{node}"
+        x, y = pos[node]
+        node_data = graph.nodes[node]
+        int_node = node_data["internal_node"]
+        color_data = df.loc[df["id"] == node_id][color_name][0]
+        if not int_node.independent:
+            node_cp_x.append(x)
+            node_cp_y.append(y)
+            node_color_cp.append(color_data)
+            node_text_cp.append(node_id)
+        elif "Water" in str(type(int_node.grid)):
+            node_x_heat.append(x)
+            node_y_heat.append(y)
+            node_color_heat.append(color_data)
+            node_text_heat.append(node_id)
+        elif "Gas" in str(type(int_node.grid)):
+            node_x_gas.append(x)
+            node_y_gas.append(y)
+            node_color_gas.append(color_data)
+            node_text_gas.append(node_id)
+        elif "Power" in str(type(int_node.grid)):
+            node_x_power.append(x)
+            node_y_power.append(y)
+            node_color_power.append(color_data)
+            node_text_power.append(node_id)
+
+    # cp
+    node_trace_cp = go.Scatter(
+        x=node_cp_x,
+        y=node_cp_y,
+        mode="markers",
+        hoverinfo="text",
+        marker=dict(
+            color="purple",
+            symbol="diamond",
+            size=10,
+            line=dict(width=2, color="#888"),
+        ),
+    )
+
+    # heat
+    node_trace_heat = go.Scatter(
+        x=node_x_heat,
+        y=node_y_heat,
+        mode="markers",
+        hoverinfo="text",
+        text=node_text_heat,
+        marker=dict(
+            color=node_color_heat,
+            symbol="pentagon",
+            size=10,
+            coloraxis="coloraxis",
+            line=dict(width=2, color="#888"),
+        ),
+    )
+    # power
+    node_trace_power = go.Scatter(
+        x=node_x_power,
+        y=node_y_power,
+        mode="markers",
+        hoverinfo="text",
+        text=node_text_power,
+        marker=dict(
+            color=node_color_power,
+            symbol="square",
+            size=10,
+            coloraxis="coloraxis",
+            line=dict(width=2, color="#888"),
+        ),
+    )
+    # gas
+    node_trace_gas = go.Scatter(
+        x=node_x_gas,
+        y=node_y_gas,
+        mode="markers",
+        hoverinfo="text",
+        text=node_text_gas,
+        marker=dict(
+            color=node_color_gas,
+            symbol="triangle-up",
+            size=10,
+            coloraxis="coloraxis",
+            line=dict(width=2, color="#888"),
+        ),
+    )
+
+    fig = go.Figure(
+        data=[
+            edge_trace,
+            node_trace_heat,
+            node_trace_power,
+            node_trace_gas,
+            node_trace_cp,
+        ],
+        layout=go.Layout(
+            title=title,
+            showlegend=False,
+            hovermode="closest",
+            xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+            yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+            template=template,
+        ),
+    )
+    fig.update_layout(
+        height=400,
+        width=600,
+        margin={"l": 20, "b": 30, "r": 10, "t": 30},
+        xaxis_title="",
+        legend={"title": color_legend_text},
+        yaxis_title="",
+        title=title,
+        coloraxis_colorbar=dict(
+            title=color_legend_text,
+        ),
+    )
+    fig.layout.coloraxis.showscale = True
+    fig.layout.coloraxis.colorscale = "YlGnBu"
+    fig.layout.coloraxis.reversescale = True
+    fig.layout.coloraxis.colorbar.thickness = 15
+    fig.layout.coloraxis.colorbar.xanchor = "left"
+    fig.layout.coloraxis.colorbar.titleside = "right"
+    fig.layout.coloraxis.colorbar.outlinewidth = 2
+    fig.layout.coloraxis.colorbar.outlinecolor = "#888"
+    return fig
