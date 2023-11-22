@@ -137,6 +137,43 @@ def create_group_histogram(
     return fig
 
 
+def create_bar(
+    df,
+    x_label,
+    y_label,
+    color,
+    legend_text=None,
+    height=400,
+    width=600,
+    template="plotly_white",
+    title=None,
+    xaxis_title=None,
+    yaxis_title=None,
+    color_discrete_sequence=None,
+    color_discrete_map=None,
+):
+    fig = px.bar(
+        df,
+        x=x_label,
+        y=y_label,
+        color=color,
+        title=title,
+        template=template,
+        color_discrete_sequence=color_discrete_sequence,
+        color_discrete_map=color_discrete_map,
+    )
+    fig.update_layout(
+        height=height,
+        width=width,
+        margin={"l": 20, "b": 30, "r": 10, "t": 30},
+        legend={"title": legend_text},
+        xaxis_title=xaxis_title,
+        yaxis_title=yaxis_title,
+        xaxis_tickangle=-45,
+    )
+    return fig
+
+
 def create_multi_bar(
     name_hist_list,
     x=None,
@@ -331,6 +368,7 @@ def create_scatter_with_df(
 
 import networkx.drawing.nx_agraph as nxd
 import networkx as nx
+import plotly.express as px
 
 
 def create_networkx_plot(
@@ -340,28 +378,26 @@ def create_networkx_plot(
     color_legend_text=None,
     title=None,
     template="plotly_white+publish2",
+    without_nodes=False,
 ):
     graph: nx.Graph = network._network_internal
     pos = nxd.pygraphviz_layout(graph, prog="neato")
-    edge_x = []
-    edge_y = []
-    for from_node, to_node, _ in graph.edges:
+    x_edges = []
+    y_edges = []
+    color_edges = []
+    for from_node, to_node, uid in graph.edges:
         x0, y0 = pos[from_node]
         x1, y1 = pos[to_node]
-        edge_x.append(x0)
-        edge_x.append(x1)
-        edge_x.append(None)
-        edge_y.append(y0)
-        edge_y.append(y1)
-        edge_y.append(None)
+        color_data = 0
+        color_data_list = list(
+            df.loc[df["id"] == f"branch:({from_node}, {to_node}, {uid})"][color_name]
+        )
+        if len(color_data_list) > 0:
+            color_data = color_data_list[0]
 
-    edge_trace = go.Scatter(
-        x=edge_x,
-        y=edge_y,
-        line=dict(width=0.5, color="#888"),
-        hoverinfo="none",
-        mode="lines",
-    )
+        x_edges.append([x0, x1, None])
+        y_edges.append([y0, y1, None])
+        color_edges.append(color_data)
 
     node_x_power = []
     node_y_power = []
@@ -384,27 +420,70 @@ def create_networkx_plot(
         x, y = pos[node]
         node_data = graph.nodes[node]
         int_node = node_data["internal_node"]
-        color_data = df.loc[df["id"] == node_id][color_name][0]
+        color_data = 0
+        color_data_list = list(df.loc[df["id"] == node_id][color_name])
+        if len(color_data_list) > 0:
+            color_data = color_data_list[0]
+        node_text = (
+            str(type(int_node.grid).__name__)
+            + " - "
+            + str(type(int_node.model).__name__)
+            + " - "
+            + str(color_data)
+        )
         if not int_node.independent:
             node_cp_x.append(x)
             node_cp_y.append(y)
             node_color_cp.append(color_data)
-            node_text_cp.append(node_id)
+            node_text_cp.append(node_text)
         elif "Water" in str(type(int_node.grid)):
             node_x_heat.append(x)
             node_y_heat.append(y)
             node_color_heat.append(color_data)
-            node_text_heat.append(node_id)
+            node_text_heat.append(node_text)
         elif "Gas" in str(type(int_node.grid)):
             node_x_gas.append(x)
             node_y_gas.append(y)
             node_color_gas.append(color_data)
-            node_text_gas.append(node_id)
+            node_text_gas.append(node_text)
         elif "Power" in str(type(int_node.grid)):
             node_x_power.append(x)
             node_y_power.append(y)
             node_color_power.append(color_data)
-            node_text_power.append(node_id)
+            node_text_power.append(node_text)
+
+    max_color_val = max(
+        color_edges
+        if without_nodes
+        else node_color_gas
+        + node_color_cp
+        + node_color_heat
+        + node_color_power
+        + color_edges
+    )
+    edge_traces = []
+    for i in range(len(x_edges)):
+        edge_traces.append(
+            go.Scatter(
+                x=x_edges[i],
+                y=y_edges[i],
+                line=dict(
+                    width=3,
+                    color="rgb(0,0,0)"
+                    if max(color_edges) == 0
+                    else px.colors.sample_colorscale(
+                        px.colors.sequential.Sunsetdark,
+                        (color_edges[i] / max_color_val) + min(color_edges),
+                    )[0],
+                ),
+                hoverinfo="text",
+                mode="lines",
+                text=f"{color_edges[i]}",
+                marker=dict(
+                    coloraxis="coloraxis",
+                ),
+            )
+        )
 
     # cp
     node_trace_cp = go.Scatter(
@@ -412,11 +491,13 @@ def create_networkx_plot(
         y=node_cp_y,
         mode="markers",
         hoverinfo="text",
+        text=node_text_cp,
         marker=dict(
-            color="purple",
+            color=node_color_cp,
             symbol="diamond",
-            size=10,
-            line=dict(width=2, color="#888"),
+            size=9,
+            coloraxis="coloraxis",
+            line=dict(width=1, color="#7e1c99"),
         ),
     )
 
@@ -430,9 +511,9 @@ def create_networkx_plot(
         marker=dict(
             color=node_color_heat,
             symbol="pentagon",
-            size=10,
+            size=9,
             coloraxis="coloraxis",
-            line=dict(width=2, color="#888"),
+            line=dict(width=1, color="#9c2430"),
         ),
     )
     # power
@@ -445,9 +526,9 @@ def create_networkx_plot(
         marker=dict(
             color=node_color_power,
             symbol="square",
-            size=10,
+            size=9,
             coloraxis="coloraxis",
-            line=dict(width=2, color="#888"),
+            line=dict(width=1, color="#b89921"),
         ),
     )
     # gas
@@ -460,20 +541,35 @@ def create_networkx_plot(
         marker=dict(
             color=node_color_gas,
             symbol="triangle-up",
-            size=10,
+            size=9,
             coloraxis="coloraxis",
-            line=dict(width=2, color="#888"),
+            line=dict(width=1, color="#2c9425"),
         ),
     )
 
     fig = go.Figure(
-        data=[
-            edge_trace,
-            node_trace_heat,
-            node_trace_power,
-            node_trace_gas,
-            node_trace_cp,
-        ],
+        data=edge_traces
+        + (
+            [
+                go.Scatter(
+                    x=[None],
+                    y=[None],
+                    mode="markers",
+                    marker=dict(
+                        coloraxis="coloraxis",
+                        showscale=True,
+                    ),
+                    hoverinfo="none",
+                )
+            ]
+            if without_nodes
+            else [
+                node_trace_heat,
+                node_trace_power,
+                node_trace_gas,
+                node_trace_cp,
+            ]
+        ),
         layout=go.Layout(
             title=title,
             showlegend=False,
@@ -496,11 +592,19 @@ def create_networkx_plot(
         ),
     )
     fig.layout.coloraxis.showscale = True
-    fig.layout.coloraxis.colorscale = "YlGnBu"
-    fig.layout.coloraxis.reversescale = True
+    fig.layout.coloraxis.colorscale = "Sunsetdark"
+    fig.layout.coloraxis.reversescale = False
     fig.layout.coloraxis.colorbar.thickness = 15
     fig.layout.coloraxis.colorbar.xanchor = "left"
     fig.layout.coloraxis.colorbar.titleside = "right"
     fig.layout.coloraxis.colorbar.outlinewidth = 2
     fig.layout.coloraxis.colorbar.outlinecolor = "#888"
+    fig.layout.coloraxis.cmin = min(
+        node_color_gas
+        + node_color_cp
+        + node_color_heat
+        + node_color_power
+        + color_edges
+    )
+    fig.layout.coloraxis.cmax = max_color_val
     return fig
