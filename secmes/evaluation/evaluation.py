@@ -141,7 +141,7 @@ def create_bar(
     df,
     x_label,
     y_label,
-    color,
+    color=None,
     legend_text=None,
     height=400,
     width=600,
@@ -151,6 +151,7 @@ def create_bar(
     yaxis_title=None,
     color_discrete_sequence=None,
     color_discrete_map=None,
+    marker_color=None,
 ):
     fig = px.bar(
         df,
@@ -162,6 +163,8 @@ def create_bar(
         color_discrete_sequence=color_discrete_sequence,
         color_discrete_map=color_discrete_map,
     )
+    if marker_color is not None:
+        fig.update_traces(marker_color=marker_color)
     fig.update_layout(
         height=height,
         width=width,
