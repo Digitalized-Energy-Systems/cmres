@@ -117,8 +117,6 @@ def create_group_histogram(
         x=x_label,
         y=y_label,
         color=color,
-        range_x=(0, range_x),
-        range_y=(0, range_y),
         title=title,
         template=template,
         barmode="group",
@@ -152,6 +150,7 @@ def create_bar(
     color_discrete_sequence=None,
     color_discrete_map=None,
     marker_color=None,
+    barmode=None,
 ):
     fig = px.bar(
         df,
@@ -162,6 +161,7 @@ def create_bar(
         template=template,
         color_discrete_sequence=color_discrete_sequence,
         color_discrete_map=color_discrete_map,
+        barmode=barmode,
     )
     if marker_color is not None:
         fig.update_traces(marker_color=marker_color)
@@ -372,10 +372,26 @@ def create_scatter_with_df(
 import networkx.drawing.nx_agraph as nxd
 import networkx as nx
 import plotly.express as px
+import monee
+
+GRID_NAME_TO_SHIFT_X = {
+    "power": 0,
+    "heat": 0.0003,
+    "gas": 0.0006,
+    "None": 0.0003,
+    None: 0.0003,
+}
+GRID_NAME_TO_SHIFT_Y = {
+    "power": 0,
+    "heat": 0.0003,
+    "gas": 0.0006,
+    "None": -0.0003,
+    None: -0.0003,
+}
 
 
 def create_networkx_plot(
-    network,
+    network: monee.Network,
     df,
     color_name,
     color_legend_text=None,
@@ -384,13 +400,29 @@ def create_networkx_plot(
     without_nodes=False,
 ):
     graph: nx.Graph = network._network_internal
-    pos = nxd.pygraphviz_layout(graph, prog="neato")
+    # pos = nxd.pygraphviz_layout(graph, prog="neato")
+    # pos =
+    pos = {}
     x_edges = []
     y_edges = []
     color_edges = []
     for from_node, to_node, uid in graph.edges:
-        x0, y0 = pos[from_node]
-        x1, y1 = pos[to_node]
+        from_m_node = network.node_by_id(from_node)
+        to_m_node = network.node_by_id(to_node)
+        add_to_from_x = GRID_NAME_TO_SHIFT_X[from_m_node.grid.name]
+        add_to_from_y = GRID_NAME_TO_SHIFT_Y[from_m_node.grid.name]
+        add_to_to_x = GRID_NAME_TO_SHIFT_X[to_m_node.grid.name]
+        add_to_to_y = GRID_NAME_TO_SHIFT_Y[to_m_node.grid.name]
+        x0, y0 = (
+            from_m_node.position[0] + add_to_from_x,
+            from_m_node.position[1] + add_to_from_y,
+        )
+        x1, y1 = (
+            to_m_node.position[0] + add_to_to_x,
+            to_m_node.position[1] + add_to_to_y,
+        )
+        pos[from_node] = (x0, y0)
+        pos[to_node] = (x1, y1)
         color_data = 0
         color_data_list = list(
             df.loc[df["id"] == f"branch:({from_node}, {to_node}, {uid})"][color_name]
@@ -401,7 +433,6 @@ def create_networkx_plot(
         x_edges.append([x0, x1, None])
         y_edges.append([y0, y1, None])
         color_edges.append(color_data)
-
     node_x_power = []
     node_y_power = []
     node_color_power = []
@@ -500,7 +531,7 @@ def create_networkx_plot(
             symbol="diamond",
             size=9,
             coloraxis="coloraxis",
-            line=dict(width=1, color="#7e1c99"),
+            line=dict(width=1, color="#d3d3d3"),
         ),
     )
 
@@ -516,7 +547,7 @@ def create_networkx_plot(
             symbol="pentagon",
             size=9,
             coloraxis="coloraxis",
-            line=dict(width=1, color="#9c2430"),
+            line=dict(width=1, color="#d3d3d3"),
         ),
     )
     # power
@@ -531,7 +562,7 @@ def create_networkx_plot(
             symbol="square",
             size=9,
             coloraxis="coloraxis",
-            line=dict(width=1, color="#b89921"),
+            line=dict(width=1, color="#d3d3d3"),
         ),
     )
     # gas
@@ -546,7 +577,7 @@ def create_networkx_plot(
             symbol="triangle-up",
             size=9,
             coloraxis="coloraxis",
-            line=dict(width=1, color="#2c9425"),
+            line=dict(width=1, color="#d3d3d3"),
         ),
     )
 
