@@ -49,6 +49,7 @@ COLOR_SCALE_YB_3 = px.colors.sample_colorscale(YlGnBuDark, 3)
 
 CP_TYPE_COLOR_MAP = {"p2h": "#5e35b1", "p2g": "#00897b", "p2h": "#d81b60"}
 NETWORK_COLOR_MAP = {"heat": "#d32f2f", "gas": "#388e3c", "electricity": "#ffa000"}
+NETWORK_PATTERN_MAP = {"heat": ".", "gas": "\\", "electricity": "+"}
 NETWORK_COLOR_MAP_NUM = {"1": "#d32f2f", "2": "#388e3c", "0": "#ffa000"}
 AR_COLOR_MAP = {
     0.1: "rgb(65,182,196)",
@@ -149,6 +150,7 @@ def create_bar(
     yaxis_title=None,
     color_discrete_sequence=None,
     color_discrete_map=None,
+    pattern_shape_map=None,
     marker_color=None,
     barmode=None,
 ):
@@ -161,6 +163,7 @@ def create_bar(
         template=template,
         color_discrete_sequence=color_discrete_sequence,
         color_discrete_map=color_discrete_map,
+        pattern_shape_map=pattern_shape_map,
         barmode=barmode,
     )
     if marker_color is not None:
