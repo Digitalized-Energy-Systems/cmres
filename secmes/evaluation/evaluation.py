@@ -61,8 +61,18 @@ START_ALL_IN_ONE = '<h1>{}</h1><div style="display: flex;align-items: center;fle
 END_ALL_IN_ONE = "</div>"
 
 
+def get_title(fig, index, titles):
+    if hasattr(fig.layout, "title") and fig.layout.title.text:
+        return fig.layout.title.text
+    return titles[index]
+
+
+def slugify(str: str):
+    return str.replace("/", "").replace("<", "").replace(">", "")
+
+
 def write_all_in_one(
-    figures, scenario_name, out_path, out_filename, write_single_files=True
+    figures, scenario_name, out_path, out_filename, write_single_files=True, titles=None
 ):
     out_path.mkdir(parents=True, exist_ok=True)
     (out_path / out_filename).parent.mkdir(parents=True, exist_ok=True)
@@ -82,15 +92,15 @@ def write_all_in_one(
     if write_single_files:
         path_single_files = (out_path / out_filename).parent / "single"
         path_single_files.mkdir(parents=True, exist_ok=True)
-        for fig in figures:
+        for i, fig in enumerate(figures):
             fig.write_image(
                 path_single_files
                 / (
-                    fig.layout.title.text
+                    get_title(fig, i, titles)
                     + "-"
-                    + fig.layout.xaxis.title.text
+                    + slugify(fig.layout.xaxis.title.text)
                     + "-"
-                    + fig.layout.yaxis.title.text
+                    + slugify(fig.layout.yaxis.title.text)
                     + ".pdf"
                 )
             )
@@ -153,6 +163,7 @@ def create_bar(
     pattern_shape_map=None,
     marker_color=None,
     barmode=None,
+    showlegend=True,
 ):
     fig = px.bar(
         df,
@@ -176,6 +187,7 @@ def create_bar(
         xaxis_title=xaxis_title,
         yaxis_title=yaxis_title,
         xaxis_tickangle=-45,
+        showlegend=showlegend,
     )
     return fig
 
@@ -352,7 +364,7 @@ def create_scatter_with_df(
         height=height,
         width=width,
         margin={"l": 30, "b": 40, "r": 20, "t": 40},
-        legend={"title": legend_text, "y": 0.2, "x": 0.8},
+        legend={"title": legend_text, "y": 0, "x": 1},
         xaxis_title=xaxis_title,
         yaxis_title=yaxis_title,
     )
@@ -644,4 +656,98 @@ def create_networkx_plot(
         + color_edges
     )
     fig.layout.coloraxis.cmax = max_color_val
+    return fig
+
+
+import numpy as np
+
+
+def create_multilevel_grouped_bar_chart(
+    y_array_list,
+    color_list,
+    name_list,
+    group_labels,
+    group_size,
+    x_axis_labels,
+    yaxis_title,
+    title=None,
+    multi_level_distance=-0.18,
+):
+    fig = go.Figure()
+    common_x = np.array(list(range(len(y_array_list[0])))) + np.array(
+        [0.5 * (i // group_size) for i in range(len(y_array_list[0]))]
+    )
+
+    for i, color in enumerate(color_list):
+        fig.add_bar(
+            x=common_x,
+            y=y_array_list[i],
+            name=name_list[i],
+            marker_color=color,
+        )
+    for i, group_label in enumerate(group_labels):
+        fig.add_annotation(
+            text=group_label,
+            xref="paper",
+            yref="paper",
+            x=(common_x[i * group_size] + 2.5) / (max(common_x)),
+            y=multi_level_distance,
+            showarrow=False,
+            font_size=20,
+        )
+
+    # Layout
+    fig.update_layout(
+        barmode="stack",
+        showlegend=True,
+        template="plotly_white",
+        height=700,
+        width=1200,
+        legend=dict(
+            title="",
+            orientation="h",
+            traceorder="normal",
+            x=0.46,
+            y=1.05,
+            bgcolor="rgba(0,0,0,0)",
+            bordercolor="rgba(0,0,0,1)",
+            borderwidth=0,
+            font_size=20,
+        ),
+        title=title,
+    )
+
+    fig.update_yaxes(
+        showline=True,
+        showgrid=False,
+        linewidth=0.5,
+        linecolor="black",
+        title=yaxis_title,
+        titlefont=dict(size=24),
+        title_standoff=40,
+        ticks="outside",
+        dtick=2,
+        ticklen=10,
+        tickfont=dict(size=20),
+        range=[
+            0,
+            max(
+                [
+                    sum([y_array_list[i][j] for i in range(len(y_array_list))])
+                    for j in range(len(y_array_list[0]))
+                ]
+            )
+            + 0.5,
+        ],
+    )
+
+    fig.update_xaxes(
+        title="",
+        tickvals=common_x,
+        ticktext=x_axis_labels,
+        ticks="",
+        tickfont_size=20,
+        linecolor="black",
+        linewidth=1,
+    )
     return fig

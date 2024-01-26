@@ -24,15 +24,15 @@ from monee import Network
 
 
 FAIL_BASE_PROBABILITY_MAP = {
-    mm.Source: 0.2,
+    mm.Source: 0.1,
     mm.Sink: 0.0,
-    mm.PowerToGas: 0.2,
-    mm.PowerToHeat: 0.2,
-    mm.CHP: 0.2,
-    mm.GasToPower: 0.2,
-    mm.PowerGenerator: 0.3,
-    mm.HeatExchanger: 0.2,
-    mm.HeatExchangerGenerator: 0.2,
+    mm.PowerToGas: 0.1,
+    mm.PowerToHeat: 0.1,
+    mm.CHP: 0.1,
+    mm.GasToPower: 0.1,
+    mm.PowerGenerator: 0.2,
+    mm.HeatExchanger: 0.1,
+    mm.HeatExchangerGenerator: 0.1,
     mm.GenericPowerBranch: 0.01,
     mm.Trafo: 0.00,
     mm.WaterPipe: 0.005,

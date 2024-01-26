@@ -4,7 +4,7 @@ import monee.problem as mp
 
 BOUND_EL = ("vm_pu", 1, 0.2)
 BOUND_GAS = ("pressure_pa", 500000, 0.5)
-BOUND_HEAT = ("t_k", 352, 0.3)
+BOUND_HEAT = ("t_k", 352, 0.2)
 BOUND_LP = ("loading_percent", 0.75, 1)
 
 
