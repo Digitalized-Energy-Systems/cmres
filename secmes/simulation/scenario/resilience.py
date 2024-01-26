@@ -84,5 +84,6 @@ def start_resilience_simulation(
         sim.run()
     finally:
         flush_observed_data(out_name, id)
-
+    performance_sum = sum([sum(t) for t in observer.data()["performance"]])
     observer.clear()
+    return performance_sum

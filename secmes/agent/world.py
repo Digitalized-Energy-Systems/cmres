@@ -108,7 +108,7 @@ class CentralFaultyMoneeWorld:
             )
 
         # initial single run for initial observation
-        print(run_energy_flow(self.__net))
+        run_energy_flow(self.__net)
 
         self._init_func(self.__net)
 

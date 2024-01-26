@@ -85,7 +85,7 @@ def start_res_simulation(
     out_name=RES_SIM_NAME,
     id=0,
 ):
-    ssr.start_resilience_simulation(
+    return ssr.start_resilience_simulation(
         net,
         timeseries_data,
         resilience_model,
