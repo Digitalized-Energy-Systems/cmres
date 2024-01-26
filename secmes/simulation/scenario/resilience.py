@@ -84,6 +84,8 @@ def start_resilience_simulation(
         sim.run()
     finally:
         flush_observed_data(out_name, id)
-    performance_sum = sum([sum(t) for t in observer.data()["performance"]])
+    performance_sum = sum(
+        [sum(t) if type(t) == tuple else t for t in observer.data()["performance"]]
+    )
     observer.clear()
     return performance_sum
