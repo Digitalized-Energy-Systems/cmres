@@ -701,8 +701,8 @@ def create_multilevel_grouped_bar_chart(
         barmode="stack",
         showlegend=True,
         template="plotly_white",
-        height=700,
-        width=1200,
+        height=800,
+        width=1600,
         legend=dict(
             title="",
             orientation="h",
