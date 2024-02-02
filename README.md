@@ -1,3 +1,3 @@
 # CMRES
 
-Complex Multi-Energy System Resilience Simulation Framework
+Complex Multi-Energy System Resilience Simulation
