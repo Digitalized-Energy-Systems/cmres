@@ -12,8 +12,6 @@ Implementation of MGBM stopping criteria.
 }
 """
 
-import copy
-
 from interface import implements, Interface
 from overrides import overrides
 from pykalman import KalmanFilter
@@ -203,9 +201,11 @@ class ThresholdDecision(implements(StopDecision)):
     def decide_stop(self, evidences):
         return all(
             [
-                evidence > self.threshold
-                if self.__reverse
-                else evidence < self.threshold
+                (
+                    evidence > self.threshold
+                    if self.__reverse
+                    else evidence < self.threshold
+                )
                 for evidence in evidences
             ]
         )

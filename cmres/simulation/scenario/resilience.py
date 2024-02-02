@@ -2,12 +2,12 @@ from pathlib import Path
 import os
 import fcntl
 
-from secmes.agent.world import CentralFaultyMoneeWorld
-from secmes.resilience.fault import FaultGenerator
-from secmes.resilience.core import ResilienceMetric, ResilienceModel, RepairModel
-from secmes.resilience.model import CascadingModel
+from cmres.resilience.world import CentralFaultyMoneeWorld
+from cmres.resilience.fault import FaultGenerator
+from cmres.resilience.core import ResilienceMetric, ResilienceModel, RepairModel
+from cmres.resilience.model import CascadingModel
 
-import secmes.data.observer as observer
+import cmres.data.observer as observer
 
 from monee import Network, TimeseriesData
 import pandas

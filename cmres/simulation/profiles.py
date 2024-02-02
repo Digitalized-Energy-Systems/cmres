@@ -10,7 +10,7 @@ import simbench as sb
 import glob
 import pandas
 
-from secmes.mes.common import conversion_factor_kgps_to_mw
+from cmres.mes.common import conversion_factor_kgps_to_mw
 from monee import Network, TimeseriesData
 import monee.model as md
 

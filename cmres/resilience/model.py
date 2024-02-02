@@ -1,23 +1,23 @@
-from secmes.resilience.core import (
+from cmres.resilience.core import (
     ResilienceModel,
     RepairModel,
     Failure,
     Effect,
     StepModel,
 )
-from secmes.resilience.metric import (
+from cmres.resilience.metric import (
     GeneralResiliencePerformanceMetric,
     CascadingResilienceMetric,
 )
-from secmes.cn.network import name_of
+from cmres.resilience.fault import name_of
 from typing import List
 import random
 
 import numpy as np
 import scipy.stats as stats
 
-import secmes.data.observer as observer
-import secmes.omef.solver.monee as ms
+import cmres.data.observer as observer
+import cmres.omef.solver.monee as ms
 
 import monee.model as mm
 from monee import Network
@@ -74,8 +74,8 @@ class SimpleResilienceModel(ResilienceModel):
         self._time_model = lambda time: time_model(
             self._incident_timesteps + incident_shift, time
         )
-        self._spatial_model = (
-            lambda coords: spatial_model(coords) if coords is not None else 1
+        self._spatial_model = lambda coords: (
+            spatial_model(coords) if coords is not None else 1
         )
 
     def _read_impact(self, component):

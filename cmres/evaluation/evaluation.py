@@ -5,6 +5,11 @@ import plotly.express as px
 import plotly.graph_objects as go
 import plotly.io as pio
 
+import networkx.drawing.nx_agraph as nxd
+import networkx as nx
+import plotly.express as px
+import monee
+
 pio.kaleido.scope.mathjax = None
 
 pio.templates["publish"] = go.layout.Template(
@@ -383,11 +388,6 @@ def create_scatter_with_df(
         fig.data[0].mode = mode
     return fig
 
-
-import networkx.drawing.nx_agraph as nxd
-import networkx as nx
-import plotly.express as px
-import monee
 
 GRID_NAME_TO_SHIFT_X = {
     "power": 0,

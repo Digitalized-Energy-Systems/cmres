@@ -1,6 +1,4 @@
-from secmes.resilience.core import ResilienceMetric, PerformanceMetric
-
-from secmes.mes.common import conversion_factor_kgps_to_mw
+from cmres.resilience.core import ResilienceMetric, PerformanceMetric
 
 from monee import Network
 import monee.model as md

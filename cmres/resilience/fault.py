@@ -1,10 +1,17 @@
 from abc import ABC, abstractmethod
 from typing import List
-from secmes.resilience.core import *
-from secmes.cn.network import name_of
-import secmes.data.observer as observer
+from cmres.resilience.core import *
+import cmres.data.observer as observer
 
 from monee import StepHook
+
+
+def gen_id(node):
+    return f"{node.name}:{node.model}:{node.id}"
+
+
+def name_of(node):
+    return gen_id(node)
 
 
 class FaultExecutor(ABC):
