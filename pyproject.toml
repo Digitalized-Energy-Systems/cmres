@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cmres"
+version = "0.1"
+description = "Complex Multi-Energy System Resilience Simulation Framework"
+readme = "README.md"
+requires-python = ">=3.7.0"
+license = "MIT"
+authors = [
+  { name = "Rico Schrage", email = "rico.schrage@uni-oldenburg.de" }
+]
+classifiers = [
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.7",
+  "Programming Language :: Python :: Implementation :: CPython",
+  "Programming Language :: Python :: Implementation :: PyPy"
+]
+dependencies = [
+  "pandas==1.5.3",
+  "matplotlib",
+  "numpy==1.26.4",
+  "pandapipes==0.6.0",
+  "pandapower==2.9.0",
+  "peext",
+  "torch",
+  "overrides",
+  "networkx",
+  "numba",
+  "jax[cpu]",
+  "simbench",
+  "scipy",
+  "plotly==6.3.0",
+  "kaleido==0.2.1",
+  "pykalman-py311-update",
+  "python-interface",
+  "monee @ git+https://github.com/Digitalized-Energy-Systems/monee@main"
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest"
+]
+
+[tool.coverage.run]
+omit = ["tests/*"]

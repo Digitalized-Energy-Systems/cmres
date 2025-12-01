@@ -2,7 +2,7 @@ from cmres.resilience.core import ResilienceMetric, PerformanceMetric
 
 from monee import Network
 import monee.model as md
-
+import monee.problem as mp
 
 class rlist(list):
     def __init__(self, default):
@@ -34,41 +34,7 @@ class GeneralResiliencePerformanceMetric(PerformanceMetric):
         ]
 
     def calc(self, network):
-        relevant_components = self.get_relevant_components(network)
-        power_load_curtailed = 0
-        heat_load_curtailed = 0
-        gas_load_curtailed = 0
-
-        for component in relevant_components:
-            model = component.model
-            if component.ignored or not component.active:
-                if isinstance(model, md.PowerLoad):
-                    power_load_curtailed += md.upper(model.p_mw)
-                if isinstance(model, md.Sink):
-                    gas_load_curtailed += (
-                        (md.lower(model.mass_flow))
-                        * 3.6
-                        * component.grid.higher_heating_value
-                    )
-                if isinstance(model, (md.HeatExchangerLoad)):
-                    heat_load_curtailed += md.upper(model.q_w) / 10**6
-                continue
-
-            if isinstance(model, md.PowerLoad):
-                power_load_curtailed += md.upper(model.p_mw) - md.value(model.p_mw)
-            if isinstance(model, md.Sink):
-                gas_load_curtailed += (
-                    -(md.lower(model.mass_flow) + md.value(model.mass_flow))
-                    * 3.6
-                    * component.grid.higher_heating_value
-                )
-            if isinstance(model, (md.HeatExchangerLoad)):
-                heat_load_curtailed += (
-                    md.upper(model.q_w) - md.value(model.q_w)
-                ) / 10**6
-
-        return (power_load_curtailed, heat_load_curtailed, gas_load_curtailed)
-
+        return mp.calc_general_resilience_performance(network)
 
 class CascadingResilienceMetric(ResilienceMetric):
     def __init__(self) -> None:

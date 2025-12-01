@@ -9,7 +9,7 @@ from cmres.resilience.model import SimpleRepairModel, SimpleResilienceModel
 from cmres.simulation.scenarios import start_res_simulation
 from cmres.resilience.stopping import createMGBMStoppingCriterion
 
-import monee.network as mn
+import monee.network.mes as mes
 import monee.model as mm
 from monee.io.from_simbench import obtain_simbench_net
 from monee import TimeseriesData
@@ -25,16 +25,21 @@ INCIDENT_SHIFT = 0
 
 def create_common_network(simbench_id, cp_density_coeff):
     net_simbench = obtain_simbench_net(simbench_id)
+    new_mes = net_simbench.copy()
     for child in net_simbench.childs_by_type(mm.PowerGenerator):
         child.model.p_mw = child.model.p_mw * 4
-    return mn.generate_mes_based_on_power_net(
+    mes.create_gas_net_for_power(
         net_simbench,
-        heat_deployment_rate=1,
-        gas_deployment_rate=1,
-        p2g_density=0.1 * cp_density_coeff,
-        p2h_density=0.2 * cp_density_coeff,
-        chp_density=0.2 * cp_density_coeff,
+        new_mes,
+        1,
+        source_scaling=1,
+        default_diameter_m=0.64,
+        length_scale=0.001,
+        default_length=100000,
     )
+    return mes.create_monee_benchmark_net()
+    return new_mes
+
 
 
 def start_test_sim(
@@ -53,7 +58,7 @@ def start_test_sim(
     random.seed(seed)
 
     net = create_common_network(simbench_id, cp_density)
-
+    print(net.as_dataframe_dict_str())
     """
     td = (
         obtain_simbench_profile(simbench_id)
@@ -103,12 +108,12 @@ def start_test_sim(
 
 
 NUM_TO_EXP_MAP = [
-    (0, 0, 3, 0),
-    (3, 0, 0, 0),
-    (0, 3, 0, 0),
-    (0, 0, 0, 3),
-    (2, 2, 2, 2),
-    (1, 1, 1, 1),
+    # (3, 0, 0, 0), 
+    # (0, 0, 3, 0),
+    # (0, 3, 0, 0),
+    # (0, 0, 0, 3),
+    # (1, 1, 1, 1),
+    (5, 5, 5, 5),
 ]
 DENSITY_MAP = [0, 0.5, 1, 1.5, 2]
 

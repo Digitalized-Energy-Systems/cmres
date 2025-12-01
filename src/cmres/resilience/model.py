@@ -30,13 +30,15 @@ FAIL_BASE_PROBABILITY_MAP = {
     mm.PowerToHeat: 0.1,
     mm.CHP: 0.1,
     mm.GasToPower: 0.1,
-    mm.PowerGenerator: 0.2,
+    mm.PowerGenerator: 0.1,
     mm.HeatExchanger: 0.1,
     mm.HeatExchangerGenerator: 0.1,
-    mm.GenericPowerBranch: 0.01,
+    mm.HeatExchangerLoad: 0.1,
+    mm.GenericPowerBranch: 0.1,
+    mm.PowerLine: 0.1,
     mm.Trafo: 0.00,
-    mm.WaterPipe: 0.005,
-    mm.GasPipe: 0.01,
+    mm.WaterPipe: 0.1,
+    mm.GasPipe: 0.1,
     mm.Bus: 0.00,
     mm.Junction: 0.00,
 }
@@ -61,8 +63,10 @@ class SimpleResilienceModel(ResilienceModel):
         base_fail_probability_map=FAIL_BASE_PROBABILITY_MAP,
         fail_probability_model=FAILURE_PROBABILITY_MODEL,
         time_model=FAILURE_TIME_MODEL,
-        spatial_model=FAILURE_SPATIAL_MODEL,
+        spatial_mode=FAILURE_SPATIAL_MODEL,
+        base_fail=0.3,
     ) -> None:
+        self._base_fail = base_fail
         self._incident_shift = incident_shift
         self._incident_timesteps = incident_timesteps
         self._base_fail_probability_map = base_fail_probability_map
@@ -86,7 +90,7 @@ class SimpleResilienceModel(ResilienceModel):
         ):
             return self._mes_impact
 
-        if component.grid.name == "heat":
+        if component.grid.name == "water":
             return self._heat_impact
         elif component.grid.name == "power":
             return self._power_impact
@@ -100,12 +104,13 @@ class SimpleResilienceModel(ResilienceModel):
         if model_type not in self._base_fail_probability_map:
             return 0
         base_failure_probability = self._base_fail_probability_map[model_type]
-        coords = mm.calc_coordinates(network, component)
+        #coords = mm.calc_coordinates(network, component)
         return (
             self._fail_probability_model(base_failure_probability)
             * self._read_impact(component)
             * self._time_model(time)
-            * self._spatial_model(coords)
+            * self._base_fail
+         #   * self._spatial_model(coords)
         )
 
     def has_failed(self, model, time):
@@ -150,7 +155,10 @@ DMG_COEFF_FUNC_MAP = {
     mm.GasToPower: lambda model: mm.upper(model.from_mass_flow),
     mm.PowerGenerator: lambda model: mm.upper(model.p_mw),
     mm.HeatExchanger: lambda model: mm.upper(model.q_w),
+    mm.HeatExchangerGenerator: lambda model: mm.upper(model.q_w),
+    mm.HeatExchangerLoad: lambda model: mm.upper(model.q_w),
     mm.GenericPowerBranch: lambda model: model.br_r,
+    mm.PowerLine: lambda model: model.br_r,
     mm.Trafo: lambda _: 1,
     mm.WaterPipe: lambda model: model.length_m,
     mm.GasPipe: lambda model: model.length_m,
@@ -231,7 +239,8 @@ class CascadingModel(StepModel):
         self._last_performance = None
 
     def calc_performance(self, network: Network, without_load=False):
-        result = ms.solve(network, without_load=without_load)
+        result = ms.solve(network)
+        pm = self._performance_metric.calc(result.network)
         return (
             self._performance_metric.calc(result.network),
             result,
@@ -318,7 +327,6 @@ class CascadingModel(StepModel):
             self._last_performance = performance
         else:
             performance = self._last_performance
-            print("skipping new calculation")
 
         observer.gather("performance", performance)
 

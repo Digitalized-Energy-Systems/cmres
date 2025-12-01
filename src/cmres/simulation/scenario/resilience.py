@@ -81,6 +81,7 @@ def start_resilience_simulation(
     try:
         sim.prepare()
         cascading_model._faults = sim.faults
+        print(f"Starting resilience simulation using {[str(f) for f in sim.faults]}...")
         sim.run()
     finally:
         flush_observed_data(out_name, id)

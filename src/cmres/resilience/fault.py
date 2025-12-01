@@ -3,7 +3,7 @@ from typing import List
 from cmres.resilience.core import *
 import cmres.data.observer as observer
 
-from monee import StepHook
+from monee import StepHook, run_energy_flow
 
 
 def gen_id(node):
@@ -48,6 +48,9 @@ class DeadEffectFaultExecutor(FaultExecutor):
             "repair",
             {"step": time, "node": name_of(self._affected_component), "type": "repair"},
         )
+    
+    def __str__(self):
+        return f"DeadEffectFaultExecutor({name_of(self._affected_component)}, severity={self._severity})"
 
 
 class Fault:
@@ -69,6 +72,9 @@ class Fault:
     @property
     def stop_time(self):
         return self._stop_time
+    
+    def __str__(self):
+        return f"Fault(executor={self._fault_executor}, start_time={self._start_time}, stop_time={self._stop_time})"
 
 
 class FaultGenerator:
