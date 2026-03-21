@@ -1,4 +1,5 @@
 from pathlib import Path
+import logging
 import os
 import fcntl
 
@@ -11,6 +12,8 @@ import cmres.data.observer as observer
 
 from monee import Network, TimeseriesData
 import pandas
+
+log = logging.getLogger(__name__)
 
 
 def write_in_one_html(figures, name):
@@ -29,7 +32,7 @@ def flush_observed_data(experiment_name, id):
         out_file = out_path / Path(f"{key}.csv")
         dataframe = []
         for value in value_list:
-            if type(value) == dict:
+            if type(value) is dict:
                 dataframe.append({**value, **{"id": id}})
             if isinstance(value, (list, tuple)):
                 dataframe.append(
@@ -55,19 +58,20 @@ def start_resilience_simulation(
     name="RES_SIM",
     out_name="RES_SIM",
     id=0,
+    registry=None,
+    scenario=None,
 ):
-    networks = []
-
-    def iteration_step(net, _, time):
-        resilience_measurement_model.gather(net, time)
-        networks.append(net)
+    def iteration_step(net, step, step_state, step_result, base_net):
+        resilience_measurement_model.gather(net, step)
 
     cascading_model = CascadingModel()
 
     def init_func(net):
         _, __ = cascading_model.calc_performance(net, 0)
 
-    fault_gen = FaultGenerator(resilience_model, repair_model)
+    fault_gen = FaultGenerator(
+        resilience_model, repair_model, registry=registry, scenario=scenario
+    )
     sim = CentralFaultyMoneeWorld(
         iteration_step,
         init_func,
@@ -81,12 +85,21 @@ def start_resilience_simulation(
     try:
         sim.prepare()
         cascading_model._faults = sim.faults
-        print(f"Starting resilience simulation using {[str(f) for f in sim.faults]}...")
+        log.debug("Starting simulation  faults=%s", [str(f) for f in sim.faults])
         sim.run()
     finally:
+        log.debug("Flushing observer data  id=%s", id)
         flush_observed_data(out_name, id)
-    performance_sum = sum(
-        [sum(t) if type(t) == tuple else t for t in observer.data()["performance"]]
+
+    # Per-carrier performance sums: index 0=power, 1=heat, 2=gas.
+    # Each entry in observer.data()["performance"] is a 3-tuple (or scalar).
+    raw_perfs = observer.data().get("performance", [])
+    per_carrier = pandas.DataFrame(
+        [t if isinstance(t, (list, tuple)) else [t, 0.0, 0.0] for t in raw_perfs],
+        columns=["power", "heat", "gas"],
     )
+    carrier_sums = per_carrier.sum().to_numpy()  # shape (3,): [power, heat, gas]
+    performance_sum = float(carrier_sums.sum())  # scalar total (backwards-compat)
+
     observer.clear()
-    return performance_sum
+    return performance_sum, carrier_sums

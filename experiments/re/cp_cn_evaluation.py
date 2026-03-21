@@ -65,9 +65,11 @@ def extend_impact_df(cpd_to_net: Dict[float, Network], metrics_df, impact_df):
         node = cpd_to_net[row["cp_density"]].node_by_id(node_id)
         child_impact_df = impact_df[
             impact_df.apply(
-                lambda row_impact: row_impact["id"].startswith("child")
-                and int(row_impact["id"].split(":")[1]) in node.child_ids
-                and row_impact["cp_density"] == row["cp_density"],
+                lambda row_impact: (
+                    row_impact["id"].startswith("child")
+                    and int(row_impact["id"].split(":")[1]) in node.child_ids
+                    and row_impact["cp_density"] == row["cp_density"]
+                ),
                 axis=1,
             )
         ]
@@ -125,17 +127,21 @@ def create_impact_df(perf_df: pandas.DataFrame, repair_df, fail_df, metrics_df):
 
         node_in_perf_df = perf_df_with_cpd[
             perf_df_with_cpd.apply(
-                lambda row: (row["id"], row["experiment"]) in rules
-                and row["step"] >= rules[(row["id"], row["experiment"])][0]
-                and row["step"] <= rules[(row["id"], row["experiment"])][1],
+                lambda row: (
+                    (row["id"], row["experiment"]) in rules
+                    and row["step"] >= rules[(row["id"], row["experiment"])][0]
+                    and row["step"] <= rules[(row["id"], row["experiment"])][1]
+                ),
                 axis=1,
             )
         ]
         node_not_in_perf_df = perf_df_with_cpd[
             perf_df_with_cpd.apply(
-                lambda row: (row["id"], row["experiment"]) not in rules
-                or row["step"] < rules[(row["id"], row["experiment"])][0]
-                or row["step"] > rules[(row["id"], row["experiment"])][1],
+                lambda row: (
+                    (row["id"], row["experiment"]) not in rules
+                    or row["step"] < rules[(row["id"], row["experiment"])][0]
+                    or row["step"] > rules[(row["id"], row["experiment"])][1]
+                ),
                 axis=1,
             )
         ]
@@ -320,7 +326,7 @@ def load_dfs(folder_id):
         mes_impact = experiment_attributes[4]
         cp_density = float(experiment_attributes[5])
 
-        if not cp_density in cpd_to_net:
+        if cp_density not in cpd_to_net:
             with open(Path(experiment_desc) / Path("network.p"), "rb") as network_file:
                 monee_net = pickle.load(network_file)
                 print(monee_net.statistics())
@@ -408,17 +414,17 @@ def resilience_per_scenario(perf_df: pandas.DataFrame, folder_id):
             value_name="resilience_mean",
         )
     )
-    resilience_per_carrier_per_scenario[
-        "experiment"
-    ] = resilience_per_carrier_per_scenario["experiment"].apply(
-        lambda v: "-".join(v.split("/")[2].split("-")[1:-1])
+    resilience_per_carrier_per_scenario["experiment"] = (
+        resilience_per_carrier_per_scenario["experiment"].apply(
+            lambda v: "-".join(v.split("/")[2].split("-")[1:-1])
+        )
     )
-    resilience_per_carrier_per_scenario[
-        "carrier"
-    ] = resilience_per_carrier_per_scenario["carrier"].apply(
-        lambda v: CARRIER_REPLACE_MAP[v]
+    resilience_per_carrier_per_scenario["carrier"] = (
+        resilience_per_carrier_per_scenario["carrier"].apply(
+            lambda v: CARRIER_REPLACE_MAP[v]
+        )
     )
-    resilience_per_carrier_per_scenario_hist = eval.create_bar(
+    eval.create_bar(
         resilience_per_carrier_per_scenario,
         x_label="experiment",
         y_label="resilience_mean",
@@ -578,7 +584,7 @@ def impact_over_metrics(
                 metric,
                 "impact",
                 color_label="type_y",
-                yaxis_title=f"impact",
+                yaxis_title="impact",
                 xaxis_title=metric,
                 legend_text="type",
             )
@@ -594,7 +600,7 @@ def impact_over_metrics(
                     metric,
                     "impact",
                     color_label="type_y",
-                    yaxis_title=f"impact",
+                    yaxis_title="impact",
                     xaxis_title=metric,
                     legend_text="type",
                 )
@@ -610,7 +616,7 @@ def impact_over_metrics(
                 monee_net,
                 metric_impact_df_carrier_cpd,
                 color_name="impact",
-                color_legend_text=f"impact",
+                color_legend_text="impact",
                 template="plotly_white+publish",
             )
         )
@@ -620,7 +626,7 @@ def impact_over_metrics(
                 monee_net,
                 metric_impact_df_carrier_cpd,
                 color_name="impact",
-                color_legend_text=f"impact",
+                color_legend_text="impact",
                 template="plotly_white+publish",
                 without_nodes=True,
             )
@@ -680,7 +686,7 @@ def impact_aggregated_component_carrier(impact_df: pandas.DataFrame, folder_id):
             showlegend=False,
         )
     ]
-    titles.append(f"Average impacts by component type")
+    titles.append("Average impacts by component type")
     figures += [
         eval.create_bar(
             impact_per_component,
@@ -695,7 +701,7 @@ def impact_aggregated_component_carrier(impact_df: pandas.DataFrame, folder_id):
             showlegend=False,
         )
     ]
-    titles.append(f"Total impacts by component type")
+    titles.append("Total impacts by component type")
     # carrier type with carrier impacts
     figures += [
         eval.create_bar(
@@ -711,7 +717,7 @@ def impact_aggregated_component_carrier(impact_df: pandas.DataFrame, folder_id):
             showlegend=False,
         )
     ]
-    titles.append(f"Average impacts by carrier type")
+    titles.append("Average impacts by carrier type")
     figures += [
         eval.create_bar(
             impact_per_carrier,
@@ -726,7 +732,7 @@ def impact_aggregated_component_carrier(impact_df: pandas.DataFrame, folder_id):
             showlegend=False,
         )
     ]
-    titles.append(f"Total impacts by carrier type")
+    titles.append("Total impacts by carrier type")
 
     average_impact_per_carrier_cpd = (
         new_impact_df.groupby(["type_carrier", "carrier", "cp_density"])
@@ -762,7 +768,7 @@ def impact_aggregated_component_carrier(impact_df: pandas.DataFrame, folder_id):
             showlegend=False,
         )
     ]
-    titles.append(f"Average impacts by carrier type and density")
+    titles.append("Average impacts by carrier type and density")
     figures += [
         eval.create_bar(
             impact_per_carrier_cpd,
@@ -777,7 +783,7 @@ def impact_aggregated_component_carrier(impact_df: pandas.DataFrame, folder_id):
             showlegend=False,
         )
     ]
-    titles.append(f"Total impacts by carrier type and density")
+    titles.append("Total impacts by carrier type and density")
 
     average_impact_per_cpd = (
         new_impact_df.groupby(["carrier", "cp_density"]).mean().reset_index()
@@ -804,7 +810,7 @@ def impact_aggregated_component_carrier(impact_df: pandas.DataFrame, folder_id):
             showlegend=False,
         )
     ]
-    titles.append(f"Average impacts by density")
+    titles.append("Average impacts by density")
     figures += [
         eval.create_bar(
             total_impact_per_cpd,
@@ -819,7 +825,7 @@ def impact_aggregated_component_carrier(impact_df: pandas.DataFrame, folder_id):
             showlegend=False,
         )
     ]
-    titles.append(f"Total impacts by density")
+    titles.append("Total impacts by density")
 
     eval.write_all_in_one(
         figures,
@@ -849,6 +855,7 @@ def evaluate(folder_id):
 
 def main():
     evaluate("data/res_31_01_24")
+
 
 if __name__ == "__main__":
     main()

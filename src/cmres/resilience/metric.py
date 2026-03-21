@@ -4,6 +4,7 @@ from monee import Network
 import monee.model as md
 import monee.problem as mp
 
+
 class rlist(list):
     def __init__(self, default):
         self._default = default
@@ -35,6 +36,7 @@ class GeneralResiliencePerformanceMetric(PerformanceMetric):
 
     def calc(self, network):
         return mp.calc_general_resilience_performance(network)
+
 
 class CascadingResilienceMetric(ResilienceMetric):
     def __init__(self) -> None:

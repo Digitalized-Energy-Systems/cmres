@@ -1,12 +1,22 @@
-"""Module for simulating the world. Contains the main loop and asyncio loop handling.
-"""
+"""Module for simulating the world. Contains the main loop and asyncio loop handling."""
+
+import logging
 
 import cmres.data.observer as observer
 
+import monee.model as mm
+from monee import (
+    Network,
+    PyomoSolver,
+    StepHook,
+    TimeseriesData,
+    run_energy_flow,
+    run_timeseries,
+)
+
 from cmres.resilience.fault import FaultInjector
 
-from monee import Network, TimeseriesData, run_energy_flow, run_timeseries, StepHook
-import monee.model as mm
+log = logging.getLogger(__name__)
 
 
 def gen_id(el):
@@ -72,16 +82,18 @@ class CentralFaultyMoneeWorld:
         self.run_loop()
 
     def prepare(self):
-        self.faults = self._fault_generator.generate(self.__net)
         if self._fault_generator is not None:
-            self._step_hooks.append(
-                FaultInjector(
-                    self.faults,
-                )
-            )
+            self.faults = self._fault_generator.generate(self.__net)
+            self._step_hooks.append(FaultInjector(self.faults))
+        else:
+            self.faults = []
+
+        log.debug(
+            "Faults (%d): %s", len(self.faults), ", ".join(str(f) for f in self.faults)
+        )
 
         # initial single run for initial observation
-        run_energy_flow(self.__net)
+        run_energy_flow(self.__net, solver=PyomoSolver())
 
         self._init_func(self.__net)
 

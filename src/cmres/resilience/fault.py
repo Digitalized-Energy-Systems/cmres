@@ -1,9 +1,10 @@
 from abc import ABC, abstractmethod
 from typing import List
-from cmres.resilience.core import *
-import cmres.data.observer as observer
 
-from monee import StepHook, run_energy_flow
+from monee import StepHook, Network
+
+import cmres.data.observer as observer
+from cmres.resilience.core import Failure, Effect, ResilienceModel, RepairModel
 
 
 def gen_id(node):
@@ -48,7 +49,7 @@ class DeadEffectFaultExecutor(FaultExecutor):
             "repair",
             {"step": time, "node": name_of(self._affected_component), "type": "repair"},
         )
-    
+
     def __str__(self):
         return f"DeadEffectFaultExecutor({name_of(self._affected_component)}, severity={self._severity})"
 
@@ -72,22 +73,31 @@ class Fault:
     @property
     def stop_time(self):
         return self._stop_time
-    
+
     def __str__(self):
         return f"Fault(executor={self._fault_executor}, start_time={self._start_time}, stop_time={self._stop_time})"
 
 
 class FaultGenerator:
     def __init__(
-        self, resilience_model: ResilienceModel, repair_model: RepairModel
+        self,
+        resilience_model: ResilienceModel,
+        repair_model: RepairModel,
+        registry=None,
+        scenario=None,
     ) -> None:
         self._resilience_model = resilience_model
         self._repair_model = repair_model
+        self._registry = registry
+        self._scenario = scenario
 
     @staticmethod
-    def create_fault_executor(effect: Effect, severity: float, component) -> Fault:
+    def create_fault_executor(
+        effect: Effect, severity: float, component
+    ) -> "FaultExecutor":
         if effect == Effect.DEAD:
             return DeadEffectFaultExecutor(component=component, severity=severity)
+        raise NotImplementedError(f"No FaultExecutor defined for effect {effect!r}")
 
     @staticmethod
     def to_fault_obj(failure: Failure) -> Fault:
@@ -100,8 +110,12 @@ class FaultGenerator:
         )
 
     def generate(self, network) -> List[Fault]:
-        failures = self.failures = self._resilience_model.generate_failures(network)
-        self._repair_model.generate_repairs(network, failures)
+        failures = self.failures = self._resilience_model.generate_failures(
+            network, registry=self._registry, scenario=self._scenario
+        )
+        self._repair_model.generate_repairs(
+            network, failures, registry=self._registry, scenario=self._scenario
+        )
         return [FaultGenerator.to_fault_obj(failure) for failure in failures]
 
 
@@ -112,7 +126,7 @@ class FaultInjector(StepHook):
     ):
         self._faults = faults
 
-    def pre_run(self, base_net, step):
+    def pre_run(self, base_net, step, step_state):
         if self._faults is not None:
             for fault in self._faults:
                 if step == fault.start_time:

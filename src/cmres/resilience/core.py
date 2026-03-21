@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from abc import abstractmethod, ABC
+from enum import Enum
 from typing import List
 
 from monee.model import Component, Network
@@ -21,7 +22,7 @@ class ResilienceMetric(ABC):
         pass
 
 
-class Effect(enumerate):
+class Effect(Enum):
     DEAD = 0
     DECREASED_CAPACITY = 1
 
@@ -40,13 +41,15 @@ class Failure:
 
 class RepairModel(ABC):
     @abstractmethod
-    def generate_repairs(self, network, failures: List[Failure]):
+    def generate_repairs(
+        self, network, failures: List[Failure], registry=None, scenario=None
+    ):
         pass
 
 
 class ResilienceModel(ABC):
     @abstractmethod
-    def generate_failures(self, network):
+    def generate_failures(self, network, registry=None, scenario=None):
         pass
 
 

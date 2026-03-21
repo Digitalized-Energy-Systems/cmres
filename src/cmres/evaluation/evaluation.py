@@ -5,10 +5,10 @@ import plotly.express as px
 import plotly.graph_objects as go
 import plotly.io as pio
 
-import networkx.drawing.nx_agraph as nxd
 import networkx as nx
-import plotly.express as px
 import monee
+
+import numpy as np
 
 pio.kaleido.scope.mathjax = None
 
@@ -52,7 +52,7 @@ COLOR_SCALE_AR = px.colors.sample_colorscale(px.colors.sequential.Plasma_r, 100)
 COLOR_SCALE_AR_10 = px.colors.sample_colorscale(px.colors.sequential.Plasma_r, 10)
 COLOR_SCALE_YB_3 = px.colors.sample_colorscale(YlGnBuDark, 3)
 
-CP_TYPE_COLOR_MAP = {"p2h": "#5e35b1", "p2g": "#00897b", "p2h": "#d81b60"}
+CP_TYPE_COLOR_MAP = {"p2h": "#5e35b1", "p2g": "#00897b"}
 NETWORK_COLOR_MAP = {"heat": "#d32f2f", "gas": "#388e3c", "electricity": "#ffa000"}
 NETWORK_PATTERN_MAP = {"heat": ".", "gas": "\\", "electricity": "+"}
 NETWORK_COLOR_MAP_NUM = {"1": "#d32f2f", "2": "#388e3c", "0": "#ffa000"}
@@ -657,9 +657,6 @@ def create_networkx_plot(
     )
     fig.layout.coloraxis.cmax = max_color_val
     return fig
-
-
-import numpy as np
 
 
 def create_multilevel_grouped_bar_chart(

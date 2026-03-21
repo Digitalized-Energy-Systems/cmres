@@ -108,7 +108,8 @@ class PerformanceVarianceIndicator(implements(ProgressIndicator)):
 
     @overrides
     def compute_indicator(self, population):
-        return np.var(population[0 : min(self.__backsight, len(population))]) / 10
+        # Use the most-recent `backsight` samples, not the first ones.
+        return np.var(population[-min(self.__backsight, len(population)) :]) / 10
 
 
 class IterationCountIndicator(implements(ProgressIndicator)):
