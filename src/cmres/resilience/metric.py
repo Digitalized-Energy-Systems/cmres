@@ -35,7 +35,7 @@ class GeneralResiliencePerformanceMetric(PerformanceMetric):
         ]
 
     def calc(self, network):
-        return mp.calc_general_resilience_performance(network)
+        return mp.calc_general_resilience_performance(network, include_ext_grid=False)
 
 
 class CascadingResilienceMetric(ResilienceMetric):

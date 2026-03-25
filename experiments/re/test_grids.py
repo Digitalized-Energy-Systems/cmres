@@ -36,6 +36,8 @@ from monee.model.formulation import MISOCP_NETWORK_FORMULATION
 import monee.problem as mp
 from monee.network import (
     create_urban_district_net,
+    create_resilient_urban_mes_net,
+    create_balanced_urban_mes_timeseries,
     create_industrial_hub_net,
     create_regional_mes_net,
 )
@@ -139,6 +141,7 @@ def make_regional_mes_timeseries(
 # =============================================================================
 
 ALL_GRIDS = {
+    "large_urban_balanced": (create_resilient_urban_mes_net, create_balanced_urban_mes_timeseries),
     "urban_district": (create_urban_district_net, make_urban_district_timeseries),
     "industrial_hub": (create_industrial_hub_net, make_industrial_hub_timeseries),
     "regional_mes": (create_regional_mes_net, make_regional_mes_timeseries),

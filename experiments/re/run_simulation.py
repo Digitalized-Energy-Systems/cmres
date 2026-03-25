@@ -91,7 +91,7 @@ REPAIR_DELAY = 5
 
 # MC convergence
 MC_REL_TOL = 0.05  # 5 % relative CI
-MC_MAX_RUNS = 2000  # hard cap (≈ 1000 Sobol pairs)
+MC_MAX_RUNS = 2**14  # power of 2
 MC_MIN_RUNS = 200  # warm-up before convergence check
 MC_ANTITHETIC = True
 
