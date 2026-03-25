@@ -37,7 +37,7 @@ dependencies = [
   "kaleido==0.2.1",
   "pykalman-py311-update",
   "python-interface",
-  "monee @ git+https://github.com/Digitalized-Energy-Systems/monee@main"
+  "monee @ git+https://github.com/Digitalized-Energy-Systems/monee@development"
 ]
 
 [project.optional-dependencies]
