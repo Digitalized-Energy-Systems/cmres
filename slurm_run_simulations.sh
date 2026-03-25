@@ -34,7 +34,7 @@ export JAX_NUM_THREADS=${SLURM_CPUS_PER_TASK}
 export NUMBA_NUM_THREADS=${SLURM_CPUS_PER_TASK}
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-SCRIPT="./experiments/re/run_simulation.py"
+SCRIPT="./cmres/experiments/re/run_simulation.py"
 DATA_DIR="./data/res"
 LOG_DIR="./logs"
 
