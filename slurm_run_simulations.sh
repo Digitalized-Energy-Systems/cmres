@@ -62,8 +62,6 @@ source venv/bin/activate
  
 cd ./cmres
 pip install -e .
-cd ../monee 
-pip install -e .
 cd ..
 
 python "${SCRIPT}" "${SLURM_ARRAY_TASK_ID}" ${RESUME_FLAG}
