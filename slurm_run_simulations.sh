@@ -22,26 +22,11 @@
 #SBATCH --cpus-per-task=8            # JAX / numba / torch use internal threads
 #SBATCH --mem=64G
 #SBATCH --time=16:00:00              # generous; most runs finish in <2 h
-#SBATCH --partition=compute          # adjust to your cluster's partition name
 #SBATCH --output=logs/slurm_%A_%a.out
 #SBATCH --error=logs/slurm_%A_%a.err
 #SBATCH --mail-type=FAIL             # notify only on failure
 #SBATCH --mail-user=rico.schrage@uni-oldenburg.de
 
-# ── Environment ───────────────────────────────────────────────────────────────
-# Adjust the block below to match your HPC's module system / conda setup.
-
-# Option A — conda (most common):
-# module load miniconda3
-# conda activate cmres
-
-# Option B — venv:
-# source /path/to/venv/bin/activate
-
-# Option C — module-based Python + pip-installed env:
-# module load python/3.11
-
-# Limit background threading to the allocated cores so tasks don't compete.
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK}
 export MKL_NUM_THREADS=${SLURM_CPUS_PER_TASK}
 export OPENBLAS_NUM_THREADS=${SLURM_CPUS_PER_TASK}
@@ -49,10 +34,9 @@ export JAX_NUM_THREADS=${SLURM_CPUS_PER_TASK}
 export NUMBA_NUM_THREADS=${SLURM_CPUS_PER_TASK}
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
-SCRIPT="${REPO_ROOT}/experiments/re/run_simulation.py"
-DATA_DIR="${REPO_ROOT}/data/res"
-LOG_DIR="${REPO_ROOT}/logs"
+SCRIPT="./experiments/re/run_simulation.py"
+DATA_DIR="./data/res"
+LOG_DIR="./logs"
 
 mkdir -p "${DATA_DIR}" "${LOG_DIR}"
 
@@ -71,7 +55,15 @@ echo "Experiment  : ${SLURM_ARRAY_TASK_ID} / 18"
 echo "Started at  : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "============================================================"
 
-cd "${REPO_ROOT}"
+module load hpc-env/13.1
+module load Python/3.11.3-GCCcore-13.1.0
+
+source venv/bin/activate
+ 
+cd ./cmres
+pip install -e .
+cd ../monee install -e .
+cd ..
 
 python "${SCRIPT}" "${SLURM_ARRAY_TASK_ID}" ${RESUME_FLAG}
 
