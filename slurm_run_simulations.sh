@@ -56,10 +56,10 @@ echo "Started at  : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "============================================================"
 
 module load hpc-env/13.1
-module load Python/3.11.3-GCCcore-13.1.0
+module load Miniforge3/26.1.0-0
 
-source venv/bin/activate
- 
+conda activate cmres_env
+
 # cd ./cmres
 # pip install -e .
 # cd ..

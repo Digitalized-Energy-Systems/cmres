@@ -20,11 +20,9 @@ classifiers = [
   "Programming Language :: Python :: Implementation :: PyPy"
 ]
 dependencies = [
-  "pandas==1.5.3",
+  "pandas",
   "matplotlib",
-  "numpy==1.26.4",
-  "pandapipes==0.6.0",
-  "pandapower==2.9.0",
+  "numpy",
   "peext",
   "torch",
   "overrides",
