@@ -60,9 +60,9 @@ module load Python/3.11.3-GCCcore-13.1.0
 
 source venv/bin/activate
  
-cd ./cmres
-pip install -e .
-cd ..
+# cd ./cmres
+# pip install -e .
+# cd ..
 
 python "${SCRIPT}" "${SLURM_ARRAY_TASK_ID}" ${RESUME_FLAG}
 
