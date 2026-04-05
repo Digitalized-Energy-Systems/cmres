@@ -15,25 +15,25 @@ pio.kaleido.scope.mathjax = None
 pio.templates["publish"] = go.layout.Template(
     layout=go.Layout(
         font=dict(family="sans-serif", size=19),
-        titlefont=dict(family="sans-serif", size=19),
+        title=dict(font=dict(family="sans-serif", size=19)),
     )
 )
 pio.templates["publish3"] = go.layout.Template(
     layout=go.Layout(
         font=dict(family="sans-serif", size=19),
-        titlefont=dict(family="sans-serif", size=19),
+        title=dict(font=dict(family="sans-serif", size=19)),
     )
 )
 pio.templates["publish2"] = go.layout.Template(
     layout=go.Layout(
         font=dict(family="sans-serif", size=13),
-        titlefont=dict(family="sans-serif", size=13),
+        title=dict(font=dict(family="sans-serif", size=13)),
     )
 )
 pio.templates["publish1"] = go.layout.Template(
     layout=go.Layout(
         font=dict(family="sans-serif", size=9),
-        titlefont=dict(family="sans-serif", size=9),
+        title=dict(font=dict(family="sans-serif", size=9)),
     )
 )
 
@@ -381,7 +381,7 @@ def create_scatter_with_df(
         )
         fig.layout.coloraxis.colorbar.thickness = 15
         fig.layout.coloraxis.colorbar.xanchor = "left"
-        fig.layout.coloraxis.colorbar.titleside = "right"
+        fig.layout.coloraxis.colorbar.title.side = "right"
         fig.layout.coloraxis.colorbar.outlinewidth = 2
         fig.layout.coloraxis.colorbar.outlinecolor = "#888"
     if mode is not None:
@@ -392,6 +392,7 @@ def create_scatter_with_df(
 GRID_NAME_TO_SHIFT_X = {
     "power": 0,
     "heat": 0.0003,
+    "water": 0.0003,
     "gas": 0.0006,
     "None": 0.0003,
     None: 0.0003,
@@ -399,6 +400,7 @@ GRID_NAME_TO_SHIFT_X = {
 GRID_NAME_TO_SHIFT_Y = {
     "power": 0,
     "heat": 0.0003,
+    "water": 0.0003,
     "gas": 0.0006,
     "None": -0.0003,
     None: -0.0003,
@@ -415,8 +417,8 @@ def create_networkx_plot(
     without_nodes=False,
 ):
     graph: nx.Graph = network._network_internal
-    # pos = nxd.pygraphviz_layout(graph, prog="neato")
-    # pos =
+    # pre-compute spring layout for nodes that have no position
+    fallback_pos = nx.spring_layout(graph, seed=42)
     pos = {}
     x_edges = []
     y_edges = []
@@ -424,17 +426,21 @@ def create_networkx_plot(
     for from_node, to_node, uid in graph.edges:
         from_m_node = network.node_by_id(from_node)
         to_m_node = network.node_by_id(to_node)
-        add_to_from_x = GRID_NAME_TO_SHIFT_X[from_m_node.grid.name]
-        add_to_from_y = GRID_NAME_TO_SHIFT_Y[from_m_node.grid.name]
-        add_to_to_x = GRID_NAME_TO_SHIFT_X[to_m_node.grid.name]
-        add_to_to_y = GRID_NAME_TO_SHIFT_Y[to_m_node.grid.name]
+        from_grid = from_m_node.grid[0] if isinstance(from_m_node.grid, list) else from_m_node.grid
+        to_grid = to_m_node.grid[0] if isinstance(to_m_node.grid, list) else to_m_node.grid
+        add_to_from_x = GRID_NAME_TO_SHIFT_X[from_grid.name]
+        add_to_from_y = GRID_NAME_TO_SHIFT_Y[from_grid.name]
+        add_to_to_x = GRID_NAME_TO_SHIFT_X[to_grid.name]
+        add_to_to_y = GRID_NAME_TO_SHIFT_Y[to_grid.name]
+        from_pos = from_m_node.position if from_m_node.position is not None else fallback_pos[from_node]
+        to_pos = to_m_node.position if to_m_node.position is not None else fallback_pos[to_node]
         x0, y0 = (
-            from_m_node.position[0] + add_to_from_x,
-            from_m_node.position[1] + add_to_from_y,
+            from_pos[0] + add_to_from_x,
+            from_pos[1] + add_to_from_y,
         )
         x1, y1 = (
-            to_m_node.position[0] + add_to_to_x,
-            to_m_node.position[1] + add_to_to_y,
+            to_pos[0] + add_to_to_x,
+            to_pos[1] + add_to_to_y,
         )
         pos[from_node] = (x0, y0)
         pos[to_node] = (x1, y1)
@@ -466,7 +472,7 @@ def create_networkx_plot(
     node_text_cp = []
     for node in graph.nodes:
         node_id = f"node:{node}"
-        x, y = pos[node]
+        x, y = pos.get(node, fallback_pos[node])
         node_data = graph.nodes[node]
         int_node = node_data["internal_node"]
         color_data = 0
@@ -645,7 +651,7 @@ def create_networkx_plot(
     fig.layout.coloraxis.reversescale = False
     fig.layout.coloraxis.colorbar.thickness = 15
     fig.layout.coloraxis.colorbar.xanchor = "left"
-    fig.layout.coloraxis.colorbar.titleside = "right"
+    fig.layout.coloraxis.colorbar.title.side = "right"
     fig.layout.coloraxis.colorbar.outlinewidth = 2
     fig.layout.coloraxis.colorbar.outlinecolor = "#888"
     fig.layout.coloraxis.cmin = min(
@@ -719,9 +725,7 @@ def create_multilevel_grouped_bar_chart(
         showgrid=False,
         linewidth=0.5,
         linecolor="black",
-        title=yaxis_title,
-        titlefont=dict(size=24),
-        title_standoff=40,
+        title=dict(text=yaxis_title, font=dict(size=24), standoff=40),
         ticks="outside",
         dtick=2,
         ticklen=10,

@@ -40,7 +40,7 @@ class CPMetricConfig:
     W_HEAT: float = 1.0
 
     # Topology scaling: topo_factor = 1 + TOPO_ALPHA*BC_group
-    TOPO_ALPHA: float = 1.0
+    TOPO_ALPHA: float = 1
 
     # Throughput scaling
     USE_THROUGHPUT_PROXY: bool = True
@@ -56,7 +56,7 @@ class CPMetricConfig:
     # Override per-branch thermal limit (MVA) for all power branches.
     # Use when the model stores an unrealistic max_i_ka (e.g. benchmark placeholder).
     # None = use model value as-is.
-    POWER_BRANCH_LIMIT_MVA_OVERRIDE: Optional[float] = 66.3
+    POWER_BRANCH_LIMIT_MVA_OVERRIDE: Optional[float] = None
 
     # Binding constraint visibility
     BINDING_MARGIN_EPS: float = 1e-6
@@ -822,10 +822,104 @@ def compute_physical_topology_metrics(monee_net):
     return G, bc, deg, debug
 
 
-def _group_bc(G, compound):
+def compute_stress_topology_metrics(monee_net, ctx: "CarrierPTDFContext", cfg: "CPMetricConfig"):
+    """
+    Betweenness centrality weighted by branch stress = |flow| / margin.
+    More stressed (loaded) branches are treated as shorter paths
+    (weight = 1 / (stress + eps)), so BC highlights nodes that lie
+    on paths through congested branches.
+
+    Returns: (G, bc_nodes, debug)
+    """
+    # Build stress lookup: branch_id -> loading stress
+    stress_by_id = {}
+
+    if "built" in ctx.power:
+        for i, bid in enumerate(ctx.power["branch_ids"]):
+            margin = float(ctx.power["margins"][i]) if i < len(ctx.power["margins"]) else cfg.MIN_MARGIN
+            try:
+                flow0 = abs(_first_attr(monee_net.branch_by_id(bid).model,
+                                        ["p_from_mw", "p_mw", "p_from", "p"], default=0.0))
+            except Exception:
+                flow0 = 0.0
+            stress_by_id[bid] = float(flow0) / (margin + cfg.EPS_MARGIN)
+
+    if "built" in ctx.gas:
+        for i, pid in enumerate(ctx.gas["pipe_ids"]):
+            margin = float(ctx.gas["margins"][i]) if i < len(ctx.gas["margins"]) else cfg.MIN_MARGIN
+            try:
+                flow0 = abs(_first_attr(monee_net.branch_by_id(pid).model,
+                                        ["mass_flow", "mass_flow_pos", "m_dot"], default=0.0))
+            except Exception:
+                flow0 = 0.0
+            stress_by_id[pid] = float(flow0) / (margin + cfg.EPS_MARGIN)
+
+    if "built" in ctx.heat:
+        for i, pid in enumerate(ctx.heat["pipe_ids"]):
+            margin = float(ctx.heat["margins"][i]) if i < len(ctx.heat["margins"]) else cfg.MIN_MARGIN
+            try:
+                flow0 = abs(_first_attr(monee_net.branch_by_id(pid).model,
+                                        ["mass_flow", "mass_flow_pos", "m_dot"], default=0.0))
+            except Exception:
+                flow0 = 0.0
+            stress_by_id[pid] = float(flow0) / (margin + cfg.EPS_MARGIN)
+
+    G0 = monee_net._network_internal
+    G = nx.Graph(G0)
+
+    EPS = 1e-9
+    mapped = 0
+    total = 0
+
+    for u, v, data in G.edges(data=True):
+        total += 1
+        stress_val = None
+
+        # Try branch_id from edge data
+        bid = data.get("branch_id", None)
+        if bid is not None and bid in stress_by_id:
+            stress_val = stress_by_id[bid]
+            mapped += 1
+
+        # Try edge key as branch_id tuple
+        if stress_val is None:
+            for candidate in [(u, v, 0), (v, u, 0), (u, v), (v, u)]:
+                if candidate in stress_by_id:
+                    stress_val = stress_by_id[candidate]
+                    mapped += 1
+                    break
+
+        # Try monee branch lookup
+        if stress_val is None:
+            for candidate in [(u, v), (v, u)]:
+                try:
+                    br = monee_net.branch_by_id(candidate)
+                    if br.id in stress_by_id:
+                        stress_val = stress_by_id[br.id]
+                        mapped += 1
+                        break
+                except Exception:
+                    pass
+
+        # weight = 1/(stress+eps): highly loaded edges become "short" (preferred)
+        if stress_val is not None and stress_val > 0:
+            w = 1.0 / (stress_val + EPS)
+        else:
+            w = 1.0 / EPS  # unmapped or zero-flow: treat as very short (neutral)
+        G.edges[u, v]["stress_weight"] = float(np.clip(w, 0.0, 1e12))
+
+    bc = nx.betweenness_centrality(G, weight="stress_weight")
+    debug = {
+        "stress_topo_edge_count": total,
+        "stress_topo_mapped_ratio": (mapped / total) if total else 0.0,
+    }
+    return G, bc, debug
+
+
+def _group_bc(G, compound, weight="weight"):
     try:
         internal_ids = [c.id for c in compound.component_of_type(MNode)]
-        return nx.group_betweenness_centrality(G, internal_ids, weight="weight")
+        return nx.group_betweenness_centrality(G, internal_ids, weight=weight)
     except Exception:
         return 0.0
 
@@ -1265,7 +1359,7 @@ def _row_from_detail(
 # =============================================================================
 
 
-def mes_cp_metric_bulletproof(monee_net, cfg: CPMetricConfig = CPMetricConfig()):
+def mes_cp_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig()):
     fail_prob = cfg.CP_FAIL_PROB or DEFAULT_FAIL_PROB
 
     # topology
@@ -1290,7 +1384,7 @@ def mes_cp_metric_bulletproof(monee_net, cfg: CPMetricConfig = CPMetricConfig())
             )
 
             bc_group = _group_bc(G_phys, cp)
-            topo_factor = 1.0 + cfg.TOPO_ALPHA * float(bc_group)
+            topo_factor = (1.0 + cfg.TOPO_ALPHA * float(bc_group))
 
             carrier_detail = {}
             total_stress = 0.0
@@ -1392,7 +1486,7 @@ def mes_cp_metric_bulletproof(monee_net, cfg: CPMetricConfig = CPMetricConfig())
                     ]
                 )
             )
-            topo_factor = 1.0 + cfg.TOPO_ALPHA * bc_avg
+            topo_factor = (1.0 + cfg.TOPO_ALPHA * bc_avg)
 
             carrier_detail = {}
             total_stress = 0.0
@@ -1487,19 +1581,536 @@ def mes_cp_metric_bulletproof(monee_net, cfg: CPMetricConfig = CPMetricConfig())
 
 
 # =============================================================================
+# ALL-COMPONENTS METRIC
+# =============================================================================
+
+
+# Default failure probabilities for non-CP branch types
+DEFAULT_BRANCH_FAIL_PROB = {
+    mm.GenericPowerBranch: 0.05,
+    mm.GasPipe: 0.05,
+    mm.WaterPipe: 0.05,
+    mm.HeatExchanger: 0.05,
+}
+
+
+def _branch_lodf_stress(
+    monee_net, ctx: CarrierPTDFContext, carrier: str, from_node_id, to_node_id, cfg: CPMetricConfig
+):
+    """
+    Approximate LODF stress for a branch removal using ptdf_from - ptdf_to.
+    Returns (mean_s, max_s, agg_s, reliable).
+    """
+    if carrier == "power":
+        ptdf_from, ok_f = ctx.power_ptdf_node(monee_net, from_node_id)
+        ptdf_to, ok_t = ctx.power_ptdf_node(monee_net, to_node_id)
+        margins = ctx.power["margins"]
+    elif carrier == "gas":
+        ptdf_from, ok_f = ctx.gas_ptdf_node(monee_net, from_node_id)
+        ptdf_to, ok_t = ctx.gas_ptdf_node(monee_net, to_node_id)
+        margins = ctx.gas.get("margins", np.ones(len(ptdf_from)) * cfg.MIN_MARGIN)
+    elif carrier == "heat":
+        ptdf_from, ok_f = ctx.heat_ptdf_node(monee_net, from_node_id)
+        ptdf_to, ok_t = ctx.heat_ptdf_node(monee_net, to_node_id)
+        margins = ctx.heat.get("margins", np.ones(len(ptdf_from)) * cfg.MIN_MARGIN)
+    else:
+        return 0.0, 0.0, 0.0, False
+
+    if ptdf_from.size == 0:
+        return 0.0, 0.0, 0.0, True
+
+    if margins.size != ptdf_from.size:
+        margins = np.ones(ptdf_from.size) * cfg.MIN_MARGIN
+
+    ptdf_diff = ptdf_from - ptdf_to
+    mean_s, max_s, agg_s = _stress_from_ptdf(ptdf_diff, margins, cfg)
+    return mean_s, max_s, agg_s, bool(ok_f and ok_t)
+
+
+def mes_all_components_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig()):
+    """
+    Score ALL active grid branches (CP and non-CP) using the LODF approximation.
+
+    CPs (CHP, PowerToHeat, GasToPower, PowerToGas) are scored as in
+    mes_cp_metric_bulletproof().  Non-CP branches (PowerLine/GenericPowerBranch,
+    GasPipe, WaterPipe, HeatExchanger) use the PTDF difference approximation
+    ptdf_from - ptdf_to as a proxy for the line-outage distribution factor.
+
+    Returns
+    -------
+    df_all : pd.DataFrame
+        One row per component, sorted by score descending.
+        Columns: cp_id, cp_type, is_cp, p_fail, throughput, topo_bc, topo_factor,
+                 total_stress, score, reliable, {power,gas,heat}_{node_id,stress,...}
+    df_debug : pd.DataFrame  (only if cfg.RETURN_DEBUG)
+    """
+    # Reuse existing CP scores
+    if cfg.RETURN_DEBUG:
+        df_cp, df_debug = mes_cp_metric(monee_net, cfg)
+    else:
+        df_cp = mes_cp_metric(monee_net, cfg)
+        df_debug = None
+
+    df_cp = df_cp.copy()
+    df_cp["is_cp"] = True
+
+    # Build shared context (already built internally by mes_cp_metric_bulletproof,
+    # but we need a fresh one here so we can access it).
+    G_phys, bc_individual, _deg, _topo_dbg = compute_physical_topology_metrics(monee_net)
+    ctx = CarrierPTDFContext(cfg)
+    ctx.power_prebuild(monee_net)
+    ctx.gas_prebuild(monee_net)
+    ctx.heat_prebuild(monee_net)
+
+    sn_mva = _system_sn_mva(monee_net)
+
+    # CP branch ids to skip (already covered above)
+    cp_branch_ids = set()
+    for cp_type in (mm.GasToPower, mm.PowerToGas):
+        for br in monee_net.branches_by_type(cp_type):
+            cp_branch_ids.add(br.id)
+
+    fail_prob_branch = DEFAULT_BRANCH_FAIL_PROB
+
+    rows_non_cp = []
+
+    # ---- Power branches (GenericPowerBranch) ----
+    for branch_id in ctx.power["branch_ids"]:
+        if branch_id in cp_branch_ids:
+            continue
+        try:
+            br = monee_net.branch_by_id(branch_id)
+        except Exception:
+            continue
+
+        p_fail = float(fail_prob_branch.get(mm.GenericPowerBranch, 0.05))
+        limit, flow0 = _power_branch_limit_and_flow(monee_net, branch_id, cfg)
+        throughput = max(float(flow0) / sn_mva, 1e-6) if cfg.USE_THROUGHPUT_PROXY else 1.0
+
+        bc_avg = float(np.mean([
+            bc_individual.get(br.from_node_id, 0.0),
+            bc_individual.get(br.to_node_id, 0.0),
+        ]))
+        topo_factor = (1.0 + cfg.TOPO_ALPHA * bc_avg)
+
+        mean_s, max_s, agg_s, reliable = _branch_lodf_stress(
+            monee_net, ctx, "power", br.from_node_id, br.to_node_id, cfg
+        )
+        total_stress = cfg.W_POWER * agg_s
+        score = p_fail * throughput * total_stress * topo_factor
+
+        row = dict(
+            cp_id=str(branch_id),
+            cp_type="PowerLine",
+            is_cp=False,
+            p_fail=p_fail,
+            throughput=throughput,
+            topo_bc=bc_avg,
+            topo_factor=topo_factor,
+            total_stress=total_stress,
+            score=score,
+            reliable=reliable,
+            power_node_id=br.from_node_id,
+            power_reliable=reliable,
+            power_stress_mean=mean_s,
+            power_stress_max=max_s,
+            power_stress=agg_s,
+            gas_node_id=None, gas_reliable=None,
+            gas_stress_mean=0.0, gas_stress_max=0.0, gas_stress=0.0,
+            heat_node_id=None, heat_reliable=None,
+            heat_stress_mean=0.0, heat_stress_max=0.0, heat_stress=0.0,
+        )
+        rows_non_cp.append(row)
+
+    # ---- Gas pipes ----
+    for pipe_id in ctx.gas["pipe_ids"]:
+        if pipe_id in cp_branch_ids:
+            continue
+        try:
+            br = monee_net.branch_by_id(pipe_id)
+        except Exception:
+            continue
+
+        p_fail = float(fail_prob_branch.get(mm.GasPipe, 0.05))
+        gg = _gas_grid(monee_net)
+        _limit, flow0 = _gas_pipe_limit_and_flow(monee_net, pipe_id, gg)
+        throughput = max(float(flow0) / sn_mva, 1e-6) if cfg.USE_THROUGHPUT_PROXY else 1.0
+
+        bc_avg = float(np.mean([
+            bc_individual.get(br.from_node_id, 0.0),
+            bc_individual.get(br.to_node_id, 0.0),
+        ]))
+        topo_factor = (1.0 + cfg.TOPO_ALPHA * bc_avg)
+
+        mean_s, max_s, agg_s, reliable = _branch_lodf_stress(
+            monee_net, ctx, "gas", br.from_node_id, br.to_node_id, cfg
+        )
+        total_stress = cfg.W_GAS * agg_s
+        score = p_fail * throughput * total_stress * topo_factor
+
+        row = dict(
+            cp_id=str(pipe_id),
+            cp_type="GasPipe",
+            is_cp=False,
+            p_fail=p_fail,
+            throughput=throughput,
+            topo_bc=bc_avg,
+            topo_factor=topo_factor,
+            total_stress=total_stress,
+            score=score,
+            reliable=reliable,
+            power_node_id=None, power_reliable=None,
+            power_stress_mean=0.0, power_stress_max=0.0, power_stress=0.0,
+            gas_node_id=br.from_node_id,
+            gas_reliable=reliable,
+            gas_stress_mean=mean_s,
+            gas_stress_max=max_s,
+            gas_stress=agg_s,
+            heat_node_id=None, heat_reliable=None,
+            heat_stress_mean=0.0, heat_stress_max=0.0, heat_stress=0.0,
+        )
+        rows_non_cp.append(row)
+
+    # ---- Heat pipes (WaterPipe + HeatExchanger) ----
+    for pipe_id in ctx.heat["pipe_ids"]:
+        if pipe_id in cp_branch_ids:
+            continue
+        try:
+            br = monee_net.branch_by_id(pipe_id)
+        except Exception:
+            continue
+
+        bm = br.model
+        cp_type_str = "HeatExchanger" if isinstance(bm, mm.HeatExchanger) else "WaterPipe"
+        fail_key = mm.HeatExchanger if isinstance(bm, mm.HeatExchanger) else mm.WaterPipe
+        p_fail = float(fail_prob_branch.get(fail_key, 0.05))
+
+        _limit, flow0 = _heat_pipe_limit_and_flow(monee_net, pipe_id)
+        throughput = max(float(flow0) / sn_mva, 1e-6) if cfg.USE_THROUGHPUT_PROXY else 1.0
+
+        bc_avg = float(np.mean([
+            bc_individual.get(br.from_node_id, 0.0),
+            bc_individual.get(br.to_node_id, 0.0),
+        ]))
+        topo_factor = (1.0 + cfg.TOPO_ALPHA * bc_avg)
+
+        mean_s, max_s, agg_s, reliable = _branch_lodf_stress(
+            monee_net, ctx, "heat", br.from_node_id, br.to_node_id, cfg
+        )
+        total_stress = cfg.W_HEAT * agg_s
+        score = p_fail * throughput * total_stress * topo_factor
+
+        row = dict(
+            cp_id=str(pipe_id),
+            cp_type=cp_type_str,
+            is_cp=False,
+            p_fail=p_fail,
+            throughput=throughput,
+            topo_bc=bc_avg,
+            topo_factor=topo_factor,
+            total_stress=total_stress,
+            score=score,
+            reliable=reliable,
+            power_node_id=None, power_reliable=None,
+            power_stress_mean=0.0, power_stress_max=0.0, power_stress=0.0,
+            gas_node_id=None, gas_reliable=None,
+            gas_stress_mean=0.0, gas_stress_max=0.0, gas_stress=0.0,
+            heat_node_id=br.from_node_id,
+            heat_reliable=reliable,
+            heat_stress_mean=mean_s,
+            heat_stress_max=max_s,
+            heat_stress=agg_s,
+        )
+        rows_non_cp.append(row)
+
+    df_non_cp = pd.DataFrame(rows_non_cp) if rows_non_cp else pd.DataFrame(
+        columns=list(df_cp.columns) + ["is_cp"]
+    )
+
+    # Ensure df_cp has same columns as df_non_cp (add is_cp already done above)
+    df_all = pd.concat([df_cp, df_non_cp], ignore_index=True, sort=False)
+    df_all = df_all.sort_values("score", ascending=False).reset_index(drop=True)
+
+    # ---- Local metric ----
+    # Uses only information locally available to the device (1-hop at most):
+    #   p_fail             – device failure probability (device parameter)
+    #   loading            – |flow| / limit: own utilisation (local measurement)
+    #                        For CPs without a meaningful limit: rated throughput proxy.
+    #   n_critical_nbrs    – neighbours with degree ≤ 2 (1-hop info only):
+    #                        counts neighbours for whom this component is on their
+    #                        only or critical path; computable without global routing.
+    #   carrier_coupling   – number of distinct energy carriers this component connects
+    #                        (observable from own port configuration, no network traversal).
+    #
+    # local_score = p_fail × loading × (1 + n_critical_nbrs) × carrier_coupling
+    #
+    # Rationale:
+    #   loading           → how much energy actually flows through me right now
+    #   n_critical_nbrs   → how many neighbours are stranded if I fail
+    #   carrier_coupling  → how many domains my failure disrupts simultaneously
+
+    # Pre-build graph adjacency for 1-hop neighbour degree lookups
+    G_local = nx.Graph(monee_net._network_internal)
+
+    def _connected_node_ids(row):
+        """All network node IDs directly connected to this component."""
+        nids = []
+        for col in ("power_node_id", "gas_node_id", "heat_node_id"):
+            nid = row.get(col)
+            if nid is not None:
+                nids.append(nid)
+        if not nids:
+            cp_type = row.get("cp_type", "")
+            cp_id = row.get("cp_id")
+            if cp_type in ("CHP", "PowerToHeat"):
+                cp_cls = mm.CHP if cp_type == "CHP" else mm.PowerToHeat
+                for cp in monee_net.compounds_by_type(cp_cls):
+                    if cp.id == cp_id:
+                        nids = list(cp.connected_to.values())
+                        break
+        return nids
+
+    def _n_critical_nbrs(row):
+        """Count of 1-hop neighbours whose degree is ≤ 2 (critically dependent)."""
+        nids = [n for n in _connected_node_ids(row)
+                if n is not None and n == n and G_local.has_node(n)]
+        count = 0
+        for nid in nids:
+            for nbr in G_local.neighbors(nid):
+                if nbr != nid and _deg.get(nbr, 1) <= 2:
+                    count += 1
+        return float(count)
+
+    def _carrier_coupling(row):
+        """Number of distinct energy carriers this component connects (1–3)."""
+        cp_type = row.get("cp_type", "")
+        if cp_type in ("CHP",):
+            return 2.0  # electricity + heat
+        if cp_type in ("PowerToHeat",):
+            return 2.0  # electricity + heat
+        if cp_type in ("GasToPower", "PowerToGas"):
+            return 2.0  # gas + electricity
+        # Single-carrier branches
+        return 1.0
+
+    def _loading_local(row):
+        """
+        |flow| / limit — own utilisation ratio (locally measurable).
+        For CPs, falls back to the rated throughput proxy (no meaningful flow limit).
+        """
+        cp_type = row.get("cp_type", "")
+        cp_id = row.get("cp_id")
+        throughput = float(row.get("throughput", 1.0))
+
+        if cp_type in ("CHP", "PowerToHeat", "GasToPower", "PowerToGas"):
+            return throughput  # rated-capacity proxy; no global state needed
+
+        try:
+            import ast
+            tup = ast.literal_eval(str(cp_id))
+            if cp_type == "PowerLine":
+                limit, flow0 = _power_branch_limit_and_flow(monee_net, tup, cfg)
+            elif cp_type == "GasPipe":
+                gg = _gas_grid(monee_net)
+                limit, flow0 = _gas_pipe_limit_and_flow(monee_net, tup, gg)
+            else:  # WaterPipe, HeatExchanger
+                limit, flow0 = _heat_pipe_limit_and_flow(monee_net, tup)
+            if np.isfinite(limit) and limit > 0:
+                return float(flow0) / float(limit)
+        except Exception:
+            pass
+        return throughput
+
+    df_all["loading"] = df_all.apply(_loading_local, axis=1)
+    df_all["n_critical_nbrs"] = df_all.apply(_n_critical_nbrs, axis=1)
+    df_all["carrier_coupling"] = df_all.apply(_carrier_coupling, axis=1)
+    df_all["local_score"] = (
+        df_all["p_fail"]
+        * df_all["loading"]
+        * (1.0 + df_all["n_critical_nbrs"])
+        * df_all["carrier_coupling"]
+    )
+
+    # ---- Self-only metric (zero-hop) ----
+    # Uses exclusively the component's own observable state — no network traversal:
+    #   p_fail           – device failure probability
+    #   loading          – own utilisation |flow| / limit
+    #   carrier_coupling – number of carriers connected (readable from own ports)
+    # self_score = p_fail × loading × carrier_coupling
+    df_all["self_score"] = (
+        df_all["p_fail"]
+        * df_all["loading"]
+        * df_all["carrier_coupling"]
+    )
+
+    # ---- Katz centrality (physical graph) ----
+    # Katz uses weights as adjacency strengths (A_ij), not distances.
+    # Physical "weight" values are resistances (high = harder to traverse),
+    # so we invert them to get conductances (high = strong coupling),
+    # making the semantics consistent with betweenness centrality.
+    G_katz = nx.Graph(G_phys)
+    for u, v, data in G_katz.edges(data=True):
+        w = data.get("weight", 1.0)
+        G_katz.edges[u, v]["katz_weight"] = 1.0 / max(float(w), 1e-12)
+    try:
+        eigenvalues = np.real(np.linalg.eigvals(nx.to_numpy_array(G_katz, weight="katz_weight")))
+        spectral_radius = float(np.max(np.abs(eigenvalues)))
+        katz_alpha = 0.85 / spectral_radius if spectral_radius > 0 else 0.1
+        katz_individual = nx.katz_centrality(
+            G_katz, alpha=katz_alpha, weight="katz_weight", normalized=True
+        )
+    except Exception:
+        katz_individual = {n: 0.0 for n in G_phys.nodes()}
+
+    def _katz_for_row(row):
+        cp_type = row.get("cp_type", "")
+        cp_id = row.get("cp_id")
+
+        if cp_type in ("CHP", "PowerToHeat"):
+            cp_cls = mm.CHP if cp_type == "CHP" else mm.PowerToHeat
+            for cp in monee_net.compounds_by_type(cp_cls):
+                if cp.id == cp_id:
+                    vals = [katz_individual.get(nid, 0.0)
+                            for nid in cp.connected_to.values()]
+                    return float(np.mean(vals)) if vals else 0.0
+            return 0.0
+
+        node_ids = [row.get(col) for col in ("power_node_id", "gas_node_id", "heat_node_id")]
+        node_ids = [n for n in node_ids if n is not None and n == n]
+        if node_ids:
+            return float(np.mean([katz_individual.get(n, 0.0) for n in node_ids]))
+
+        # Branch CPs: cp_id = "from→to"
+        try:
+            from_id, to_id = str(cp_id).split("→")
+            return float(np.mean([
+                katz_individual.get(from_id.strip(), 0.0),
+                katz_individual.get(to_id.strip(), 0.0),
+            ]))
+        except Exception:
+            return 0.0
+
+    df_all["katz_score"] = df_all.apply(_katz_for_row, axis=1)
+
+    # ---- Closeness vitality (physical graph, same weights as BC and Katz) ----
+    # vitality(v) = W(G) - W(G \ v): how much total pairwise distance increases
+    # when v is removed. Captures structural indispensability, not just centrality.
+    try:
+        vitality_individual = nx.closeness_vitality(G_phys, weight="weight")
+        # Replace inf (node removal disconnects graph → infinite path distances)
+        # with the maximum finite vitality, treating disconnectors as maximally critical.
+        finite_vals = [v for v in vitality_individual.values()
+                       if np.isfinite(v)]
+        max_finite = max(finite_vals) if finite_vals else 0.0
+        vitality_individual = {
+            n: (max_finite if not np.isfinite(v) else v)
+            for n, v in vitality_individual.items()
+        }
+        # Shift so minimum is 0
+        min_v = min(vitality_individual.values()) if vitality_individual else 0.0
+        if min_v < 0:
+            vitality_individual = {n: v - min_v for n, v in vitality_individual.items()}
+    except Exception:
+        vitality_individual = {n: 0.0 for n in G_phys.nodes()}
+
+    def _vitality_for_row(row):
+        cp_type = row.get("cp_type", "")
+        cp_id = row.get("cp_id")
+
+        if cp_type in ("CHP", "PowerToHeat"):
+            cp_cls = mm.CHP if cp_type == "CHP" else mm.PowerToHeat
+            for cp in monee_net.compounds_by_type(cp_cls):
+                if cp.id == cp_id:
+                    vals = [vitality_individual.get(nid, 0.0)
+                            for nid in cp.connected_to.values()]
+                    return float(np.mean(vals)) if vals else 0.0
+            return 0.0
+
+        node_ids = [row.get(col) for col in ("power_node_id", "gas_node_id", "heat_node_id")]
+        node_ids = [n for n in node_ids if n is not None and n == n]
+        if node_ids:
+            return float(np.mean([vitality_individual.get(n, 0.0) for n in node_ids]))
+
+        try:
+            from_id, to_id = str(cp_id).split("→")
+            return float(np.mean([
+                vitality_individual.get(from_id.strip(), 0.0),
+                vitality_individual.get(to_id.strip(), 0.0),
+            ]))
+        except Exception:
+            return 0.0
+
+    df_all["vitality_score"] = df_all.apply(_vitality_for_row, axis=1)
+
+    # ---- Stress-weighted topology ----
+    # BC where edge weight = 1/(loading+eps), so stressed branches are "shorter".
+    # Compounds use group_bc; branches/CPs use average endpoint BC.
+    try:
+        _G_stress, stress_bc_nodes, stress_topo_dbg = compute_stress_topology_metrics(
+            monee_net, ctx, cfg
+        )
+
+        def _stress_bc_for_row(row):
+            cp_type = row.get("cp_type", "")
+            cp_id = row.get("cp_id")
+
+            if cp_type in ("CHP", "PowerToHeat"):
+                cp_cls = mm.CHP if cp_type == "CHP" else mm.PowerToHeat
+                for cp in monee_net.compounds_by_type(cp_cls):
+                    if cp.id == cp_id:
+                        return float(_group_bc(_G_stress, cp, weight="stress_weight"))
+                return 0.0
+
+            # For all branch types, average the endpoint node BCs
+            node_ids = []
+            for col in ("power_node_id", "gas_node_id", "heat_node_id"):
+                nid = row.get(col)
+                if nid is not None:
+                    node_ids.append(stress_bc_nodes.get(nid, 0.0))
+            if node_ids:
+                return float(np.mean(node_ids))
+
+            # Fallback: try to parse cp_id as edge tuple (non-CP branches)
+            try:
+                import ast
+                tup = ast.literal_eval(str(cp_id))
+                br = monee_net.branch_by_id(tup)
+                return float(np.mean([
+                    stress_bc_nodes.get(br.from_node_id, 0.0),
+                    stress_bc_nodes.get(br.to_node_id, 0.0),
+                ]))
+            except Exception:
+                return 0.0
+
+        df_all["stress_bc"] = df_all.apply(_stress_bc_for_row, axis=1)
+        df_all["stress_topo_factor"] = 1.0 + cfg.TOPO_ALPHA * df_all["stress_bc"]
+        df_all["stress_score"] = df_all["score"] / df_all["topo_factor"].replace(0, np.nan) * df_all["stress_topo_factor"]
+    except Exception as e:
+        df_all["stress_bc"] = 0.0
+        df_all["stress_topo_factor"] = 1.0
+        df_all["stress_score"] = df_all["score"]
+        print(f"[warn] stress topology failed: {e}")
+
+    if cfg.RETURN_DEBUG:
+        return df_all, df_debug
+    return df_all
+
+
+# =============================================================================
 # RUN
 # =============================================================================
 
 if __name__ == "__main__":
-    net = mes.create_monee_benchmark_net()
+    from monee.network import create_balanced_urban_mes_net
+    net = create_balanced_urban_mes_net()
     result = monee.run_energy_flow(net, solver=monee.PyomoSolver())
     print(result)
     solved = result.network
 
     print(
-        "\n=== Bullet-proofed MES CP Criticality (Stress-based, distributed balancing) ==="
+        "\n=== MES CP Criticality (Stress-based, distributed balancing) ==="
     )
-    df_scores, df_debug = mes_cp_metric_bulletproof(solved, cfg=CPMetricConfig())
+    df_scores, df_debug = mes_cp_metric(solved, cfg=CPMetricConfig())
 
     print("\n--- Scores ---")
     print(df_scores.to_string(index=False))

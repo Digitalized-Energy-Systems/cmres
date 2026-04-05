@@ -31,6 +31,7 @@ def solve(network):
     return run_energy_flow_optimization(
         network,
         solver=PyomoSolver(),
+        solver_name="scip",
         optimization_problem=optimization_problem,
         exclude_unconnected_nodes=True,
     )

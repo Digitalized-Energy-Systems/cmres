@@ -1,17 +1,23 @@
 from typing import Dict
 import os
+import sys
 import pickle
 from pathlib import PurePath, Path
 from statistics import mean
 
 import cmres.evaluation.evaluation as eval
-from monee import Network, run_energy_flow
+from monee import Network, run_energy_flow, PyomoSolver
 from monee.model.core import Node
+import scipy.stats
 
 import pandas
 import networkx as nx
 
-OUTPUT = "data/out/res"
+sys.path.insert(0, str(Path(__file__).parent))
+from cp_metric import mes_all_components_metric, CPMetricConfig
+
+INPUT = "/home/rschrage/experiments/aeer/temp/res"
+OUTPUT = "data/out"
 SMALL_NUMBER = 0.00000000001
 
 TYPE_TO_CARRIER = {
@@ -20,8 +26,10 @@ TYPE_TO_CARRIER = {
     "CHP": "multi",
     "GasPipe": "gas",
     "GenericPowerBranch": "electricity",
+    "PowerLine": "electricity",
     "PowerGenerator": "electricity",
     "PowerToGas": "multi",
+    "GasToPower": "multi",
     "PowerToHeat": "multi",
     "WaterPipe": "heat",
     "PowerToHeatControlNode": "multi",
@@ -34,15 +42,16 @@ TYPE_TO_CARRIER = {
     "GenericTransferBranch": "multi",
     "HeatExchangerLoad": "heat",
     "HeatExchanger": "heat",
+    "SubHE": "heat",
 }
 
 EXPERIMENT_ID_TO_STR = {
-    "0-0-0-3": "high cp",
-    "0-0-3-0": "high gas",
-    "0-3-0-0": "high heating",
-    "3-0-0-0": "high electricity",
-    "1-1-1-1": "low overall",
-    "2-2-2-2": "medium overall",
+    "high_el": "high electricity",
+    "high_gas": "high gas",
+    "high_heat": "high heating",
+    "high_cp": "high cp",
+    "low": "low overall",
+    "medium": "medium overall",
 }
 
 
@@ -56,26 +65,26 @@ def get_id_type(id_str: str):
     return "node"
 
 
-def extend_impact_df(cpd_to_net: Dict[float, Network], metrics_df, impact_df):
+def extend_impact_df(net_type_to_net: Dict[str, Network], metrics_df, impact_df):
     new_impact_df = pandas.DataFrame()
     for _, row in metrics_df[
         metrics_df.apply(lambda row: row["id"].startswith("node"), axis=1)
     ].iterrows():
         node_id = int(row["id"].split(":")[1])
-        node = cpd_to_net[row["cp_density"]].node_by_id(node_id)
+        node = net_type_to_net[row["network_type"]].node_by_id(node_id)
         child_impact_df = impact_df[
             impact_df.apply(
                 lambda row_impact: (
                     row_impact["id"].startswith("child")
                     and int(row_impact["id"].split(":")[1]) in node.child_ids
-                    and row_impact["cp_density"] == row["cp_density"]
+                    and row_impact["network_type"] == row["network_type"]
                 ),
                 axis=1,
             )
         ]
 
         node_impacts_df = (
-            child_impact_df.groupby(["carrier", "cp_density"]).mean().reset_index()
+            child_impact_df.groupby(["carrier", "network_type"]).mean().reset_index()
         )
         node_impacts_df["id"] = row["id"]
         node_impacts_df["type"] = type(node.model)
@@ -100,20 +109,36 @@ def create_impact_df(perf_df: pandas.DataFrame, repair_df, fail_df, metrics_df):
         node_edge_id = row["id"]
         type = row["type"]
 
-        node_usable_fail_df = usable_fail_df.query(f"node == '{node_edge_id}'")
-        node_usable_repair_df = usable_repair_df.query(f"node == '{node_edge_id}'")
+        # For branch IDs, the stored tuple order in fail/repair CSVs may be reversed
+        # relative to metrics_df (e.g. "(9, 2, 0)" vs "(2, 9, 0)").
+        # Build a set of candidate IDs to query against.
+        candidate_ids = {node_edge_id}
+        if node_edge_id.startswith("branch:"):
+            inner = node_edge_id[len("branch:"):]
+            parts = [p.strip() for p in inner.strip("()").split(",")]
+            if len(parts) >= 3:
+                reversed_id = f"branch:({parts[1]}, {parts[0]}, {parts[2]})"
+                candidate_ids.add(reversed_id)
+
+        node_usable_fail_df = usable_fail_df[usable_fail_df["node"].isin(candidate_ids)]
+        node_usable_repair_df = usable_repair_df[usable_repair_df["node"].isin(candidate_ids)]
+        # Normalise the stored ID back to metrics_df convention so downstream joins work
+        node_usable_fail_df = node_usable_fail_df.copy()
+        node_usable_repair_df = node_usable_repair_df.copy()
+        node_usable_fail_df["node"] = node_edge_id
+        node_usable_repair_df["node"] = node_edge_id
 
         concated_fail_node_df = pandas.concat(
             [node_usable_fail_df, node_usable_repair_df]
         )
 
         rules = {}
-        cp_density = row["cp_density"]
-        concated_fail_node_df_with_cpd = concated_fail_node_df[
-            concated_fail_node_df["cp_density"] == cp_density
+        network_type = row["network_type"]
+        concated_fail_node_df_with_net_type = concated_fail_node_df[
+            concated_fail_node_df["network_type"] == network_type
         ]
-        perf_df_with_cpd = perf_df[perf_df["cp_density"] == cp_density]
-        for name, group in concated_fail_node_df_with_cpd.groupby(["experiment", "id"]):
+        perf_df_with_net_type = perf_df[perf_df["network_type"] == network_type]
+        for name, group in concated_fail_node_df_with_net_type.groupby(["experiment", "id"]):
             if len(group) != 2:
                 continue
             failure_row = group.query("type == 'failure'")
@@ -125,8 +150,8 @@ def create_impact_df(perf_df: pandas.DataFrame, repair_df, fail_df, metrics_df):
                 repair_row["step"].iloc[0],
             )
 
-        node_in_perf_df = perf_df_with_cpd[
-            perf_df_with_cpd.apply(
+        node_in_perf_df = perf_df_with_net_type[
+            perf_df_with_net_type.apply(
                 lambda row: (
                     (row["id"], row["experiment"]) in rules
                     and row["step"] >= rules[(row["id"], row["experiment"])][0]
@@ -135,8 +160,8 @@ def create_impact_df(perf_df: pandas.DataFrame, repair_df, fail_df, metrics_df):
                 axis=1,
             )
         ]
-        node_not_in_perf_df = perf_df_with_cpd[
-            perf_df_with_cpd.apply(
+        node_not_in_perf_df = perf_df_with_net_type[
+            perf_df_with_net_type.apply(
                 lambda row: (
                     (row["id"], row["experiment"]) not in rules
                     or row["step"] < rules[(row["id"], row["experiment"])][0]
@@ -149,13 +174,12 @@ def create_impact_df(perf_df: pandas.DataFrame, repair_df, fail_df, metrics_df):
         node_in_perf_df_mean = node_in_perf_df[["0", "1", "2"]].mean()
         node_not_in_perf_df_mean = node_not_in_perf_df[["0", "1", "2"]].mean()
         for carrier in [("heat", "1"), ("gas", "2"), ("electricity", "0")]:
+            # Absolute degradation: performance drop caused by this component's failure.
+            # Positive = component caused loss; negative = performance was better during failure
+            # (can happen if the component was a bottleneck consuming rather than supplying).
             impact = (
-                (node_in_perf_df_mean[carrier[1]] + SMALL_NUMBER)
-                / (node_not_in_perf_df_mean[carrier[1]] + SMALL_NUMBER)
-                if node_in_perf_df_mean[carrier[1]]
-                > node_not_in_perf_df_mean[carrier[1]]
-                else -(node_not_in_perf_df_mean[carrier[1]] + SMALL_NUMBER)
-                / (node_in_perf_df_mean[carrier[1]] + SMALL_NUMBER)
+                node_not_in_perf_df_mean[carrier[1]]
+                - node_in_perf_df_mean[carrier[1]]
             )
             global_rows.append(
                 {
@@ -163,7 +187,7 @@ def create_impact_df(perf_df: pandas.DataFrame, repair_df, fail_df, metrics_df):
                     "carrier": carrier[0],
                     "impact": impact,
                     "type": type,
-                    "cp_density": cp_density,
+                    "network_type": network_type,
                 }
             )
     return pandas.DataFrame(global_rows)
@@ -178,13 +202,18 @@ def create_or_load_impact_df(fail_df, perf_df, repair_df, metrics_df, folder_id)
     return impact_df
 
 
-def create_metrics_df(monee_net: Network, cp_density: float):
-    monee_net = run_energy_flow(monee_net).network
+def create_metrics_df(monee_net: Network, network_type: str):
+    try:
+        monee_net = run_energy_flow(monee_net).network
+        for edge in monee_net._network_internal.edges:
+            branch_model = monee_net.branch_by_id(edge).model
+            monee_net._network_internal.edges[edge]["weight"] = branch_model.loss_percent()
+    except Exception as e:
+        print(f"Warning: energy flow failed for {network_type}, using uniform weights: {e}")
+        for edge in monee_net._network_internal.edges:
+            monee_net._network_internal.edges[edge]["weight"] = 1.0
 
     # id, type, metric... (betweenness_centrality)
-    for edge in monee_net._network_internal.edges:
-        branch_model = monee_net.branch_by_id(edge).model
-        monee_net._network_internal.edges[edge]["weight"] = branch_model.loss_percent()
 
     node_to_bc = nx.betweenness_centrality(monee_net._network_internal, weight="weight")
     edge_to_bc = nx.edge_betweenness_centrality(
@@ -220,7 +249,7 @@ def create_metrics_df(monee_net: Network, cp_density: float):
                 "degree": node_to_degree[node_id],
                 "vc": node_to_vital[node_id],
                 "katz": node_to_katz[node_id],
-                "cp_density": cp_density,
+                "network_type": network_type,
             }
         )
     for child in monee_net.childs:
@@ -236,7 +265,7 @@ def create_metrics_df(monee_net: Network, cp_density: float):
                 "degree": degree,
                 "vc": vc,
                 "katz": katz,
-                "cp_density": cp_density,
+                "network_type": network_type,
             }
         )
     for compound in monee_net.compounds:
@@ -262,7 +291,7 @@ def create_metrics_df(monee_net: Network, cp_density: float):
                 "degree": degree,
                 "vc": vc,
                 "katz": katz,
-                "cp_density": cp_density,
+                "network_type": network_type,
             }
         )
     for edge_id, cb in edge_to_bc.items():
@@ -274,7 +303,7 @@ def create_metrics_df(monee_net: Network, cp_density: float):
                 "degree": edge_to_degree[edge_id],
                 "vc": edge_to_vital[edge_id],
                 "katz": edge_to_katz[edge_id],
-                "cp_density": cp_density,
+                "network_type": network_type,
             }
         )
     return pandas.DataFrame(all_rows)
@@ -282,8 +311,8 @@ def create_metrics_df(monee_net: Network, cp_density: float):
 
 def create_full_metrics_df(key_to_net):
     dfs = []
-    for cpd, net in key_to_net.items():
-        dfs.append(create_metrics_df(net, cpd))
+    for net_type, net in key_to_net.items():
+        dfs.append(create_metrics_df(net, net_type))
     return pandas.concat(dfs)
 
 
@@ -298,14 +327,14 @@ def create_or_load_metrics_df(key_to_net, folder_id):
 
 
 def append_desc_df(
-    single_df, identifier, power_impact, heat_impact, gas_impact, mes_impact, cp_density
+    single_df, identifier, power_impact, heat_impact, gas_impact, mes_impact, network_type
 ):
     single_df["experiment"] = identifier
     single_df["power_impact"] = power_impact
     single_df["heat_impact"] = heat_impact
     single_df["gas_impact"] = gas_impact
     single_df["mes_impact"] = mes_impact
-    single_df["cp_density"] = cp_density
+    single_df["network_type"] = network_type
 
 
 def load_dfs(folder_id):
@@ -315,22 +344,25 @@ def load_dfs(folder_id):
     performance_dfs = []
     repair_dfs = []
 
-    cpd_to_net = {}
+    net_type_to_net = {}
 
     for experiment_desc in all_folders:
+        if not (Path(experiment_desc) / "performance.csv").exists():
+            print(f"Skipping incomplete folder: {experiment_desc}")
+            continue
         experiment_desc_name = PurePath(experiment_desc).name
         experiment_attributes = experiment_desc_name.split("-")
-        power_impact = experiment_attributes[1]
-        heat_impact = experiment_attributes[2]
-        gas_impact = experiment_attributes[3]
-        mes_impact = experiment_attributes[4]
-        cp_density = float(experiment_attributes[5])
+        power_impact = experiment_attributes[2]
+        heat_impact = experiment_attributes[3]
+        gas_impact = experiment_attributes[4]
+        mes_impact = experiment_attributes[5]
+        network_type = experiment_attributes[6]
 
-        if cp_density not in cpd_to_net:
+        if network_type not in net_type_to_net:
             with open(Path(experiment_desc) / Path("network.p"), "rb") as network_file:
                 monee_net = pickle.load(network_file)
                 print(monee_net.statistics())
-                cpd_to_net[cp_density] = monee_net
+                net_type_to_net[network_type] = monee_net
 
         # failure
         failure_path = Path(experiment_desc) / Path("failure.csv")
@@ -343,7 +375,7 @@ def load_dfs(folder_id):
                 heat_impact,
                 gas_impact,
                 mes_impact,
-                cp_density,
+                network_type,
             )
             failure_dfs.append(failure_df)
 
@@ -358,7 +390,7 @@ def load_dfs(folder_id):
             heat_impact,
             gas_impact,
             mes_impact,
-            cp_density,
+            network_type,
         )
         performance_dfs.append(performance_df)
 
@@ -373,7 +405,7 @@ def load_dfs(folder_id):
                 heat_impact,
                 gas_impact,
                 mes_impact,
-                cp_density,
+                network_type,
             )
             repair_dfs.append(repair_df)
 
@@ -381,8 +413,8 @@ def load_dfs(folder_id):
         pandas.concat(failure_dfs),
         pandas.concat(performance_dfs),
         pandas.concat(repair_dfs),
-        create_or_load_metrics_df(cpd_to_net, folder_id),
-        cpd_to_net,
+        create_or_load_metrics_df(net_type_to_net, folder_id),
+        net_type_to_net,
     )
 
 
@@ -402,21 +434,22 @@ CARRIER_REPLACE_MAP = {"0": "electricity", "1": "heat", "2": "gas"}
 def resilience_per_scenario(perf_df: pandas.DataFrame, folder_id):
     # experiment, id 0 1 2
     resilience_per_carrier_per_scenario = (
-        perf_df.groupby(["cp_density", "experiment", "id"])[["0", "1", "2"]]
+        perf_df.groupby(["network_type", "experiment", "id"])[["0", "1", "2"]]
         .sum()
         .reset_index()
-        .groupby(["cp_density", "experiment"])
+        .groupby(["network_type", "experiment"])
         .mean()
         .reset_index()
         .melt(
-            id_vars=["cp_density", "experiment", "id"],
+            id_vars=["network_type", "experiment"],
+            value_vars=["0", "1", "2"],
             var_name="carrier",
             value_name="resilience_mean",
         )
     )
     resilience_per_carrier_per_scenario["experiment"] = (
         resilience_per_carrier_per_scenario["experiment"].apply(
-            lambda v: "-".join(v.split("/")[2].split("-")[1:-1])
+            lambda v: v.split("/")[-1].split("-")[1]
         )
     )
     resilience_per_carrier_per_scenario["carrier"] = (
@@ -440,10 +473,9 @@ def resilience_per_scenario(perf_df: pandas.DataFrame, folder_id):
         width=1200,
         height=450,
     )
-    unique_cp_densitites = pandas.unique(
-        resilience_per_carrier_per_scenario["cp_density"]
-    )
-    unique_cp_densitites.sort()
+    unique_network_types = sorted(pandas.unique(
+        resilience_per_carrier_per_scenario["network_type"]
+    ))
     unique_experiments = list(
         pandas.unique(resilience_per_carrier_per_scenario["experiment"])
     )
@@ -454,16 +486,16 @@ def resilience_per_scenario(perf_df: pandas.DataFrame, folder_id):
                 list(
                     resilience_per_carrier_per_scenario[
                         resilience_per_carrier_per_scenario["carrier"] == carrier
-                    ].sort_values(by=["cp_density", "experiment"])["resilience_mean"]
+                    ].sort_values(by=["network_type", "experiment"])["resilience_mean"]
                 )
                 for carrier in ["electricity", "heat", "gas"]
             ],
             ["#ffa000", "#d32f2f", "#388e3c"],
             ["electricity", "heat", "gas"],
-            [f"<b>{cpd}</b>" for cpd in unique_cp_densitites],
+            [f"<b>{net_type}</b>" for net_type in unique_network_types],
             len(unique_experiments),
-            [f"{EXPERIMENT_ID_TO_STR[exp]}" for exp in unique_experiments]
-            * len(unique_cp_densitites),
+            [f"{EXPERIMENT_ID_TO_STR.get(exp, exp)}" for exp in unique_experiments]
+            * len(unique_network_types),
             yaxis_title="<b>mean performance loss in MW</b>",
             multi_level_distance=-0.4,
         )
@@ -491,14 +523,14 @@ TYPE_SPECIALS_CN = {
 
 
 def impact_over_metrics(
-    cpd_to_net: Dict[float, Network],
+    net_type_to_net: Dict[str, Network],
     impact_df,
     metrics_df,
     folder_id,
     metric_ids,
 ):
     metric_impact_df: pandas.DataFrame = impact_df.astype({"id": "string"}).merge(
-        metrics_df.astype({"id": "string"}), on=["id", "cp_density"]
+        metrics_df.astype({"id": "string"}), on=["id", "network_type"]
     )
     metric_impact_df["type_y"] = (
         metric_impact_df["type_y"].astype(str).apply(lambda v: v.split(".")[-1][:-2])
@@ -543,24 +575,24 @@ def impact_over_metrics(
                 )
                 titles.append(f"{metric} to the {key}' {carrier_name}-impact")
 
-        for cpd, monee_net in cpd_to_net.items():
-            metric_impact_df_carrier_cpd = metric_impact_df_carrier[
-                metric_impact_df_carrier["cp_density"] == cpd
+        for net_type, monee_net in net_type_to_net.items():
+            metric_impact_df_carrier_net_type = metric_impact_df_carrier[
+                metric_impact_df_carrier["network_type"] == net_type
             ]
             figures.append(
                 eval.create_networkx_plot(
                     monee_net,
-                    metric_impact_df_carrier_cpd,
+                    metric_impact_df_carrier_net_type,
                     color_name="impact",
                     color_legend_text=f"{carrier_name}-impact",
                     template="plotly_white+publish",
                 )
             )
-            titles.append(f"graph of the components' {carrier_name}-impact ({cpd})")
+            titles.append(f"graph of the components' {carrier_name}-impact ({net_type})")
             figures.append(
                 eval.create_networkx_plot(
                     monee_net,
-                    metric_impact_df_carrier_cpd,
+                    metric_impact_df_carrier_net_type,
                     color_name="impact",
                     color_legend_text=f"{carrier_name}-impact",
                     template="plotly_white+publish",
@@ -568,12 +600,12 @@ def impact_over_metrics(
                 )
             )
             titles.append(
-                f"edge-graph of the components' {carrier_name}-impact ({cpd})"
+                f"edge-graph of the components' {carrier_name}-impact ({net_type})"
             )
 
     # aggregated all carrier impacts
     metric_impact_df_all_carrier = (
-        metric_impact_df.groupby(["type_y", "cp_density", "id"] + metric_ids)
+        metric_impact_df.groupby(["type_y", "network_type", "id"] + metric_ids)
         .sum()
         .reset_index()
     )
@@ -607,31 +639,31 @@ def impact_over_metrics(
             )
             titles.append(f"{metric} to the {key}' {carrier_name}-impact")
 
-    for cpd, monee_net in cpd_to_net.items():
-        metric_impact_df_carrier_cpd = metric_impact_df_all_carrier[
-            metric_impact_df_all_carrier["cp_density"] == cpd
+    for net_type, monee_net in net_type_to_net.items():
+        metric_impact_df_carrier_net_type = metric_impact_df_all_carrier[
+            metric_impact_df_all_carrier["network_type"] == net_type
         ]
         figures.append(
             eval.create_networkx_plot(
                 monee_net,
-                metric_impact_df_carrier_cpd,
+                metric_impact_df_carrier_net_type,
                 color_name="impact",
                 color_legend_text="impact",
                 template="plotly_white+publish",
             )
         )
-        titles.append(f"graph of the components' impact ({cpd})")
+        titles.append(f"graph of the components' impact ({net_type})")
         figures.append(
             eval.create_networkx_plot(
                 monee_net,
-                metric_impact_df_carrier_cpd,
+                metric_impact_df_carrier_net_type,
                 color_name="impact",
                 color_legend_text="impact",
                 template="plotly_white+publish",
                 without_nodes=True,
             )
         )
-        titles.append(f"edge-graph of the components' impact ({cpd})")
+        titles.append(f"edge-graph of the components' impact ({net_type})")
 
     eval.write_all_in_one(
         figures,
@@ -734,30 +766,30 @@ def impact_aggregated_component_carrier(impact_df: pandas.DataFrame, folder_id):
     ]
     titles.append("Total impacts by carrier type")
 
-    average_impact_per_carrier_cpd = (
-        new_impact_df.groupby(["type_carrier", "carrier", "cp_density"])
+    average_impact_per_carrier_net_type = (
+        new_impact_df.groupby(["type_carrier", "carrier", "network_type"])
         .mean()
         .reset_index()
     )
-    average_impact_per_carrier_cpd["carrier_cpd"] = (
-        average_impact_per_carrier_cpd["type_carrier"].astype(str)
+    average_impact_per_carrier_net_type["carrier_net_type"] = (
+        average_impact_per_carrier_net_type["type_carrier"].astype(str)
         + "-"
-        + average_impact_per_carrier_cpd["cp_density"].astype(str)
+        + average_impact_per_carrier_net_type["network_type"].astype(str)
     )
-    impact_per_carrier_cpd = (
-        new_impact_df.groupby(["type_carrier", "carrier", "cp_density"])
+    impact_per_carrier_net_type = (
+        new_impact_df.groupby(["type_carrier", "carrier", "network_type"])
         .sum()
         .reset_index()
     )
-    impact_per_carrier_cpd["carrier_cpd"] = (
-        impact_per_carrier_cpd["type_carrier"].astype(str)
+    impact_per_carrier_net_type["carrier_net_type"] = (
+        impact_per_carrier_net_type["type_carrier"].astype(str)
         + "-"
-        + impact_per_carrier_cpd["cp_density"].astype(str)
+        + impact_per_carrier_net_type["network_type"].astype(str)
     )
     figures += [
         eval.create_bar(
-            average_impact_per_carrier_cpd,
-            x_label="carrier_cpd",
+            average_impact_per_carrier_net_type,
+            x_label="carrier_net_type",
             y_label="impact",
             color="carrier",
             color_discrete_map=eval.NETWORK_COLOR_MAP,
@@ -771,8 +803,8 @@ def impact_aggregated_component_carrier(impact_df: pandas.DataFrame, folder_id):
     titles.append("Average impacts by carrier type and density")
     figures += [
         eval.create_bar(
-            impact_per_carrier_cpd,
-            x_label="carrier_cpd",
+            impact_per_carrier_net_type,
+            x_label="carrier_net_type",
             y_label="impact",
             color="carrier",
             color_discrete_map=eval.NETWORK_COLOR_MAP,
@@ -785,21 +817,21 @@ def impact_aggregated_component_carrier(impact_df: pandas.DataFrame, folder_id):
     ]
     titles.append("Total impacts by carrier type and density")
 
-    average_impact_per_cpd = (
-        new_impact_df.groupby(["carrier", "cp_density"]).mean().reset_index()
+    average_impact_per_net_type = (
+        new_impact_df.groupby(["carrier", "network_type"]).mean().reset_index()
     )
-    average_impact_per_cpd["cp_density"] = average_impact_per_cpd["cp_density"].astype(
+    average_impact_per_net_type["network_type"] = average_impact_per_net_type["network_type"].astype(
         str
     )
-    total_impact_per_cpd = (
-        new_impact_df.groupby(["carrier", "cp_density"]).sum().reset_index()
+    total_impact_per_net_type = (
+        new_impact_df.groupby(["carrier", "network_type"]).sum().reset_index()
     )
-    total_impact_per_cpd["cp_density"] = total_impact_per_cpd["cp_density"].astype(str)
+    total_impact_per_net_type["network_type"] = total_impact_per_net_type["network_type"].astype(str)
 
     figures += [
         eval.create_bar(
-            average_impact_per_cpd,
-            x_label="cp_density",
+            average_impact_per_net_type,
+            x_label="network_type",
             y_label="impact",
             color="carrier",
             color_discrete_map=eval.NETWORK_COLOR_MAP,
@@ -813,8 +845,8 @@ def impact_aggregated_component_carrier(impact_df: pandas.DataFrame, folder_id):
     titles.append("Average impacts by density")
     figures += [
         eval.create_bar(
-            total_impact_per_cpd,
-            x_label="cp_density",
+            total_impact_per_net_type,
+            x_label="network_type",
             y_label="impact",
             color="carrier",
             color_discrete_map=eval.NETWORK_COLOR_MAP,
@@ -836,25 +868,579 @@ def impact_aggregated_component_carrier(impact_df: pandas.DataFrame, folder_id):
     )
 
 
+def _match_impact_id(cp_id, cp_type, impact_ids):
+    """Find the impact_df id string for a given metric entry."""
+    if cp_type in ("CHP", "PowerToHeat"):
+        candidate = f"compound:{cp_id}"
+        return candidate if candidate in impact_ids else None
+
+    # Non-CP branches: cp_id is already str(edge_tuple) e.g. "(10, 4, 0)"
+    if cp_type in ("PowerLine", "GasPipe", "WaterPipe", "HeatExchanger"):
+        candidate = f"branch:{cp_id}"
+        if candidate in impact_ids:
+            return candidate
+        # Fallback: fuzzy match ignoring trailing uid
+        inner = str(cp_id).strip("()")
+        parts = [p.strip() for p in inner.split(",")]
+        if len(parts) >= 2:
+            a, b = parts[0], parts[1]
+            for iid in impact_ids:
+                if not iid.startswith("branch:"):
+                    continue
+                iinner = iid[len("branch:"):].strip("()")
+                iparts = [p.strip() for p in iinner.split(",")]
+                if len(iparts) >= 2:
+                    ia, ib = iparts[0], iparts[1]
+                    if (ia == a and ib == b) or (ia == b and ib == a):
+                        return iid
+        return None
+
+    # branch CPs (GasToPower, PowerToGas): cp_id = "from→to"
+    try:
+        from_id, to_id = str(cp_id).split("→")
+        from_id, to_id = from_id.strip(), to_id.strip()
+    except ValueError:
+        return None
+    for iid in impact_ids:
+        if not iid.startswith("branch:"):
+            continue
+        inner = iid[len("branch:"):]  # e.g. "(10, 4, 0)"
+        parts = inner.strip("()").split(",")
+        if len(parts) < 2:
+            continue
+        a, b = parts[0].strip(), parts[1].strip()
+        if (a == from_id and b == to_id) or (a == to_id and b == from_id):
+            return iid
+    return None
+
+
+def cp_metric_vs_actual_impact(monee_net, impact_df_nt, network_type):
+    try:
+        df_scores, _ = mes_all_components_metric(monee_net, cfg=CPMetricConfig())
+    except Exception as e:
+        print(f"CP metric failed for {network_type}: {e}")
+        raise e
+
+    # Aggregate actual impact per component across carriers
+    impact_abs = impact_df_nt.copy()
+    impact_abs["impact"] = impact_abs["impact"].abs()
+    actual_total = (
+        impact_abs.groupby("id")["impact"].sum()
+        .reset_index()
+        .rename(columns={"impact": "actual_total"})
+    )
+    actual_per_carrier = (
+        impact_abs.pivot_table(index="id", columns="carrier", values="impact", aggfunc="sum")
+        .reset_index()
+    )
+
+    impact_ids = set(actual_total["id"])
+    rows = []
+    for _, score_row in df_scores.iterrows():
+        impact_id = _match_impact_id(score_row["cp_id"], score_row["cp_type"], impact_ids)
+        if impact_id is None:
+            continue
+        actual_row = actual_total[actual_total["id"] == impact_id]
+        if len(actual_row) == 0:
+            continue
+        entry = {
+            "cp_id": str(score_row["cp_id"]),
+            "cp_type": score_row["cp_type"],
+            "predicted_score": score_row["score"],
+            "predicted_stress": score_row["total_stress"],
+            "topo_factor": score_row["topo_factor"],
+            "topo_bc": score_row["topo_bc"],
+            "stress_bc": score_row.get("stress_bc", 0.0),
+            "stress_score": score_row.get("stress_score", score_row["score"]),
+            "local_score": score_row.get("local_score", score_row["score"]),
+            "self_score": score_row.get("self_score", score_row["score"]),
+            "katz_score": score_row.get("katz_score", 0.0),
+            "vitality_score": score_row.get("vitality_score", 0.0),
+            "actual_total": actual_row["actual_total"].iloc[0],
+        }
+        for metric_col, carrier_col in [
+            ("power_stress", "electricity"),
+            ("gas_stress", "gas"),
+            ("heat_stress", "heat"),
+        ]:
+            entry[f"predicted_{metric_col}"] = score_row.get(metric_col, 0.0)
+            carrier_actual = actual_per_carrier[actual_per_carrier["id"] == impact_id]
+            entry[f"actual_{carrier_col}"] = (
+                carrier_actual[carrier_col].iloc[0]
+                if len(carrier_actual) > 0 and carrier_col in carrier_actual.columns
+                else 0.0
+            )
+        rows.append(entry)
+
+    if not rows:
+        print(f"No metric/impact matches found for {network_type}")
+        return
+
+    df = pandas.DataFrame(rows)
+    figures = []
+    titles = []
+
+    import numpy as _np2
+
+    def _spearman_with_ci(a, b, alpha=0.05):
+        """Returns (rho, pval, ci_lo, ci_hi) using Fisher z-transform CI."""
+        res = scipy.stats.spearmanr(a, b)
+        rho, pval = res.statistic, res.pvalue
+        n = len(a)
+        if n > 3:
+            z = _np2.arctanh(rho)
+            se = 1.0 / _np2.sqrt(n - 3)
+            z_crit = scipy.stats.norm.ppf(1 - alpha / 2)
+            ci_lo = float(_np2.tanh(z - z_crit * se))
+            ci_hi = float(_np2.tanh(z + z_crit * se))
+        else:
+            ci_lo, ci_hi = float("nan"), float("nan")
+        return float(rho), float(pval), ci_lo, ci_hi
+
+    def _rho_label(rho, pval, ci_lo, ci_hi):
+        return f"ρ={rho:.2f} [{ci_lo:.2f}, {ci_hi:.2f}], p={pval:.3f}"
+
+    # Spearman correlation annotation
+    rho_str = ""
+    if len(df) >= 3:
+        rho, pval, ci_lo, ci_hi = _spearman_with_ci(
+            df["predicted_score"], df["actual_total"]
+        )
+        rho_str = f" (Spearman {_rho_label(rho, pval, ci_lo, ci_hi)})"
+
+    # Scatter: predicted score vs actual total impact
+    figures.append(eval.create_scatter_with_df(
+        df, "predicted_score", "actual_total",
+        color_label="cp_type",
+        yaxis_title="Actual Total Impact (MC)",
+        xaxis_title="Predicted CP Score",
+        legend_text="CP Type",
+    ))
+    titles.append(f"Predicted Component Score vs Actual Impact{rho_str}")
+
+    # Per-carrier: predicted stress vs actual carrier impact
+    for pred_col, actual_col, label in [
+        ("predicted_power_stress", "actual_electricity", "Electricity"),
+        ("predicted_gas_stress", "actual_gas", "Gas"),
+        ("predicted_heat_stress", "actual_heat", "Heat"),
+    ]:
+        if actual_col not in df.columns:
+            continue
+        figures.append(eval.create_scatter_with_df(
+            df, pred_col, actual_col,
+            color_label="cp_type",
+            yaxis_title=f"Actual {label} Impact (MC)",
+            xaxis_title=f"Predicted {label} Stress",
+            legend_text="CP Type",
+        ))
+        titles.append(f"Predicted {label} Stress vs Actual {label} Impact")
+
+    # Topo factor vs actual total impact
+    figures.append(eval.create_scatter_with_df(
+        df, "topo_factor", "actual_total",
+        color_label="cp_type",
+        yaxis_title="Actual Total Impact (MC)",
+        xaxis_title="Topology Factor (1 + α·BC)",
+        legend_text="CP Type",
+    ))
+    titles.append("Topology Factor vs Actual Total Impact")
+
+    figures.append(eval.create_scatter_with_df(
+        df, "topo_bc", "actual_total",
+        color_label="cp_type",
+        yaxis_title="Actual Total Impact (MC)",
+        xaxis_title="Group Betweenness Centrality",
+        legend_text="CP Type",
+    ))
+    titles.append("Betweenness Centrality vs Actual Total Impact")
+
+    # Topology benefit: compare score with vs without topo factor
+    import plotly.graph_objects as go
+    import plotly.express as px
+    from plotly.subplots import make_subplots
+
+    df["score_no_topo"] = df["predicted_score"] / df["topo_factor"].replace(0, float("nan"))
+    # topo_only: use raw BC as the sole predictor
+    df["score_topo_only"] = df["topo_bc"]
+
+    rows_with_data = df.dropna(subset=["score_no_topo", "actual_total"])
+    if len(rows_with_data) >= 3:
+        def _sr(col):
+            return _spearman_with_ci(rows_with_data[col], rows_with_data["actual_total"])
+
+        rho_with,       pval_with,       ci_lo_with,       ci_hi_with       = _sr("predicted_score")
+        rho_without,    pval_without,    ci_lo_without,    ci_hi_without    = _sr("score_no_topo")
+        rho_topo_only,  pval_topo_only,  ci_lo_topo_only,  ci_hi_topo_only  = _sr("score_topo_only")
+        rho_stress_bc,  pval_stress_bc,  ci_lo_stress_bc,  ci_hi_stress_bc  = _sr("stress_bc")
+        rho_local,      pval_local,      ci_lo_local,      ci_hi_local      = _sr("local_score")
+        rho_self,       pval_self,       ci_lo_self,       ci_hi_self       = _sr("self_score")
+        rho_katz,       pval_katz,       ci_lo_katz,       ci_hi_katz       = _sr("katz_score")
+        rho_vitality,   pval_vitality,   ci_lo_vitality,   ci_hi_vitality   = _sr("vitality_score")
+
+        cp_types = rows_with_data["cp_type"].unique().tolist()
+        colors = px.colors.qualitative.Plotly
+        type_color = {t: colors[i % len(colors)] for i, t in enumerate(cp_types)}
+
+        panels = [
+            # x_col, subplot title (with ρ + 95% CI), x-axis label (exact formula)
+            ("predicted_score",
+             f"Full: PTDF stress + phys. BC<br>{_rho_label(rho_with, pval_with, ci_lo_with, ci_hi_with)}",
+             "p_fail · τ · PTDF_stress · (1 + α·BC_phys)"),
+            ("score_no_topo",
+             f"PTDF stress only, no BC<br>{_rho_label(rho_without, pval_without, ci_lo_without, ci_hi_without)}",
+             "p_fail · τ · PTDF_stress"),
+            ("score_topo_only",
+             f"Phys. BC only, no stress<br>{_rho_label(rho_topo_only, pval_topo_only, ci_lo_topo_only, ci_hi_topo_only)}",
+             "Phys. betweenness centrality"),
+            ("stress_bc",
+             f"Stress-weighted BC only<br>{_rho_label(rho_stress_bc, pval_stress_bc, ci_lo_stress_bc, ci_hi_stress_bc)}",
+             "Stress-weighted betweenness centrality"),
+            ("local_score",
+             f"1-hop local: loading + critical neighbours<br>{_rho_label(rho_local, pval_local, ci_lo_local, ci_hi_local)}",
+             "p_fail · loading · (1 + crit.nbrs) · n_carriers"),
+            ("self_score",
+             f"0-hop self: own loading only<br>{_rho_label(rho_self, pval_self, ci_lo_self, ci_hi_self)}",
+             "p_fail · loading · n_carriers"),
+            ("katz_score",
+             f"Katz centrality only<br>{_rho_label(rho_katz, pval_katz, ci_lo_katz, ci_hi_katz)}",
+             "Katz centrality (phys. graph)"),
+            ("vitality_score",
+             f"Closeness vitality only<br>{_rho_label(rho_vitality, pval_vitality, ci_lo_vitality, ci_hi_vitality)}",
+             "Closeness vitality W(G)−W(G\\v) (phys. graph)"),
+        ]
+
+        topo_fig = make_subplots(
+            rows=1, cols=len(panels),
+            subplot_titles=[p[1] for p in panels],
+            shared_yaxes=True,
+        )
+        for col_idx, (x_col, _title, x_label) in enumerate(panels, start=1):
+            for cp_type in cp_types:
+                sub = rows_with_data[rows_with_data["cp_type"] == cp_type]
+                color = type_color[cp_type]
+                topo_fig.add_trace(go.Scatter(
+                    x=sub[x_col], y=sub["actual_total"],
+                    mode="markers", name=cp_type,
+                    marker=dict(color=color, size=8),
+                    legendgroup=cp_type, showlegend=(col_idx == 1),
+                ), row=1, col=col_idx)
+            topo_fig.update_xaxes(title_text=x_label, row=1, col=col_idx)
+
+        topo_fig.update_yaxes(title_text="Actual Total Impact (MC)", row=1, col=1)
+        topo_fig.update_layout(
+            height=420, width=1600,
+            template="plotly_white",
+            margin={"l": 50, "b": 50, "r": 20, "t": 60},
+            legend={"title": "Component Type"},
+        )
+        figures.append(topo_fig)
+        titles.append(
+            f"Metric scatter comparison — "
+            f"ρ(PTDF+pBC)={rho_with:.2f} | ρ(PTDF)={rho_without:.2f} | "
+            f"ρ(pBC)={rho_topo_only:.2f} | ρ(sBC)={rho_stress_bc:.2f} | "
+            f"ρ(1-hop)={rho_local:.2f} | ρ(0-hop)={rho_self:.2f} | ρ(katz)={rho_katz:.2f} | ρ(vi)={rho_vitality:.2f}"
+        )
+
+    # ── Metric comparison figures ──────────────────────────────────────────
+    import numpy as _np
+
+    METRICS = [
+        ("predicted_score", "PTDF stress + phys. BC"),   # p_fail·τ·PTDF·(1+α·BC_phys)
+        ("score_no_topo",   "PTDF stress only"),          # p_fail·τ·PTDF  (BC removed)
+        ("score_topo_only", "Phys. BC only"),             # raw betweenness centrality, no stress
+        ("stress_bc",       "Stress BC only"),             # raw stress-weighted betweenness centrality, no PTDF
+        ("local_score",     "1-hop local"),               # p_fail·loading·(1+crit.nbrs)·n_carriers
+        ("self_score",      "0-hop self"),                # p_fail·loading·n_carriers
+        ("katz_score",      "Katz BC only"),              # raw Katz centrality (phys. graph), no stress
+        ("actual_total",    "Actual (MC)"),               # ground truth
+    ]
+    df = df.copy()
+
+    # Compute ranks for every metric (1 = highest)
+    for col, _label in METRICS:
+        df[f"rank_{col}"] = df[col].rank(ascending=False, method="min").astype(int)
+
+    valid = df.dropna(subset=[col for col, _ in METRICS])
+
+    # 1. ρ bar chart with 95% CI error bars
+    rho_rows = []
+    for col, label in METRICS[:-1]:  # exclude actual vs itself
+        rho, pval, ci_lo, ci_hi = _spearman_with_ci(valid[col], valid["actual_total"])
+        rho_rows.append({
+            "Metric": label, "Spearman ρ": rho, "p-value": pval,
+            "ci_lo": ci_lo, "ci_hi": ci_hi,
+            "err_lo": rho - ci_lo, "err_hi": ci_hi - rho,
+        })
+    rho_df = pandas.DataFrame(rho_rows).sort_values("Spearman ρ", ascending=False)
+
+    rho_bar = go.Figure(go.Bar(
+        x=rho_df["Metric"],
+        y=rho_df["Spearman ρ"],
+        error_y=dict(
+            type="data", symmetric=False,
+            array=rho_df["err_hi"].tolist(),
+            arrayminus=rho_df["err_lo"].tolist(),
+        ),
+        text=[f"ρ={r:.2f} [{lo:.2f},{hi:.2f}]<br>p={p:.3f}"
+              for r, p, lo, hi in zip(
+                  rho_df["Spearman ρ"], rho_df["p-value"],
+                  rho_df["ci_lo"], rho_df["ci_hi"])],
+        textposition="outside",
+        marker_color=px.colors.qualitative.Plotly[:len(rho_df)],
+    ))
+    rho_bar.update_layout(
+        height=450, width=800,
+        template="plotly_white",
+        yaxis=dict(title="Spearman ρ vs Actual (95% CI)", range=[-1.15, 1.15],
+                   zeroline=True, zerolinecolor="black", zerolinewidth=1),
+        xaxis_title="Metric",
+        margin={"l": 50, "b": 100, "r": 20, "t": 40},
+        showlegend=False,
+    )
+    figures.append(rho_bar)
+    titles.append("Predictive Power: Spearman ρ vs Actual Impact")
+
+    # 2. Pairwise rank-correlation heatmap
+    all_labels = [label for _, label in METRICS]
+    all_cols   = [col   for col, _ in METRICS]
+    n = len(all_cols)
+    rho_matrix = _np.ones((n, n))
+    for i, ci in enumerate(all_cols):
+        for j, cj in enumerate(all_cols):
+            if i != j:
+                rho_matrix[i, j] = float(scipy.stats.spearmanr(valid[ci], valid[cj]).statistic)
+
+    heatmap_fig = go.Figure(go.Heatmap(
+        z=rho_matrix,
+        x=all_labels, y=all_labels,
+        colorscale="RdBu", zmin=-1, zmax=1,
+        text=[[f"{rho_matrix[i,j]:.2f}" for j in range(n)] for i in range(n)],
+        texttemplate="%{text}",
+        colorbar=dict(title=dict(text="Spearman ρ", side="right")),
+    ))
+    heatmap_fig.update_layout(
+        height=480, width=620,
+        template="plotly_white",
+        margin={"l": 120, "b": 120, "r": 20, "t": 40},
+        xaxis=dict(title="Metric"),
+        yaxis=dict(title="Metric"),
+    )
+    figures.append(heatmap_fig)
+    titles.append("Pairwise Rank Correlation (Spearman ρ) Between All Metrics")
+
+    # 3. Bump chart – rank of each component across all metrics
+    metric_names = [label for _, label in METRICS]
+    rank_cols    = [f"rank_{col}" for col, _ in METRICS]
+    cp_colors    = px.colors.qualitative.Plotly
+    cp_type_color = {t: cp_colors[i % len(cp_colors)]
+                     for i, t in enumerate(df["cp_type"].unique())}
+
+    seen_cp_types = set()
+    bump_fig = go.Figure()
+    for _, row in df.iterrows():
+        ranks = [row[rc] for rc in rank_cols]
+        cp_type = row["cp_type"]
+        first_of_type = cp_type not in seen_cp_types
+        seen_cp_types.add(cp_type)
+        bump_fig.add_trace(go.Scatter(
+            x=metric_names, y=ranks,
+            mode="lines+markers",
+            name=str(row["cp_id"]),
+            legendgroup=cp_type,
+            legendgrouptitle=dict(text=cp_type) if first_of_type else None,
+            line=dict(color=cp_type_color.get(cp_type, "grey"), width=1.5),
+            marker=dict(size=7),
+            hovertemplate=f"<b>{row['cp_id']}</b> ({cp_type})<br>%{{x}}: rank %{{y}}<extra></extra>",
+            showlegend=True,
+        ))
+
+    bump_fig.update_layout(
+        height=max(400, 20 * len(df)),
+        width=900,
+        template="plotly_white",
+        yaxis=dict(title="Rank (1 = highest impact)", autorange="reversed",
+                   dtick=1, gridcolor="lightgrey"),
+        xaxis=dict(title="Metric"),
+        margin={"l": 60, "b": 60, "r": 180, "t": 40},
+        legend=dict(title="Component", groupclick="toggleitem",
+                    x=1.01, y=1, xanchor="left"),
+    )
+    figures.append(bump_fig)
+    titles.append("Rank Bump Chart: Each Component's Rank Across All Metrics")
+
+    # ── Ranking accuracy figures ───────────────────────────────────────────
+    # Helpers (no external dependencies beyond numpy/scipy)
+
+    def _ndcg(actual_vals, predicted_scores):
+        """Normalised Discounted Cumulative Gain.
+        Relevance = max(actual, 0) so components with zero/negative impact get
+        relevance 0 — they are not 'relevant' to identify as critical.
+        Using actual - min() would inflate all scores when the range is wide and
+        arbitrarily reward metrics that rank the least-harmful component last.
+        """
+        actual_arr = _np.array(actual_vals, dtype=float)
+        pred_order = _np.argsort(predicted_scores)[::-1]
+        ideal_order = _np.argsort(actual_arr)[::-1]
+        gains = _np.maximum(actual_arr, 0.0)           # negative impact → relevance 0
+        dcg  = sum(gains[pred_order[i]]  / _np.log2(i + 2) for i in range(len(gains)))
+        idcg = sum(gains[ideal_order[i]] / _np.log2(i + 2) for i in range(len(gains)))
+        return float(dcg / idcg) if idcg > 0 else 0.0
+
+    def _precision_at_k(actual_vals, predicted_scores, k):
+        """Fraction of true top-k components that appear in the predicted top-k."""
+        actual_top = set(_np.argsort(actual_vals)[-k:])
+        pred_top   = set(_np.argsort(predicted_scores)[-k:])
+        return len(actual_top & pred_top) / k
+
+    def _bootstrap_ci(stat_fn, actual_arr, pred_arr, n_boot=1000, alpha=0.05, rng=None):
+        """Bootstrap percentile CI for any scalar statistic.
+        stat_fn(actual, predicted) → float
+        """
+        if rng is None:
+            rng = _np.random.default_rng(42)
+        n = len(actual_arr)
+        boot = []
+        for _ in range(n_boot):
+            idx = rng.integers(0, n, n)
+            boot.append(stat_fn(actual_arr[idx], pred_arr[idx]))
+        return (float(_np.percentile(boot, 100 * alpha / 2)),
+                float(_np.percentile(boot, 100 * (1 - alpha / 2))))
+
+    pred_metrics = [(col, label) for col, label in METRICS if col != "actual_total"]
+    actual_vals  = valid["actual_total"].values
+
+    # 4a. Summary bar chart: Kendall τ and NDCG per metric, with bootstrap 95% CIs
+    _rng = _np.random.default_rng(42)
+    acc_rows = []
+    for col, label in pred_metrics:
+        scores = valid[col].values
+        tau  = float(scipy.stats.kendalltau(scores, actual_vals).statistic)
+        ndcg = _ndcg(actual_vals, scores)
+        tau_lo, tau_hi   = _bootstrap_ci(
+            lambda a, p: float(scipy.stats.kendalltau(p, a).statistic),
+            actual_vals, scores, rng=_rng)
+        ndcg_lo, ndcg_hi = _bootstrap_ci(
+            lambda a, p: _ndcg(a, p),
+            actual_vals, scores, rng=_rng)
+        acc_rows.append({
+            "Metric": label,
+            "Kendall τ": tau,  "τ_lo": tau_lo,  "τ_hi": tau_hi,
+            "NDCG":      ndcg, "ndcg_lo": ndcg_lo, "ndcg_hi": ndcg_hi,
+        })
+
+    acc_df = pandas.DataFrame(acc_rows).sort_values("NDCG", ascending=True)
+
+    acc_fig = make_subplots(rows=1, cols=2, subplot_titles=["Kendall τ (95% CI)", "NDCG (95% CI)"])
+    metric_colors = {row["Metric"]: px.colors.qualitative.Plotly[i % 10]
+                     for i, row in acc_df.iterrows()}
+
+    for col_idx, (measure, lo_col, hi_col) in enumerate(
+        [("Kendall τ", "τ_lo", "τ_hi"), ("NDCG", "ndcg_lo", "ndcg_hi")], start=1
+    ):
+        vals   = acc_df[measure].values
+        err_lo = (vals - acc_df[lo_col].values).clip(0)
+        err_hi = (acc_df[hi_col].values - vals).clip(0)
+        acc_fig.add_trace(go.Bar(
+            x=vals,
+            y=acc_df["Metric"],
+            orientation="h",
+            marker_color=[metric_colors[m] for m in acc_df["Metric"]],
+            error_x=dict(type="data", symmetric=False,
+                         array=err_hi.tolist(), arrayminus=err_lo.tolist()),
+            text=[f"{v:.3f} [{lo:.2f},{hi:.2f}]"
+                  for v, lo, hi in zip(vals, acc_df[lo_col], acc_df[hi_col])],
+            textposition="outside",
+            showlegend=False,
+        ), row=1, col=col_idx)
+        ref_range = [-1.05, 1.05] if measure == "Kendall τ" else [-0.05, 1.05]
+        acc_fig.update_xaxes(title_text=measure, range=ref_range,
+                             zeroline=True, zerolinecolor="black", zerolinewidth=1,
+                             row=1, col=col_idx)
+        acc_fig.update_yaxes(title_text="Metric", row=1, col=col_idx)
+
+    acc_fig.update_layout(
+        height=80 + 40 * len(acc_df), width=1000,
+        template="plotly_white",
+        margin={"l": 160, "b": 50, "r": 120, "t": 50},
+    )
+    figures.append(acc_fig)
+    best = acc_df.iloc[-1]["Metric"]
+    titles.append(f"Ranking Accuracy: Kendall τ and NDCG with Bootstrap 95% CI (best NDCG: {best})")
+
+    # 4b. Precision@k curve: how well does each metric identify the true top-k?
+    n_comp = len(valid)
+    k_values = list(range(1, n_comp + 1))
+    prec_fig = go.Figure()
+    for col, label in pred_metrics:
+        scores = valid[col].values
+        prec_at_k = [_precision_at_k(actual_vals, scores, k) for k in k_values]
+        prec_fig.add_trace(go.Scatter(
+            x=k_values, y=prec_at_k,
+            mode="lines+markers",
+            name=label,
+            marker=dict(size=5),
+        ))
+    # Baseline: random predictor expected precision = k/n
+    prec_fig.add_trace(go.Scatter(
+        x=k_values, y=[k / n_comp for k in k_values],
+        mode="lines", name="Random baseline",
+        line=dict(dash="dash", color="grey", width=1),
+    ))
+    prec_fig.update_layout(
+        height=450, width=750,
+        template="plotly_white",
+        xaxis=dict(title="k (number of top components considered)", dtick=1),
+        yaxis=dict(title="Precision@k", range=[-0.05, 1.05],
+                   zeroline=True, zerolinecolor="lightgrey"),
+        margin={"l": 60, "b": 60, "r": 20, "t": 40},
+        legend=dict(title="Metric", x=1.01, xanchor="left"),
+    )
+    figures.append(prec_fig)
+    titles.append("Precision@k: Fraction of True Top-k Components Correctly Identified")
+
+    eval.write_all_in_one(
+        figures, "Figure", Path("."),
+        OUTPUT + f"/{network_type}/cp_metric_vs_actual.html",
+        titles=titles,
+    )
+    print(f"Written cp_metric_vs_actual.html for {network_type}")
+
+
 def evaluate(folder_id):
-    fail_df, perf_df, repair_df, metrics_df, cpd_to_net = load_dfs(folder_id)
+    fail_df, perf_df, repair_df, metrics_df, net_type_to_net = load_dfs(folder_id)
     impact_df = create_or_load_impact_df(
         fail_df, perf_df, repair_df, metrics_df, folder_id
     )
-    resilience_per_scenario(perf_df, folder_id)
-    impact_df = extend_impact_df(cpd_to_net, metrics_df, impact_df)
-    impact_aggregated_component_carrier(impact_df, folder_id)
-    impact_over_metrics(
-        cpd_to_net,
-        impact_df,
-        metrics_df,
-        folder_id,
-        ["betweenness_centrality", "degree", "vc", "katz"],
-    )
+    impact_df = extend_impact_df(net_type_to_net, metrics_df, impact_df)
+
+    for network_type, monee_net in net_type_to_net.items():
+        if network_type == "large_urban_balanced":
+            result = run_energy_flow(monee_net, solver=PyomoSolver())
+            print(result.full())
+            print(result.network.as_result_dataframe_dict_str())
+            monee_net = result.network
+        else:
+            continue
+        Path(OUTPUT + f"/{network_type}").mkdir(exist_ok=True, parents=True)
+
+        perf_df_nt = perf_df[perf_df["network_type"] == network_type]
+        impact_df_nt = impact_df[impact_df["network_type"] == network_type]
+        metrics_df_nt = metrics_df[metrics_df["network_type"] == network_type]
+
+        resilience_per_scenario(perf_df_nt, network_type)
+        impact_aggregated_component_carrier(impact_df_nt, network_type)
+        impact_over_metrics(
+            {network_type: monee_net},
+            impact_df_nt,
+            metrics_df_nt,
+            network_type,
+            ["betweenness_centrality", "degree", "vc", "katz"],
+        )
+        cp_metric_vs_actual_impact(monee_net, impact_df_nt, network_type)
 
 
 def main():
-    evaluate("data/res_31_01_24")
+    evaluate(INPUT)
 
 
 if __name__ == "__main__":
