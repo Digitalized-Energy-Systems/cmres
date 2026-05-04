@@ -1,6 +1,4 @@
 import logging
-import traceback
-from typing import List
 
 import monee.model as mm
 import numpy as np
@@ -12,7 +10,6 @@ import cmres.omef.solver.monee as ms
 from cmres.resilience.core import (
     Effect,
     Failure,
-    RepairModel,
     ResilienceModel,
     StepModel,
 )
@@ -29,14 +26,10 @@ log = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-# Antithetic counterparts of the default normal-draw models.
+# Antithetic counterpart of the default normal-draw failure model.
 # For X ~ N(μ, σ):  antithetic = 2μ − X  (reflects about the mean).
 def ANTITHETIC_FAILURE_PROBABILITY_MODEL(base_prob):
     return base_prob * (2.0 - np.random.normal(1, scale=0.1))
-
-
-def ANTITHETIC_DMG_COEFF_VARIANCE_MODEL(dmg_coeff):
-    return dmg_coeff * (2.0 - np.random.normal(1, scale=0.1))
 
 
 FAIL_BASE_PROBABILITY_MAP = {
@@ -97,10 +90,6 @@ class SimpleResilienceModel(ResilienceModel):
         self,
         incident_shift=5,
         incident_timesteps=10,
-        heat_impact=0.1,
-        gas_impact=0.1,
-        power_impact=5,
-        mes_impact=1,
         base_fail_probability_map=FAIL_BASE_PROBABILITY_MAP,
         fail_probability_model=FAILURE_PROBABILITY_MODEL,
         time_model=FAILURE_TIME_MODEL,
@@ -112,10 +101,6 @@ class SimpleResilienceModel(ResilienceModel):
         self._incident_shift = incident_shift
         self._incident_timesteps = incident_timesteps
         self._base_fail_probability_map = base_fail_probability_map
-        self._heat_impact = heat_impact
-        self._gas_impact = gas_impact
-        self._power_impact = power_impact
-        self._mes_impact = mes_impact
         self._antithetic = antithetic
         # Antithetic mode: replace the default normal-draw model with its
         # reflection (2μ − X) so that paired runs are negatively correlated.
@@ -129,23 +114,6 @@ class SimpleResilienceModel(ResilienceModel):
         self._spatial_model = lambda coords: (
             spatial_model(coords) if coords is not None else 1
         )
-
-    def _read_impact(self, component):
-        if (
-            not hasattr(component, "grid")
-            or component.grid is None
-            or type(component.grid) is dict
-        ):
-            return self._mes_impact
-
-        if component.grid.name == "water":
-            return self._heat_impact
-        elif component.grid.name == "power":
-            return self._power_impact
-        elif component.grid.name == "gas":
-            return self._gas_impact
-
-        return self._mes_impact
 
     def calc_fail(self, network: Network, component, time):
         model_type = type(component.model)
@@ -233,6 +201,14 @@ class SimpleResilienceModel(ResilienceModel):
         spontaneously, the component/timestep with the highest computed
         failure probability is forced to fail.  This keeps every MC scenario
         eventful while preserving the relative ranking of failure likelihoods.
+
+        Statistical note: the forced-failure rule is a zero-truncation.
+        The returned estimator is therefore the expectation *conditional on*
+        at least one failure, which biases the unconditional mean upward
+        by a factor ≲ 1/(1 − P(all-zero)).  For the priors used here,
+        P(all-zero) ≪ 1 per scenario and the bias is numerically negligible.
+        Remove the guaranteed-failure branch below to recover an unbiased
+        estimator of the unconditional mean.
         """
         use_scenario = registry is not None and scenario is not None
         failures = []
@@ -256,7 +232,7 @@ class SimpleResilienceModel(ResilienceModel):
                     fail_prob = self.calc_fail(net, node, time)
                     triggered = self._bernoulli(fail_prob)
                 if triggered:
-                    failures.append(Failure(time, node, fail_prob, Effect.DEAD, -1))
+                    failures.append(Failure(time, node, fail_prob, Effect.DEAD))
                     already_failed.add(node.id)
                 elif fail_prob > 0 and (
                     best_candidate is None or fail_prob > best_candidate[0]
@@ -274,7 +250,7 @@ class SimpleResilienceModel(ResilienceModel):
                     fail_prob = self.calc_fail(net, branch, time)
                     triggered = self._bernoulli(fail_prob)
                 if triggered:
-                    failures.append(Failure(time, branch, fail_prob, Effect.DEAD, -1))
+                    failures.append(Failure(time, branch, fail_prob, Effect.DEAD))
                     already_failed.add(branch.id)
                 elif fail_prob > 0 and (
                     best_candidate is None or fail_prob > best_candidate[0]
@@ -292,7 +268,7 @@ class SimpleResilienceModel(ResilienceModel):
                     fail_prob = self.calc_fail(net, child, time)
                     triggered = self._bernoulli(fail_prob)
                 if triggered:
-                    failures.append(Failure(time, child, fail_prob, Effect.DEAD, -1))
+                    failures.append(Failure(time, child, fail_prob, Effect.DEAD))
                     already_failed.add(child.id)
                 elif fail_prob > 0 and (
                     best_candidate is None or fail_prob > best_candidate[0]
@@ -310,7 +286,7 @@ class SimpleResilienceModel(ResilienceModel):
                     fail_prob = self.calc_fail(net, compound, time)
                     triggered = self._bernoulli(fail_prob)
                 if triggered:
-                    failures.append(Failure(time, compound, fail_prob, Effect.DEAD, -1))
+                    failures.append(Failure(time, compound, fail_prob, Effect.DEAD))
                     already_failed.add(compound.id)
                 elif fail_prob > 0 and (
                     best_candidate is None or fail_prob > best_candidate[0]
@@ -326,129 +302,7 @@ class SimpleResilienceModel(ResilienceModel):
                 time,
                 fp,
             )
-            failures.append(Failure(time, comp, fp, Effect.DEAD, -1))
-
-        return failures
-
-
-DMG_COEFF_FUNC_MAP = {
-    mm.Source: lambda model: mm.upper(model.mass_flow),
-    mm.Sink: lambda model: mm.upper(model.mass_flow),
-    mm.PowerToGas: lambda model: mm.upper(model.to_mass_flow),
-    mm.PowerToHeat: lambda model: mm.upper(model.heat_energy_w),
-    mm.CHP: lambda model: mm.upper(model.mass_flow),
-    mm.GasToPower: lambda model: mm.upper(model.from_mass_flow),
-    mm.PowerGenerator: lambda model: mm.upper(model.p_mw),
-    mm.HeatExchanger: lambda model: mm.upper(model.q_w),
-    mm.HeatExchangerGenerator: lambda model: mm.upper(model.q_w),
-    mm.HeatExchangerLoad: lambda model: mm.upper(model.q_w),
-    mm.GenericPowerBranch: lambda model: model.br_r,
-    mm.PowerLine: lambda model: model.br_r,
-    mm.Trafo: lambda _: 1,
-    mm.WaterPipe: lambda model: model.length_m,
-    mm.GasPipe: lambda model: model.length_m,
-    mm.Bus: lambda _: 1,
-    mm.Junction: lambda _: 1,
-}
-
-
-def DMG_COEFF_VARIANCE_MODEL(dmg_coeff):
-    return dmg_coeff * np.random.normal(1, scale=0.1)
-
-
-class SimpleRepairModel(RepairModel):
-    def __init__(
-        self,
-        delay_for_repair=10,
-        dmg_coeff_func_map=DMG_COEFF_FUNC_MAP,
-        dmg_coeff_variance_model=DMG_COEFF_VARIANCE_MODEL,
-        incident_timesteps=10,
-        incident_shift=0,
-        antithetic: bool = False,
-    ) -> None:
-        self._dmg_coeff_func_map = dmg_coeff_func_map
-        self._antithetic = antithetic
-        # Antithetic mode: replace normal-draw model with its reflection.
-        if antithetic and dmg_coeff_variance_model is DMG_COEFF_VARIANCE_MODEL:
-            self._dmg_coeff_variance_model = ANTITHETIC_DMG_COEFF_VARIANCE_MODEL
-        else:
-            self._dmg_coeff_variance_model = dmg_coeff_variance_model
-        self._delay_for_repair = delay_for_repair
-        self._incident_timesteps = incident_timesteps
-        self._incident_shift = incident_shift
-
-    def generate_repairs(
-        self,
-        _,
-        failures: List[Failure],
-        registry=None,
-        scenario=None,
-    ):
-        """Assign repaired_time to each failure.
-
-        Parameters
-        ----------
-        registry : ComponentRegistry | None
-        scenario : FailureScenario | None
-            When provided, repair time and damage coefficient are derived from
-            pre-sampled uniforms (dims 2 and 3) rather than the global RNG.
-        """
-        use_scenario = registry is not None and scenario is not None
-
-        for failure in failures:
-            f: Failure = failure
-            if type(f.component.model) not in self._dmg_coeff_func_map:
-                raise Exception(
-                    f"There is no dmg coeff defined for {type(f.component.model)}!"
-                )
-            raw_dmg_coeff = self._dmg_coeff_func_map[type(f.component.model)](
-                f.component.model
-            )
-
-            if use_scenario:
-                cidx = registry.index_of(f.component)
-                # Map failure simulation time back to incident array index:
-                # f.time = i + incident_shift  →  t_idx = i = f.time − incident_shift
-                raw_t_idx = f.time - self._incident_shift
-                t_max = scenario.uniforms.shape[1] - 1
-                t_idx = max(0, min(raw_t_idx, t_max))
-                if t_idx != raw_t_idx:
-                    import warnings
-
-                    warnings.warn(
-                        f"SimpleRepairModel: repair t_idx={raw_t_idx} clamped to "
-                        f"[0, {t_max}]; scenario shape may be too small for "
-                        f"the configured incident window.",
-                        RuntimeWarning,
-                        stacklevel=2,
-                    )
-                # Clamp: if cidx is valid, use scenario; else fall through to RNG
-                if cidx is not None and cidx < scenario.uniforms.shape[0]:
-                    u = scenario.uniforms[cidx, t_idx]  # shape (N_DIM,)
-
-                    # dim 2: repair base time ~ N(5, 5)
-                    base_time = _ppf_normal(u[2], loc=5.0, scale=5.0)
-                    # dim 3: damage coefficient multiplier ~ N(1, 0.1), clipped ≥ 0
-                    dmg_mult = max(0.0, _ppf_normal(u[3], loc=1.0, scale=0.1))
-
-                    dmg = dmg_mult * raw_dmg_coeff * f.severity
-                    time_needed = max(
-                        base_time + self._delay_for_repair + dmg / 10,
-                        self._incident_timesteps,
-                    )
-                    f.repaired_time = int(f.time + time_needed)
-                    continue
-
-            # ── Legacy RNG path ──────────────────────────────────────────────
-            dmg = self._dmg_coeff_variance_model(raw_dmg_coeff) * f.severity
-            base_time = np.random.normal(5, 5)
-            if self._antithetic:
-                base_time = 10.0 - base_time
-            time_needed = max(
-                base_time + self._delay_for_repair + dmg / 10,
-                self._incident_timesteps,
-            )
-            f.repaired_time = int(f.time + time_needed)
+            failures.append(Failure(time, comp, fp, Effect.DEAD))
 
         return failures
 
@@ -564,7 +418,7 @@ class CascadingModel(StepModel):
 
     def fault_delta_exists(self, step):
         for fault in self._faults:
-            if fault.start_time == step or fault.stop_time == step:
+            if fault.start_time == step:
                 return True
         return False
 
@@ -599,8 +453,15 @@ class CascadingModel(StepModel):
             try:
                 performance, _ = self.calc_performance(net)
             except Exception:
-                print(traceback.format_exc())
-
+                active_faults = [
+                    str(f) for f in (self._faults or []) if f.start_time <= step
+                ]
+                log.exception(
+                    "calc_performance failed at step=%d; falling back to "
+                    "max-load-shedding. Active faults so far: %s",
+                    step,
+                    active_faults,
+                )
                 performance = self._max_load_shedding(net)
             self._last_performance = performance
         else:

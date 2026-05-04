@@ -377,6 +377,10 @@ _HX_RESISTANCE_FALLBACK = 1e-3  # only used if there are no WaterPipes to scale 
 
 
 def _calc_C_squared(diameter_m, length_m, t_k, compressibility):
+    # Weymouth constant, C² = π²D⁵ / (128 L R T Z).  Matches the form
+    # C² = π²D⁵ / (16 f L R T Z) of Osiadacz (1987, §5) with f = 1/8
+    # baked in; the friction factor is absorbed into the monee simulator's
+    # operating-point calibration rather than carried as a free parameter.
     return (math.pi**2 * diameter_m**5) / (
         128.0 * length_m * _R_SPECIFIC_GAS * t_k * compressibility
     )
@@ -905,7 +909,12 @@ def compute_stress_topology_metrics(monee_net, ctx: "CarrierPTDFContext", cfg: "
         if stress_val is not None and stress_val > 0:
             w = 1.0 / (stress_val + EPS)
         else:
-            w = 1.0 / EPS  # unmapped or zero-flow: treat as very short (neutral)
+            # Unmapped or zero-flow edges: absence of stress data is interpreted
+            # as "maximally unconstrained" -> weight = 1/EPS makes them the
+            # shortest possible paths.  This is CONSERVATIVE, not neutral: it
+            # inflates BC of nodes adjacent to unmapped edges.  For a neutral
+            # alternative, use w = median(stress_weight over mapped edges).
+            w = 1.0 / EPS
         G.edges[u, v]["stress_weight"] = float(np.clip(w, 0.0, 1e12))
 
     bc = nx.betweenness_centrality(G, weight="stress_weight")
@@ -1599,6 +1608,14 @@ def _branch_lodf_stress(
 ):
     """
     Approximate LODF stress for a branch removal using ptdf_from - ptdf_to.
+
+    This is the first-order proxy Ψ_LODF(·, b) = Ψ(·, u) − Ψ(·, v) for a
+    branch b = (u, v).  It has the correct sign and support but diverges
+    from the exact generalised LODF of Güler, Gross & Liu (IEEE T-PWRS,
+    2007) when the tripped branch is near-binding.  For settings that
+    require tighter accuracy, replace this with the rank-one Ψ-update of
+    that paper at the cost of one extra solve per branch.
+
     Returns (mean_s, max_s, agg_s, reliable).
     """
     if carrier == "power":

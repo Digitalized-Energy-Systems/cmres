@@ -525,10 +525,10 @@ def create_networkx_plot(
                 line=dict(
                     width=3,
                     color="rgb(0,0,0)"
-                    if max(color_edges) == 0
+                    if max_color_val == 0
                     else px.colors.sample_colorscale(
                         px.colors.sequential.Sunsetdark,
-                        (color_edges[i] / max_color_val) + min(color_edges),
+                        min(1.0, max(0.0, color_edges[i] / max_color_val)),
                     )[0],
                 ),
                 hoverinfo="text",

@@ -5,7 +5,7 @@ import fcntl
 
 from cmres.resilience.world import CentralFaultyMoneeWorld
 from cmres.resilience.fault import FaultGenerator
-from cmres.resilience.core import ResilienceMetric, ResilienceModel, RepairModel
+from cmres.resilience.core import ResilienceMetric, ResilienceModel
 from cmres.resilience.model import CascadingModel
 
 import cmres.data.observer as observer
@@ -52,7 +52,6 @@ def start_resilience_simulation(
     net: Network,
     timeseries_data: TimeseriesData,
     resilience_model: ResilienceModel,
-    repair_model: RepairModel,
     resilience_measurement_model: ResilienceMetric,
     time_steps=96,
     name="RES_SIM",
@@ -70,7 +69,7 @@ def start_resilience_simulation(
         _, __ = cascading_model.calc_performance(net, 0)
 
     fault_gen = FaultGenerator(
-        resilience_model, repair_model, registry=registry, scenario=scenario
+        resilience_model, registry=registry, scenario=scenario
     )
     sim = CentralFaultyMoneeWorld(
         iteration_step,

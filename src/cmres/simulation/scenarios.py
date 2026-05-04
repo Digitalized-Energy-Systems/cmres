@@ -1,7 +1,7 @@
 # simulation scenario for RES
 
 import cmres.simulation.scenario.resilience as ssr
-from cmres.resilience.core import ResilienceMetric, ResilienceModel, RepairModel
+from cmres.resilience.core import ResilienceMetric, ResilienceModel
 
 from monee import Network, TimeseriesData
 
@@ -13,7 +13,6 @@ def start_res_simulation(
     net: Network,
     timeseries_data: TimeseriesData,
     resilience_model: ResilienceModel,
-    repair_model: RepairModel,
     resilience_measurement_model: ResilienceMetric,
     time_steps=TIME_STEPS,
     name=RES_SIM_NAME,
@@ -30,8 +29,8 @@ def start_res_simulation(
         Canonical component ordering; required when *scenario* is provided.
     scenario : FailureScenario | None
         Pre-sampled uniform[0,1] inputs from an RQMC sampler.  When provided,
-        all stochastic failure and repair decisions come from the scenario
-        rather than the global RNG.
+        all stochastic failure decisions come from the scenario rather than
+        the global RNG.
 
     Returns
     -------
@@ -43,7 +42,6 @@ def start_res_simulation(
         net,
         timeseries_data,
         resilience_model,
-        repair_model,
         resilience_measurement_model,
         time_steps=time_steps,
         name=name,

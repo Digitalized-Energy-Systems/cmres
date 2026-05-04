@@ -3,12 +3,20 @@
 Variance-reduction stack
 ------------------------
 1. Randomised Quasi-Monte Carlo (RQMC)
-   Owen-scrambled Sobol sequences replace pseudo-random seeds.  For a
-   d-dimensional integrand, RQMC achieves O(n⁻¹ (log n)^{d/2}) convergence
-   vs O(n⁻¹/²) for plain MC.  All random inputs for one simulation run are
-   pre-generated as a single Sobol point, reshaped to
-   (n_components, T_incident, N_DIM).  The Sobol engine is pre-generated once
-   before the loop.
+   Owen-scrambled Sobol sequences replace pseudo-random seeds.  Rates
+   (RMS error) per Owen (1997):
+     • smooth integrands (bounded mixed partials):
+           O(n⁻³ᐟ² (log n)^{(d−1)/2})
+     • Hardy–Krause bounded-variation integrands:
+           O(n⁻¹   (log n)^{(d−1)/2})
+     • plain pseudo-random MC:
+           O(n⁻¹ᐟ²)
+   The MES performance map is piecewise smooth (analytic inside the
+   Bernoulli cells, discontinuous across them), so the observed rate sits
+   between the two RQMC bounds.  All random inputs for one simulation run
+   are pre-generated as a single Sobol point, reshaped to
+   (n_components, T_incident, N_DIM).  The Sobol engine is pre-generated
+   once before the loop.
 
 2. Antithetic Variates (AV)
    Every Sobol point u is paired with its antithetic twin (1 − u).  Because
@@ -16,8 +24,14 @@ Variance-reduction stack
    exact for every input type:
      • Bernoulli(p)   : normal fails if u < p;  antithetic fails if (1−u) < p
      • Normal X~N(μ,σ): normal uses norm.ppf(u); antithetic uses norm.ppf(1−u) = 2μ−X
-   For p_fail ≈ 0.1, pairing (u, 1−u) gives ~56 % variance reduction in the
-   failure-count estimator.
+   Variance-reduction factor depends on the integrand:
+     • For a single Bernoulli(p) trigger, the paired-estimator variance
+       ratio is (1−2p)/(1−p) — only ~11 % reduction at p = 0.1.
+     • For a linear function of the Gaussian multipliers the reflection
+       is exact (reduction → 100 %).
+   The MES performance loss is a nonlinear function of both, so the
+   empirical reduction sits between these bounds and is integrand-specific;
+   it should be reported per-experiment rather than claimed ex ante.
 
 3. Self-Normalised Importance Sampling (SNIS)
    The WeightedAccumulator implements the SNIS estimator.  For plain RQMC/MC
@@ -36,17 +50,23 @@ Stopping criterion — sequential relative CI
 
 References
 ----------
-Owen (2013) "Monte Carlo theory, methods and examples"
-    https://artowen.su.domains/mc/
 Sobol' (1967) "On the distribution of points in a cube and the approximate
     evaluation of integrals"
-Joe & Kuo (2010) "Constructing Sobol sequences with better two-dimensional
+Owen (1995) "Randomly permuted (t,m,s)-nets and (t,s)-sequences"
+Owen (1997) "Scrambled net variance for integrals of smooth functions"
+    Annals of Statistics 25(4), pp. 1541–1562.
+Owen (2013) "Monte Carlo theory, methods and examples"
+    https://artowen.su.domains/mc/
+Joe & Kuo (2008) "Constructing Sobol sequences with better two-dimensional
     projections"
+Hammersley & Morton (1956) "A new Monte Carlo technique: antithetic variates"
 Chan, Golub & LeVeque (1983) "Algorithms for computing the sample variance"
     The American Statistician 37(3), pp. 242–247.
 Kish (1965) "Survey Sampling"
 Welford (1962) "Note on a method for calculating corrected sums of squares"
     Technometrics 4(3), pp. 419–420.
+McKay, Beckman & Conover (1979) "A comparison of three methods for selecting
+    values of input variables …"  (LHS fallback when d > 21 201.)
 """
 
 from __future__ import annotations
@@ -84,6 +104,14 @@ class ComponentRegistry:
     3. ``net.childs``    – independent children only
     4. ``net.compounds`` – all compounds
 
+    Identity
+    --------
+    Components are keyed by ``(kind, comp.id)`` where ``kind`` is one of
+    ``"node" | "branch" | "child" | "compound"``.  This survives
+    ``Network.copy()`` (which produces fresh Python objects with new
+    ``id(comp)`` but identical ``comp.id``) and avoids collisions between the
+    four categories, whose ``comp.id`` spaces overlap.
+
     Parameters
     ----------
     net : monee.Network
@@ -98,24 +126,37 @@ class ComponentRegistry:
 
         for node in net.nodes:
             if node.independent:
-                self._register(node)
+                self._register(node, "node")
         for branch in net.branches:
             if branch.independent or type(branch.model) is mm.HeatExchanger:
-                self._register(branch)
+                self._register(branch, "branch")
         for child in net.childs:
             if child.independent:
-                self._register(child)
+                self._register(child, "child")
         for compound in net.compounds:
-            self._register(compound)
+            self._register(compound, "compound")
 
-    def _register(self, comp) -> None:
+    def _register(self, comp, kind: str) -> None:
         idx = len(self._components)
-        self._id_map[id(comp)] = idx
+        self._id_map[(kind, comp.id)] = idx
         self._components.append(comp)
+
+    @staticmethod
+    def _kind_of(comp) -> str:
+        cls = type(comp).__name__
+        if cls == "Node":
+            return "node"
+        if cls == "Branch":
+            return "branch"
+        if cls == "Child":
+            return "child"
+        if cls == "Compound":
+            return "compound"
+        return cls.lower()
 
     def index_of(self, comp) -> Optional[int]:
         """Return the registry index for *comp*, or ``None`` if not registered."""
-        return self._id_map.get(id(comp))
+        return self._id_map.get((self._kind_of(comp), comp.id))
 
     @property
     def n_components(self) -> int:
@@ -137,23 +178,25 @@ class FailureScenario:
     """Pre-sampled uniform[0,1] inputs for one resilience simulation run.
 
     ``uniforms`` has shape ``(n_components, T_incident, N_DIM)`` where
-    N_DIM = 4.
+    N_DIM = 2.
 
     Dimension layout
     ----------------
     0 : failure probability multiplier  →  N(1, 0.1)  via ``norm.ppf``
     1 : failure Bernoulli trigger       →  compare U directly with fail_prob
-    2 : repair time base draw           →  N(5, 5)    via ``norm.ppf``
-    3 : damage coefficient multiplier  →  N(1, 0.1)  via ``norm.ppf``
+
+    Repair-time and damage-multiplier dimensions were removed: repair is now
+    a deterministic function of ``(component, severity)`` so its variance
+    no longer consumes Sobol budget.
 
     Antithetic twin
     ---------------
     ``make_antithetic()`` returns a reflected scenario (1 − U).  When paired
-    with the original, all four inputs are maximally negatively correlated.
+    with the original, both inputs are maximally negatively correlated.
     For ``log_weight != 0`` (IS mode), the weight is inherited unchanged.
     """
 
-    N_DIM: ClassVar[int] = 4
+    N_DIM: ClassVar[int] = 2
 
     uniforms: np.ndarray  # shape (n_components, T_incident, N_DIM)
     log_weight: float = 0.0  # log IS weight; 0.0 → plain RQMC (no reweighting)

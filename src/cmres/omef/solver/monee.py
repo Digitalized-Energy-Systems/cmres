@@ -7,31 +7,26 @@ BOUND_HEAT = ("t_pu", 1, 0.1)
 
 
 def solve(network):
-    optimization_problem = None
-    bounds_el = (
-        BOUND_EL[1] * (1 - BOUND_EL[2]),
-        BOUND_EL[1] * (1 + BOUND_EL[2]),
-    )
-    bounds_heat = (
-        BOUND_HEAT[1] * (1 - BOUND_HEAT[2]),
-        BOUND_HEAT[1] * (1 + BOUND_HEAT[2]),
-    )
-    bounds_gas = (
-        BOUND_GAS[1] * (1 - BOUND_GAS[2]),
-        BOUND_GAS[1] * (1 + BOUND_GAS[2]),
-    )
 
-    optimization_problem = mp.create_load_shedding_optimization_problem(
-        bounds_el=bounds_el,
-        bounds_heat=bounds_heat,
-        bounds_gas=bounds_gas,
-        use_ext_grid_bounds=False,
+    optimization_problem = mp.create_min_load_shedding_problem(
+        bounds_el=(0.9, 1.1),
+        bounds_gas=(0.9, 1.1),
+        bounds_heat=(0.8, 1.15),
+        ext_grid_el_bounds=(-0.25, 0.25),
+        ext_grid_gas_bounds=(-1.5, 1.5),
+        ext_grid_heat_bounds=(-100, 100),
+        include_ext_grids=True,
+        check_vm=True,
+        check_pressure=True,
+        check_temperature=True,
+        check_line_loading=True,
     )
 
     return run_energy_flow_optimization(
         network,
         solver=PyomoSolver(),
-        solver_name="scip",
+        solver_name="gurobi",
         optimization_problem=optimization_problem,
         exclude_unconnected_nodes=True,
     )
+

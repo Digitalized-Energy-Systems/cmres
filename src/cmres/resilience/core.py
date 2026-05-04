@@ -1,7 +1,6 @@
 from dataclasses import dataclass
 from abc import abstractmethod, ABC
 from enum import Enum
-from typing import List
 
 from monee.model import Component, Network
 
@@ -33,18 +32,9 @@ class Failure:
     component: Component
     severity: float
     effect: Effect
-    repaired_time: int
 
     def __str__(self) -> str:
-        return f"{self.time}-{self.repaired_time}.{self.severity}.{self.effect}: {self.component.grid.name}.{type(self.component.model)}.{self.component.id}"
-
-
-class RepairModel(ABC):
-    @abstractmethod
-    def generate_repairs(
-        self, network, failures: List[Failure], registry=None, scenario=None
-    ):
-        pass
+        return f"{self.time}.{self.severity}.{self.effect}: {self.component.grid.name}.{type(self.component.model)}.{self.component.id}"
 
 
 class ResilienceModel(ABC):

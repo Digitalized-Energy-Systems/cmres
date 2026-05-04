@@ -1,9 +1,9 @@
 """
 RQMC resilience simulation runner.
 
-Runs all experiment configurations (impact scenarios × test grids) and
-writes per-run results to disk.  Designed to run overnight — each individual
-experiment can take tens of minutes depending on hardware.
+Runs one RQMC resilience experiment per test grid and writes per-run results
+to disk.  Designed to run overnight — each individual experiment can take
+tens of minutes depending on hardware.
 
 Usage
 -----
@@ -13,8 +13,7 @@ Run ALL experiments sequentially:
 Run one experiment by 1-based index (for parallelism across terminals):
     python experiments/re/run_simulation.py 1
     python experiments/re/run_simulation.py 2
-    ...
-    python experiments/re/run_simulation.py 18   # 6 scenarios × 3 grids
+    python experiments/re/run_simulation.py 3
 
 Skip already-completed experiments (idempotent):
     python experiments/re/run_simulation.py --resume
@@ -24,20 +23,14 @@ Show planned experiments without running:
 
 Experiment grid
 ---------------
-6 impact scenarios × 3 test grids = 18 configurations.
-
-Impact scenarios (Table 1 in the paper):
-    high_el   : (power=3, heat=0, gas=0, mes=0)
-    high_heat : (power=0, heat=3, gas=0, mes=0)
-    high_gas  : (power=0, heat=0, gas=3, mes=0)
-    high_cp   : (power=0, heat=0, gas=0, mes=3)
-    low_all   : (power=1, heat=1, gas=1, mes=1)
-    med_all   : (power=2, heat=2, gas=2, mes=2)
-
-Test grids (see experiments/re/test_grids.py):
+One experiment per test grid (see experiments/re/test_grids.py):
     urban_district  — 20 kV / gas / heat, 4 CPs, high coupling density
     industrial_hub  — 110 kV / gas only,  5 CPs, gas-backup focus
     regional_mes    — 120 kV / gas / heat, 7 CPs, all CP types, ring topology
+
+Note: earlier revisions multiplied this by 6 "impact scenarios".  Those
+scenarios turned out to be unconsumed by the failure model and contributed
+no additional scientific signal — see discussion in methodology.tex §2.7.
 
 Output
 ------
@@ -45,7 +38,6 @@ data/res/<EXPERIMENT_NAME>/
     network.p        — pickled monee Network
     performance.csv  — per-timestep carrier performance (appended per run)
     failure.csv      — failure events
-    repair.csv       — repair events
     mc_result.npz    — MCResult summary (mean, CI, per_run array)
     mc_summary.txt   — human-readable MCResult.summary()
     run.log          — full DEBUG log for this experiment
@@ -72,7 +64,7 @@ from cmres.resilience.mc import (
     RQMCSampler,
 )  # noqa: E402
 from cmres.resilience.metric import SimpleResilienceMetric  # noqa: E402
-from cmres.resilience.model import SimpleRepairModel, SimpleResilienceModel  # noqa: E402
+from cmres.resilience.model import SimpleResilienceModel  # noqa: E402
 from cmres.simulation.scenarios import start_res_simulation  # noqa: E402
 
 log = logging.getLogger("cmres.run")
@@ -83,11 +75,12 @@ DATA_DIR = ROOT / "data" / "res"
 EXPERIMENT_NAME = "MoneeResilienceExperiment"
 SEED = 101
 
-# Simulation time budget
-TIME_STEPS = 4 * 8  # 32 timesteps per run
+# Simulation time budget.
+# Failures persist from f.time to TIME_STEPS-1 (no repair), so TIME_STEPS sets
+# the integration horizon for energy-not-served per scenario.
 INCIDENT_TIME_STEPS = 3
 INCIDENT_SHIFT = 0
-REPAIR_DELAY = 5
+TIME_STEPS = 16
 
 # MC convergence
 MC_REL_TOL = 0.05  # 5 % relative CI
@@ -97,22 +90,8 @@ MC_ANTITHETIC = True
 
 # ── Experiment grid ───────────────────────────────────────────────────────────
 
-SCENARIOS = [
-    # (label,         power, heat, gas, mes)
-    ("high_el", 3, 0, 0, 0),
-    ("high_heat", 0, 3, 0, 0),
-    ("high_gas", 0, 0, 3, 0),
-    ("high_cp", 0, 0, 0, 3),
-    ("low_all", 1, 1, 1, 1),
-    ("med_all", 2, 2, 2, 2),
-]
-
-GRIDS = list(ALL_GRIDS.keys())  # ["urban_district", "industrial_hub", "regional_mes"]
-
-# All 18 configs: (scenario_label, power, heat, gas, mes, grid_name)
-EXPERIMENTS = [
-    (label, p, h, g, m, grid) for (label, p, h, g, m) in SCENARIOS for grid in GRIDS
-]
+# One experiment per grid: ["urban_district", "industrial_hub", "regional_mes"]
+EXPERIMENTS = list(ALL_GRIDS.keys())
 
 
 # ── Network factory ───────────────────────────────────────────────────────────
@@ -130,27 +109,17 @@ def build_network_and_timeseries(grid_name: str):
 # ── Per-experiment output path ────────────────────────────────────────────────
 
 
-def exp_dir(
-    label: str, power: int, heat: int, gas: int, mes_impact: int, grid_name: str
-) -> Path:
-    tag = f"{EXPERIMENT_NAME}-{label}-{power}-{heat}-{gas}-{mes_impact}-{grid_name}"
-    return DATA_DIR / tag
+def exp_dir(grid_name: str) -> Path:
+    return DATA_DIR / f"{EXPERIMENT_NAME}-{grid_name}"
 
 
 # ── Simulation runner for one experiment ─────────────────────────────────────
 
 
-def run_experiment(
-    label: str,
-    power: int,
-    heat: int,
-    gas: int,
-    mes_impact: int,
-    grid_name: str,
-):
-    """Run RQMC simulation for one (scenario, grid) pair."""
+def run_experiment(grid_name: str):
+    """Run RQMC simulation for one test grid."""
 
-    out_dir = exp_dir(label, power, heat, gas, mes_impact, grid_name)
+    out_dir = exp_dir(grid_name)
     out_name = str(out_dir)
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -159,10 +128,7 @@ def run_experiment(
     cmres.log.setup(log_file=out_dir / "run.log")
 
     log.info("─" * 60)
-    log.info("Experiment : %s  grid=%s", label, grid_name)
-    log.info(
-        "Impact     : power=%d  heat=%d  gas=%d  mes=%d", power, heat, gas, mes_impact
-    )
+    log.info("Experiment : grid=%s", grid_name)
     log.info("Output     : %s", out_dir)
     log.info("─" * 60)
 
@@ -201,15 +167,6 @@ def run_experiment(
     resilience_model = SimpleResilienceModel(
         incident_shift=INCIDENT_SHIFT,
         incident_timesteps=INCIDENT_TIME_STEPS,
-        power_impact=power,
-        heat_impact=heat,
-        gas_impact=gas,
-        mes_impact=mes_impact,
-    )
-    repair_model = SimpleRepairModel(
-        delay_for_repair=REPAIR_DELAY,
-        incident_timesteps=INCIDENT_TIME_STEPS,
-        incident_shift=INCIDENT_SHIFT,
     )
 
     run_counter = [0]
@@ -217,14 +174,13 @@ def run_experiment(
     def run_func(scenario):
         run_id = run_counter[0]
         run_counter[0] += 1
-        # Deep-copy net so fault inject/repair mutations don't leak between runs.
+        # Deep-copy net so fault inject mutations don't leak between runs.
         # td is read-only, so it can be shared.
         # perf_sum == carrier_sums.sum() — redundant, not saved separately.
         _perf_sum, carrier_sums = start_res_simulation(
             net.copy(),
             td,
             resilience_model=resilience_model,
-            repair_model=repair_model,
             resilience_measurement_model=SimpleResilienceMetric(),
             time_steps=TIME_STEPS,
             name=f"{out_name}-{run_id}",
@@ -262,8 +218,7 @@ def run_experiment(
         per_run=result.per_run,
     )
     (out_dir / "mc_summary.txt").write_text(
-        f"label={label}  power={power}  heat={heat}  gas={gas}  "
-        f"mes={mes_impact}  grid={grid_name}\n"
+        f"grid={grid_name}\n"
         f"elapsed={elapsed:.1f}s\n\n" + result.summary()
     )
 
@@ -273,10 +228,8 @@ def run_experiment(
 # ── Resume helper ─────────────────────────────────────────────────────────────
 
 
-def is_done(label, power, heat, gas, mes_impact, grid_name) -> bool:
-    return (
-        exp_dir(label, power, heat, gas, mes_impact, grid_name) / "mc_result.npz"
-    ).exists()
+def is_done(grid_name: str) -> bool:
+    return (exp_dir(grid_name) / "mc_result.npz").exists()
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -313,16 +266,11 @@ def main():
     cmres.log.setup(console_level=console_level)
 
     if args.list:
-        print(
-            f"{'#':>3}  {'label':<12} {'p':>2} {'h':>2} {'g':>2} {'m':>2}  "
-            f"{'grid':<16}  {'done?':>6}"
-        )
-        print("-" * 60)
-        for i, (lbl, p, h, g, m, grid) in enumerate(EXPERIMENTS, 1):
-            done = "✓" if is_done(lbl, p, h, g, m, grid) else ""
-            print(
-                f"{i:>3}  {lbl:<12} {p:>2} {h:>2} {g:>2} {m:>2}  {grid:<16}  {done:>6}"
-            )
+        print(f"{'#':>3}  {'grid':<16}  {'done?':>6}")
+        print("-" * 32)
+        for i, grid in enumerate(EXPERIMENTS, 1):
+            done = "✓" if is_done(grid) else ""
+            print(f"{i:>3}  {grid:<16}  {done:>6}")
         return
 
     if args.index is not None:
@@ -330,26 +278,22 @@ def main():
         if not (0 <= idx < len(EXPERIMENTS)):
             log.error("index must be 1–%d", len(EXPERIMENTS))
             sys.exit(1)
-        lbl, p, h, g, m, grid = EXPERIMENTS[idx]
-        if args.resume and is_done(lbl, p, h, g, m, grid):
-            log.info(
-                "Skipping #%d (%s, grid=%s) — already done.", args.index, lbl, grid
-            )
+        grid = EXPERIMENTS[idx]
+        if args.resume and is_done(grid):
+            log.info("Skipping #%d (grid=%s) — already done.", args.index, grid)
             return
-        run_experiment(lbl, p, h, g, m, grid)
+        run_experiment(grid)
     else:
         total = len(EXPERIMENTS)
         done_n = 0
         skip_n = 0
-        for i, (lbl, p, h, g, m, grid) in enumerate(EXPERIMENTS, 1):
-            if args.resume and is_done(lbl, p, h, g, m, grid):
-                log.info(
-                    "[%d/%d] Skipping %s  grid=%s (already done)", i, total, lbl, grid
-                )
+        for i, grid in enumerate(EXPERIMENTS, 1):
+            if args.resume and is_done(grid):
+                log.info("[%d/%d] Skipping grid=%s (already done)", i, total, grid)
                 skip_n += 1
                 continue
-            log.info("[%d/%d] Starting %s  grid=%s", i, total, lbl, grid)
-            run_experiment(lbl, p, h, g, m, grid)
+            log.info("[%d/%d] Starting grid=%s", i, total, grid)
+            run_experiment(grid)
             done_n += 1
 
         log.info("Done.  Ran %d, skipped %d/%d.", done_n, skip_n, total)

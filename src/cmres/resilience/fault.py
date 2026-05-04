@@ -4,7 +4,7 @@ from typing import List
 from monee import StepHook, Network
 
 import cmres.data.observer as observer
-from cmres.resilience.core import Failure, Effect, ResilienceModel, RepairModel
+from cmres.resilience.core import Failure, Effect, ResilienceModel
 
 
 def gen_id(node):
@@ -18,10 +18,6 @@ def name_of(node):
 class FaultExecutor(ABC):
     @abstractmethod
     def inject_fault(self, multinet):
-        pass
-
-    @abstractmethod
-    def reverse_fault(self, multinet):
         pass
 
 
@@ -42,25 +38,14 @@ class DeadEffectFaultExecutor(FaultExecutor):
             },
         )
 
-    def reverse_fault(self, net: Network, time):
-        net.activate(self._affected_component)
-
-        observer.gather(
-            "repair",
-            {"step": time, "node": name_of(self._affected_component), "type": "repair"},
-        )
-
     def __str__(self):
         return f"DeadEffectFaultExecutor({name_of(self._affected_component)}, severity={self._severity})"
 
 
 class Fault:
-    def __init__(
-        self, fault_executor: FaultExecutor, start_time: int, stop_time: int
-    ) -> None:
+    def __init__(self, fault_executor: FaultExecutor, start_time: int) -> None:
         self._fault_executor = fault_executor
         self._start_time = start_time
-        self._stop_time = stop_time
 
     @property
     def fault_executor(self):
@@ -70,24 +55,18 @@ class Fault:
     def start_time(self):
         return self._start_time
 
-    @property
-    def stop_time(self):
-        return self._stop_time
-
     def __str__(self):
-        return f"Fault(executor={self._fault_executor}, start_time={self._start_time}, stop_time={self._stop_time})"
+        return f"Fault(executor={self._fault_executor}, start_time={self._start_time})"
 
 
 class FaultGenerator:
     def __init__(
         self,
         resilience_model: ResilienceModel,
-        repair_model: RepairModel,
         registry=None,
         scenario=None,
     ) -> None:
         self._resilience_model = resilience_model
-        self._repair_model = repair_model
         self._registry = registry
         self._scenario = scenario
 
@@ -106,15 +85,11 @@ class FaultGenerator:
                 failure.effect, failure.severity, failure.component
             ),
             failure.time,
-            failure.repaired_time,
         )
 
     def generate(self, network) -> List[Fault]:
         failures = self.failures = self._resilience_model.generate_failures(
             network, registry=self._registry, scenario=self._scenario
-        )
-        self._repair_model.generate_repairs(
-            network, failures, registry=self._registry, scenario=self._scenario
         )
         return [FaultGenerator.to_fault_obj(failure) for failure in failures]
 
@@ -131,5 +106,3 @@ class FaultInjector(StepHook):
             for fault in self._faults:
                 if step == fault.start_time:
                     fault.fault_executor.inject_fault(base_net, step)
-                if step == fault.stop_time:
-                    fault.fault_executor.reverse_fault(base_net, step)

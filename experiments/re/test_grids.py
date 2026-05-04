@@ -38,9 +38,14 @@ from monee.network import (
     create_urban_district_net,
     create_resilient_urban_mes_net,
     create_balanced_urban_mes_timeseries,
-    create_industrial_hub_net,
-    create_regional_mes_net,
 )
+
+from monee.io.from_pandapower import from_pandapower_net
+from monee.model.formulation import (
+    make_mccormick_dhs_formulation,
+)
+from monee.network import generate_supply_return_mes_based_on_power_net
+import simbench
 
 # =============================================================================
 # Helpers
@@ -140,44 +145,53 @@ def make_regional_mes_timeseries(
 # Convenience registry
 # =============================================================================
 
+def create_large_lv_simbench():
+    net = simbench.get_simbench_net("1-LV-rural3--1-no_sw")
+    mn = from_pandapower_net(net)
+    mes = generate_supply_return_mes_based_on_power_net(
+        mn,
+        coupling_density=0.5,
+        centralized=False,
+        couplings=("chp", "p2g", "p2h"),
+        coupling_kwargs={"seed": 1, "use_hg_variants": True},
+        heat_kwargs={"node_based_heat_loads": True},
+    )
+    mes.apply_formulation(MISOCP_NETWORK_FORMULATION)
+    mes.apply_formulation(make_mccormick_dhs_formulation(num_partitions=4))
+    return mes
+
+def create_large_lv_simbench_ts(
+            net: mm.Network, n_steps: int = 96, seed: int = 0
+):
+    return TimeseriesData()
+
 ALL_GRIDS = {
+    "simbench_lv": (create_large_lv_simbench, create_large_lv_simbench_ts),
     "large_urban_balanced": (create_resilient_urban_mes_net, create_balanced_urban_mes_timeseries),
-    "urban_district": (create_urban_district_net, make_urban_district_timeseries),
-    "industrial_hub": (create_industrial_hub_net, make_industrial_hub_timeseries),
-    "regional_mes": (create_regional_mes_net, make_regional_mes_timeseries),
+    # "urban_district": (create_urban_district_net, make_urban_district_timeseries),
+    # "industrial_hub": (create_industrial_hub_net, make_industrial_hub_timeseries),
+    # "regional_mes": (create_regional_mes_net, make_regional_mes_timeseries),
 }
 
-BOUND_EL = ("vm_pu", 1, 0.1)
-BOUND_GAS = ("pressure_pu", 1, 0.1)
-BOUND_HEAT = ("t_pu", 1, 0.1)
-BOUND_LP = ("loading_percent", 1, 1)
-
-
 def solve(network):
-    optimization_problem = None
-    bounds_el = (
-        BOUND_EL[1] * (1 - BOUND_EL[2]),
-        BOUND_EL[1] * (1 + BOUND_EL[2]),
-    )
-    bounds_heat = (
-        BOUND_HEAT[1] * (1 - BOUND_HEAT[2]),
-        BOUND_HEAT[1] * (1 + BOUND_HEAT[2]),
-    )
-    bounds_gas = (
-        BOUND_GAS[1] * (1 - BOUND_GAS[2]),
-        BOUND_GAS[1] * (1 + BOUND_GAS[2]),
-    )
-
-    optimization_problem = mp.create_load_shedding_optimization_problem(
-        bounds_el=bounds_el,
-        bounds_heat=bounds_heat,
-        bounds_gas=bounds_gas,
-        use_ext_grid_bounds=False,
+    optimization_problem = mp.create_min_load_shedding_problem(
+        bounds_el=(0.9, 1.1),
+        bounds_gas=(0.9, 1.1),
+        bounds_heat=(0.7, 1.3),
+        ext_grid_el_bounds=(-0.25, 0.25),
+        ext_grid_gas_bounds=(-1.5, 1.5),
+        ext_grid_heat_bounds=(-100, 100),
+        include_ext_grids=True,
+        check_vm=True,
+        check_pressure=True,
+        check_temperature=True,
+        check_line_loading=True,
     )
 
     return run_energy_flow_optimization(
         network,
         solver=PyomoSolver(),
+        solver_name="gurobi",
         optimization_problem=optimization_problem,
         exclude_unconnected_nodes=True,
     )

@@ -36,7 +36,7 @@ from cmres.resilience.mc import (
     RQMCSampler,
 )
 from cmres.resilience.metric import SimpleResilienceMetric
-from cmres.resilience.model import SimpleRepairModel, SimpleResilienceModel
+from cmres.resilience.model import SimpleResilienceModel
 from cmres.simulation.scenarios import start_res_simulation
 
 import monee.network.mes as mes
@@ -48,10 +48,11 @@ from monee import TimeseriesData
 
 EXPERIMENT_NAME = "data/res/MoneeResilienceExperiment"
 SEED = 101  # deterministic seed for the initial network build
-TIME_STEPS = 4 * 8  # total simulation time steps
-REPAIR_DELAY = 5
 INCIDENT_TIME_STEPS = 3
 INCIDENT_SHIFT = 0
+# Failures persist from f.time to TIME_STEPS-1 (no repair); horizon sets the
+# integration window for energy-not-served per scenario.
+TIME_STEPS = 16
 
 # MC convergence settings
 MC_REL_TOL = 0.05  # stop when 95 % CI relative half-width ≤ 5 % for all carriers
@@ -108,13 +109,13 @@ def make_run_func(
     The returned function accepts a single FailureScenario; all stochastic
     decisions come from that scenario's pre-sampled Sobol uniforms.
 
-    The models are created once and reused across runs — in scenario mode their
-    internal RNG is bypassed for failure/repair decisions, so re-instantiation
-    is not required.
+    The model is created once and reused across runs — in scenario mode its
+    internal RNG is bypassed for failure decisions, so re-instantiation is
+    not required.
     """
     run_counter = [0]
 
-    # Create models once; stochasticity comes from the FailureScenario.
+    # Create model once; stochasticity comes from the FailureScenario.
     resilience_model = SimpleResilienceModel(
         incident_shift=INCIDENT_SHIFT,
         incident_timesteps=INCIDENT_TIME_STEPS,
@@ -122,11 +123,6 @@ def make_run_func(
         heat_impact=heat_impact,
         gas_impact=gas_impact,
         mes_impact=mes_impact,
-    )
-    repair_model = SimpleRepairModel(
-        delay_for_repair=REPAIR_DELAY,
-        incident_timesteps=INCIDENT_TIME_STEPS,
-        incident_shift=INCIDENT_SHIFT,
     )
 
     def run_func(scenario: FailureScenario) -> np.ndarray:
@@ -137,7 +133,6 @@ def make_run_func(
             net,
             TimeseriesData(),
             resilience_model=resilience_model,
-            repair_model=repair_model,
             resilience_measurement_model=SimpleResilienceMetric(),
             time_steps=TIME_STEPS,
             name=(
@@ -187,7 +182,7 @@ def start_test_sim(
     registry = ComponentRegistry(net)
     print(
         f"[MC] ComponentRegistry: {registry.n_components} components, "
-        f"Sobol d = {registry.n_components * INCIDENT_TIME_STEPS * 4}"
+        f"Sobol d = {registry.n_components * INCIDENT_TIME_STEPS * FailureScenario.N_DIM}"
     )
 
     # Derive a unique, reproducible per-process base seed.
