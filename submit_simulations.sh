@@ -62,7 +62,7 @@ if [[ "${SUBMIT_MERGE}" != "1" ]]; then
     exit 0
 fi
 
-MERGE_OUT=$(CMRES_MERGE_PHASE=1 sbatch --parsable \
+MERGE_OUT=$(CMRES_MERGE_PHASE=1 sbatch -p rosa.p --parsable \
     --dependency=afterok:"${RUN_JOBID}" \
     --time=00:30:00 \
     --array="1-${N_GRIDS}" \
