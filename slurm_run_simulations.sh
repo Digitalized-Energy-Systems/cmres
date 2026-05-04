@@ -11,17 +11,20 @@
 #   - parallel run tasks  : N_GRIDS × N_SHARDS
 #   - dependent merge tasks: 1 (handles all grids in series)
 #
-# Submit:
-#   sbatch slurm_run_simulations.sh
+# IMPORTANT — invoke with **bash**, not **sbatch**:
 #
-# Run only the run-phase array (skip auto-submitting merge):
-#   SUBMIT_MERGE=0 sbatch slurm_run_simulations.sh
+#   bash slurm_run_simulations.sh                # default: 2 × 8 = 16 shards
+#   N_SHARDS=16 bash slurm_run_simulations.sh    # 32 shards
+#   SUBMIT_MERGE=0 bash slurm_run_simulations.sh # skip auto-merge
+#
+# This script is a *launcher*: when run as a plain shell script it submits
+# the array job (and the dependent merge job) via ``sbatch``.  Calling it
+# with ``sbatch`` would put the launcher itself inside a SLURM allocation,
+# and many clusters (including this one) deny nested ``sbatch`` calls with
+# ``Batch job submission failed: Access/permission denied``.
 #
 # Run a single shard manually (for testing):
 #   sbatch --array=1 slurm_run_simulations.sh
-#
-# Adjust shard count via env var:
-#   N_SHARDS=16 sbatch slurm_run_simulations.sh
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Tunable knobs (override via env vars on submit) ───────────────────────────
@@ -36,7 +39,7 @@ TOTAL_TASKS=$(( N_GRIDS * N_SHARDS ))
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
-#SBATCH --time=04:00:00              # per-shard wall time; shorter than the
+#SBATCH --time=16:00:00              # per-shard wall time; shorter than the
                                      # un-sharded 16h since each shard runs
                                      # only MC_MAX_RUNS / N_SHARDS scenarios
 #SBATCH --output=logs/slurm_%A_%a.out
@@ -60,12 +63,41 @@ DATA_DIR="./data/res"
 LOG_DIR="./logs"
 mkdir -p "${DATA_DIR}" "${LOG_DIR}"
 
-# ── Re-submission dispatch ────────────────────────────────────────────────────
-# When invoked without a SLURM array context, this script re-submits itself
-# with the computed array bounds + a dependent merge job, then exits.
-if [[ -z "${SLURM_ARRAY_TASK_ID:-}" && -z "${CMRES_MERGE_PHASE:-}" ]]; then
+# ── Launcher / worker dispatch ────────────────────────────────────────────────
+# This script plays two roles, distinguished by environment:
+#
+#   * Launcher : invoked as ``bash slurm_run_simulations.sh`` from the login
+#                shell — submits the RUN array + dependent MERGE array, exits.
+#   * Worker   : invoked by SLURM for each array task — runs one shard or one
+#                merge step.  Detected by ``SLURM_ARRAY_TASK_ID`` being set.
+#
+# An accidental ``sbatch slurm_run_simulations.sh`` would put the launcher
+# *inside* a SLURM allocation and the inner ``sbatch`` calls would be denied
+# on clusters that ban nested submissions.  We catch that here and bail with
+# a friendly hint instead of letting the cryptic SLURM error propagate.
+IS_WORKER=0
+if [[ -n "${SLURM_ARRAY_TASK_ID:-}" || -n "${CMRES_MERGE_PHASE:-}" ]]; then
+    IS_WORKER=1
+elif [[ -n "${SLURM_JOB_ID:-}" ]]; then
+    cat <<'EOF' >&2
+ERROR: this script must be invoked as a launcher with bash, not sbatch:
+
+    bash slurm_run_simulations.sh
+
+You ran it via sbatch, which puts the launcher inside a SLURM allocation;
+the nested sbatch calls it then makes are denied by the cluster
+("Batch job submission failed: Access/permission denied").
+EOF
+    exit 2
+fi
+
+if [[ "${IS_WORKER}" -eq 0 ]]; then
     echo "Submitting RUN phase: array=1-${TOTAL_TASKS}  (N_GRIDS=${N_GRIDS} × N_SHARDS=${N_SHARDS})"
     RUN_JOBID=$(sbatch --parsable --array="1-${TOTAL_TASKS}" "$0" "$@" | tr -d '\n')
+    if [[ -z "${RUN_JOBID}" ]]; then
+        echo "ERROR: RUN-phase sbatch failed; aborting." >&2
+        exit 1
+    fi
     echo "  RUN job id    : ${RUN_JOBID}"
 
     if [[ "${SUBMIT_MERGE}" == "1" ]]; then
@@ -75,6 +107,10 @@ if [[ -z "${SLURM_ARRAY_TASK_ID:-}" && -z "${CMRES_MERGE_PHASE:-}" ]]; then
             --time=00:30:00 \
             --array="1-${N_GRIDS}" \
             "$0" "$@" | tr -d '\n')
+        if [[ -z "${MERGE_JOBID}" ]]; then
+            echo "ERROR: MERGE-phase sbatch failed; abort but RUN job ${RUN_JOBID} continues." >&2
+            exit 1
+        fi
         echo "  MERGE job id  : ${MERGE_JOBID}"
     else
         echo "MERGE phase skipped (SUBMIT_MERGE=0)."
