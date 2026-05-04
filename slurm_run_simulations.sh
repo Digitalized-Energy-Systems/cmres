@@ -34,7 +34,7 @@ export OPENBLAS_NUM_THREADS=${SLURM_CPUS_PER_TASK:-1}
 export JAX_NUM_THREADS=${SLURM_CPUS_PER_TASK:-1}
 export NUMBA_NUM_THREADS=${SLURM_CPUS_PER_TASK:-1}
 
-SCRIPT="./cmres/experiments/re/run_simulation.py"
+SCRIPT="./experiments/re/run_simulation.py"
 mkdir -p ./data/res ./logs
 
 if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
