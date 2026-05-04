@@ -344,10 +344,10 @@ class CascadingModel(StepModel):
         self._last_performance = None
 
     def calc_performance(self, network: Network, without_load=False):
-        log.debug("Solving network for performance calculation")
+        log.info("Solving network for performance calculation")
         # print(network)
         result = ms.solve(network)
-        log.debug("Network solve complete")
+        log.info("Network solve complete")
         return self._performance_metric.calc(result.network), result
 
     def check_repairs(self, network, bound_tuple, step, network_name):
@@ -450,19 +450,59 @@ class CascadingModel(StepModel):
         log.debug("Starting step %s", step)
 
         if self.fault_delta_exists(step) or self._last_performance is None:
+            sresult = None
             try:
-                performance, _ = self.calc_performance(net)
+                performance, sresult = self.calc_performance(net)
             except Exception:
                 active_faults = [
                     str(f) for f in (self._faults or []) if f.start_time <= step
                 ]
                 log.exception(
-                    "calc_performance failed at step=%d; falling back to "
+                    "calc_performance raised at step=%d; falling back to "
                     "max-load-shedding. Active faults so far: %s",
                     step,
                     active_faults,
                 )
+                observer.gather(
+                    "infeasibility",
+                    {
+                        "step": step,
+                        "kind": "exception",
+                        "n_active_faults": len(active_faults),
+                        "active_faults": " | ".join(active_faults),
+                        "report": "",
+                    },
+                )
                 performance = self._max_load_shedding(net)
+            else:
+                if not getattr(sresult, "success", True):
+                    active_faults = [
+                        str(f) for f in (self._faults or []) if f.start_time <= step
+                    ]
+                    report = ""
+                    rep_obj = getattr(sresult, "infeasibility_report", None)
+                    if rep_obj is not None:
+                        try:
+                            report = rep_obj.summary(max_items=20)
+                        except Exception:
+                            report = repr(rep_obj)
+                    log.warning(
+                        "Solver returned infeasible at step=%d "
+                        "(active faults=%d); falling back to max-load-shedding.",
+                        step,
+                        len(active_faults),
+                    )
+                    observer.gather(
+                        "infeasibility",
+                        {
+                            "step": step,
+                            "kind": "infeasible",
+                            "n_active_faults": len(active_faults),
+                            "active_faults": " | ".join(active_faults),
+                            "report": report,
+                        },
+                    )
+                    performance = self._max_load_shedding(net)
             self._last_performance = performance
         else:
             performance = self._last_performance
