@@ -145,20 +145,22 @@ def make_regional_mes_timeseries(
 # Convenience registry
 # =============================================================================
 
-def create_large_lv_simbench():
-    net = simbench.get_simbench_net("1-LV-rural3--1-no_sw")
-    mn = from_pandapower_net(net)
-    mes = generate_supply_return_mes_based_on_power_net(
-        mn,
-        coupling_density=0.5,
-        centralized=False,
-        couplings=("chp", "p2g", "p2h"),
-        coupling_kwargs={"seed": 1, "use_hg_variants": True},
-        heat_kwargs={"node_based_heat_loads": True},
-    )
-    mes.apply_formulation(MISOCP_NETWORK_FORMULATION)
-    mes.apply_formulation(make_mccormick_dhs_formulation(num_partitions=4))
-    return mes
+def create_large_lv_simbench(density):
+    def create_large_lv_simbench():
+        net = simbench.get_simbench_net("1-LV-rural3--1-no_sw")
+        mn = from_pandapower_net(net)
+        mes = generate_supply_return_mes_based_on_power_net(
+            mn,
+            coupling_density=density,
+            centralized=False,
+            couplings=("chp", "p2g", "p2h"),
+            coupling_kwargs={"seed": 1, "use_hg_variants": True},
+            heat_kwargs={"node_based_heat_loads": True},
+        )
+        mes.apply_formulation(MISOCP_NETWORK_FORMULATION)
+        mes.apply_formulation(make_mccormick_dhs_formulation(num_partitions=4))
+        return mes
+    return create_large_lv_simbench
 
 def create_large_lv_simbench_ts(
             net: mm.Network, n_steps: int = 96, seed: int = 0
@@ -166,8 +168,10 @@ def create_large_lv_simbench_ts(
     return TimeseriesData()
 
 ALL_GRIDS = {
-    "simbench_lv": (create_large_lv_simbench, create_large_lv_simbench_ts),
-    "large_urban_balanced": (create_resilient_urban_mes_net, create_balanced_urban_mes_timeseries),
+    "simbench_lv": (create_large_lv_simbench(0.5), create_large_lv_simbench_ts),
+    "simbench_lv_low": (create_large_lv_simbench(0.1), create_large_lv_simbench_ts),
+    "simbench_lv_low_high": (create_large_lv_simbench(0.9), create_large_lv_simbench_ts),
+    # "large_urban_balanced": (create_resilient_urban_mes_net, create_balanced_urban_mes_timeseries),
     # "urban_district": (create_urban_district_net, make_urban_district_timeseries),
     # "industrial_hub": (create_industrial_hub_net, make_industrial_hub_timeseries),
     # "regional_mes": (create_regional_mes_net, make_regional_mes_timeseries),
