@@ -13,7 +13,6 @@ Run ALL experiments sequentially:
 Run one experiment by 1-based index (for parallelism across terminals):
     python experiments/re/run_simulation.py 1
     python experiments/re/run_simulation.py 2
-    python experiments/re/run_simulation.py 3
 
 Skip already-completed experiments (idempotent):
     python experiments/re/run_simulation.py --resume
@@ -21,12 +20,21 @@ Skip already-completed experiments (idempotent):
 Show planned experiments without running:
     python experiments/re/run_simulation.py --list
 
+Shard one experiment across K parallel workers
+(each worker runs ``MC_MAX_RUNS / K`` runs from a contiguous slice of the
+shared Sobol sequence; convergence is **not** checked — the full budget is
+spent so all shards finish at the same point):
+    python experiments/re/run_simulation.py 1 --shard 1 --n-shards 8
+    python experiments/re/run_simulation.py 1 --shard 2 --n-shards 8
+    ...
+
+Merge all shards of a finished experiment into the final ``mc_result.npz``:
+    python experiments/re/run_simulation.py 1 --merge
+
 Experiment grid
 ---------------
-One experiment per test grid (see experiments/re/test_grids.py):
-    urban_district  — 20 kV / gas / heat, 4 CPs, high coupling density
-    industrial_hub  — 110 kV / gas only,  5 CPs, gas-backup focus
-    regional_mes    — 120 kV / gas / heat, 7 CPs, all CP types, ring topology
+One experiment per test grid (see experiments/re/test_grids.py).  Currently
+two grids are enabled: ``simbench_lv`` and ``large_urban_balanced``.
 
 Note: earlier revisions multiplied this by 6 "impact scenarios".  Those
 scenarios turned out to be unconsumed by the failure model and contributed
@@ -35,12 +43,14 @@ no additional scientific signal — see discussion in methodology.tex §2.7.
 Output
 ------
 data/res/<EXPERIMENT_NAME>/
-    network.p        — pickled monee Network
-    performance.csv  — per-timestep carrier performance (appended per run)
-    failure.csv      — failure events
-    mc_result.npz    — MCResult summary (mean, CI, per_run array)
-    mc_summary.txt   — human-readable MCResult.summary()
-    run.log          — full DEBUG log for this experiment
+    network.p           — pickled monee Network
+    performance.csv     — per-timestep carrier performance (appended per run)
+    failure.csv         — failure events
+    mc_result.npz       — MCResult summary (mean, CI, per_run array)
+    mc_summary.txt      — human-readable MCResult.summary()
+    run.log             — full DEBUG log for this experiment
+    shard_<I>_of_<K>.npz — per-shard ``per_run`` array (sharded mode only;
+                           merged into ``mc_result.npz`` by ``--merge``)
 """
 
 import argparse
@@ -116,26 +126,50 @@ def exp_dir(grid_name: str) -> Path:
 # ── Simulation runner for one experiment ─────────────────────────────────────
 
 
-def run_experiment(grid_name: str):
-    """Run RQMC simulation for one test grid."""
+def run_experiment(grid_name: str, shard: int = 0, n_shards: int = 1):
+    """Run RQMC simulation for one test grid.
+
+    Parameters
+    ----------
+    grid_name : str
+        Key into ``ALL_GRIDS``.
+    shard : int, default 0
+        1-based shard index, or 0 for unsharded (full-experiment) mode.
+    n_shards : int, default 1
+        Total number of shards.  When ``> 1``, each shard runs a contiguous
+        slice of the shared Sobol sequence and writes ``shard_<I>_of_<K>.npz``
+        instead of the consolidated ``mc_result.npz``.  Convergence checking
+        is disabled in shard mode (every shard spends its full budget) so
+        shards finish at predictable wall-times for SLURM scheduling.
+    """
+    is_shard = n_shards > 1
+    if is_shard and not (1 <= shard <= n_shards):
+        raise ValueError(f"shard {shard} out of range [1, {n_shards}]")
 
     out_dir = exp_dir(grid_name)
     out_name = str(out_dir)
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Attach a per-experiment file handler so every DEBUG record is captured.
-    cmres.log.setup(log_file=out_dir / "run.log")
+    # Per-(experiment|shard) log file so concurrent shards don't fight over it.
+    log_filename = (
+        f"shard_{shard}_of_{n_shards}.log" if is_shard else "run.log"
+    )
+    cmres.log.setup(log_file=out_dir / log_filename)
 
     log.info("─" * 60)
     log.info("Experiment : grid=%s", grid_name)
     log.info("Output     : %s", out_dir)
+    if is_shard:
+        log.info("Shard      : %d / %d", shard, n_shards)
     log.info("─" * 60)
 
     # ── Network + timeseries ──────────────────────────────────────────────────
     net, td = build_network_and_timeseries(grid_name)
-    with (out_dir / "network.p").open("wb") as fp:
-        pickle.dump(net, fp)
+    if not is_shard or shard == 1:
+        # Network is identical across shards; only one writer needed.
+        with (out_dir / "network.p").open("wb") as fp:
+            pickle.dump(net, fp)
 
     # ── RQMC setup ───────────────────────────────────────────────────────────
     registry = ComponentRegistry(net)
@@ -155,13 +189,41 @@ def run_experiment(grid_name: str):
         n_scenarios=n_sobol,
         base_seed=SEED,
     )
-    engine = MCEngine(
-        rel_tol=MC_REL_TOL,
-        max_runs=MC_MAX_RUNS,
-        min_runs=MC_MIN_RUNS,
-        antithetic_variates=MC_ANTITHETIC,
-        sampler=sampler,
-    )
+
+    if is_shard:
+        # Each shard owns a contiguous slice of the Sobol prefix.  Sobol points
+        # are paired (point + antithetic twin) so shard slicing is done in
+        # *Sobol-point* units.
+        shard_sobol = n_sobol // n_shards
+        if shard_sobol == 0:
+            raise ValueError(
+                f"n_shards={n_shards} too large for n_sobol={n_sobol}"
+            )
+        start_idx = (shard - 1) * shard_sobol
+        # Last shard absorbs the remainder so no points are lost.
+        end_idx = shard * shard_sobol if shard < n_shards else n_sobol
+        sampler._idx = start_idx
+        shard_runs = (end_idx - start_idx) * (2 if MC_ANTITHETIC else 1)
+        # Disable convergence by setting min_runs > max_runs.
+        engine = MCEngine(
+            rel_tol=MC_REL_TOL,
+            max_runs=shard_runs,
+            min_runs=shard_runs + 1,
+            antithetic_variates=MC_ANTITHETIC,
+            sampler=sampler,
+        )
+        log.info(
+            "Sobol slice: [%d, %d)  shard_runs=%d",
+            start_idx, end_idx, shard_runs,
+        )
+    else:
+        engine = MCEngine(
+            rel_tol=MC_REL_TOL,
+            max_runs=MC_MAX_RUNS,
+            min_runs=MC_MIN_RUNS,
+            antithetic_variates=MC_ANTITHETIC,
+            sampler=sampler,
+        )
 
     # ── Models (created once, reused across runs) ─────────────────────────────
     resilience_model = SimpleResilienceModel(
@@ -169,14 +231,15 @@ def run_experiment(grid_name: str):
         incident_timesteps=INCIDENT_TIME_STEPS,
     )
 
-    run_counter = [0]
+    # Each shard tags its own runs with a globally-unique id range so the
+    # CSV-side artefacts (performance.csv, failure.csv, incidents/) don't
+    # collide across shards running on different nodes.
+    run_id_offset = (shard - 1) * (n_sobol // n_shards) * (2 if MC_ANTITHETIC else 1) if is_shard else 0
+    run_counter = [run_id_offset]
 
     def run_func(scenario):
         run_id = run_counter[0]
         run_counter[0] += 1
-        # Deep-copy net so fault inject mutations don't leak between runs.
-        # td is read-only, so it can be shared.
-        # perf_sum == carrier_sums.sum() — redundant, not saved separately.
         _perf_sum, carrier_sums = start_res_simulation(
             net.copy(),
             td,
@@ -204,25 +267,116 @@ def run_experiment(grid_name: str):
     )
     log.info(result.summary())
 
-    # ── Save MCResult ─────────────────────────────────────────────────────────
-    np.savez(
-        out_dir / "mc_result.npz",
-        mean=result.mean,
-        std=result.std,
-        ci_lower=result.ci_lower,
-        ci_upper=result.ci_upper,
-        rel_half_width=result.rel_half_width,
-        ess=np.array([result.ess]),
-        n_runs=np.array([result.n_runs]),
-        converged=np.array([result.converged]),
-        per_run=result.per_run,
-    )
-    (out_dir / "mc_summary.txt").write_text(
-        f"grid={grid_name}\n"
-        f"elapsed={elapsed:.1f}s\n\n" + result.summary()
-    )
+    # ── Save ──────────────────────────────────────────────────────────────────
+    if is_shard:
+        np.savez(
+            out_dir / f"shard_{shard}_of_{n_shards}.npz",
+            per_run=result.per_run,
+            shard=np.array([shard]),
+            n_shards=np.array([n_shards]),
+            shard_n_runs=np.array([result.n_runs]),
+            elapsed_s=np.array([elapsed]),
+            run_id_offset=np.array([run_id_offset]),
+        )
+        log.info(
+            "Shard %d/%d saved (%d runs, %.1f min).  "
+            "Run ``--merge`` after all shards finish.",
+            shard, n_shards, result.n_runs, elapsed / 60,
+        )
+    else:
+        np.savez(
+            out_dir / "mc_result.npz",
+            mean=result.mean,
+            std=result.std,
+            ci_lower=result.ci_lower,
+            ci_upper=result.ci_upper,
+            rel_half_width=result.rel_half_width,
+            ess=np.array([result.ess]),
+            n_runs=np.array([result.n_runs]),
+            converged=np.array([result.converged]),
+            per_run=result.per_run,
+        )
+        (out_dir / "mc_summary.txt").write_text(
+            f"grid={grid_name}\n"
+            f"elapsed={elapsed:.1f}s\n\n" + result.summary()
+        )
 
     return result
+
+
+# ── Shard merge ───────────────────────────────────────────────────────────────
+
+
+def merge_shards(grid_name: str) -> None:
+    """Concatenate ``shard_*_of_K.npz`` files into a final ``mc_result.npz``.
+
+    Statistics (mean, std, CI, rel_half_width, ESS) are recomputed from the
+    full per-run vector via ``WeightedAccumulator`` so the merged result is
+    indistinguishable from a single non-sharded run modulo the missing
+    sequential-stopping decision.
+    """
+    from cmres.resilience.mc import WeightedAccumulator
+
+    out_dir = exp_dir(grid_name)
+    shard_files = sorted(out_dir.glob("shard_*_of_*.npz"))
+    if not shard_files:
+        log.error("No shard files in %s — nothing to merge.", out_dir)
+        sys.exit(1)
+
+    log.info("Merging %d shard files for grid=%s", len(shard_files), grid_name)
+    per_run_chunks = []
+    total_elapsed = 0.0
+    for fp in shard_files:
+        z = np.load(fp)
+        per_run_chunks.append(z["per_run"])
+        total_elapsed += float(z["elapsed_s"][0])
+        log.info(
+            "  %s : n_runs=%d  elapsed=%.1f min",
+            fp.name, len(z["per_run"]), float(z["elapsed_s"][0]) / 60,
+        )
+    per_run = np.concatenate(per_run_chunks, axis=0)
+    n_runs = len(per_run)
+
+    # Recompute statistics from scratch.
+    acc = WeightedAccumulator(n_carriers=per_run.shape[1])
+    for x in per_run:
+        acc.update(x)
+    lo, hi = acc.confidence_interval()
+    rhw = acc.relative_half_width()
+    converged = bool(np.all(rhw <= MC_REL_TOL))
+
+    np.savez(
+        out_dir / "mc_result.npz",
+        mean=acc.mean,
+        std=acc.std,
+        ci_lower=lo,
+        ci_upper=hi,
+        rel_half_width=rhw,
+        ess=np.array([acc.ess]),
+        n_runs=np.array([n_runs]),
+        converged=np.array([converged]),
+        per_run=per_run,
+    )
+    summary_lines = [
+        f"grid={grid_name}",
+        f"merged_from={len(shard_files)} shards",
+        f"sum_elapsed_s={total_elapsed:.1f}",
+        f"n_runs={n_runs}",
+        f"ess={acc.ess:.1f}",
+        f"converged={converged}",
+        "",
+        f"{'Carrier':<8} {'Mean':>10} {'Std':>10} {'CI 95% lo':>12} "
+        f"{'CI 95% hi':>12} {'RHW':>8}",
+        "-" * 62,
+    ]
+    for i, name in enumerate(["power", "heat", "gas"]):
+        summary_lines.append(
+            f"{name:<8} {acc.mean[i]:>10.4f} {acc.std[i]:>10.4f} "
+            f"{lo[i]:>12.4f} {hi[i]:>12.4f} {rhw[i]:>8.4f}"
+        )
+    (out_dir / "mc_summary.txt").write_text("\n".join(summary_lines) + "\n")
+    log.info("Merged → %s  (n_runs=%d, ess=%.1f, converged=%s)",
+             out_dir / "mc_result.npz", n_runs, acc.ess, converged)
 
 
 # ── Resume helper ─────────────────────────────────────────────────────────────
@@ -259,6 +413,28 @@ def main():
         action="store_true",
         help="Set console log level to DEBUG (very verbose).",
     )
+    parser.add_argument(
+        "--shard",
+        type=int,
+        default=0,
+        help="1-based shard index when running in sharded mode "
+        "(requires --n-shards > 1).  0 = unsharded (default).",
+    )
+    parser.add_argument(
+        "--n-shards",
+        type=int,
+        default=1,
+        help="Total number of shards.  When > 1, this shard runs "
+        "MC_MAX_RUNS / N_SHARDS scenarios from a contiguous slice of "
+        "the shared Sobol sequence and writes shard_<I>_of_<K>.npz.",
+    )
+    parser.add_argument(
+        "--merge",
+        action="store_true",
+        help="Merge all shard_*.npz files for the experiment specified by "
+        "INDEX into the final mc_result.npz / mc_summary.txt.  Run once "
+        "per experiment after all shards have finished.",
+    )
     args = parser.parse_args()
 
     # Initialise console logging before any experiment runs.
@@ -266,12 +442,35 @@ def main():
     cmres.log.setup(console_level=console_level)
 
     if args.list:
-        print(f"{'#':>3}  {'grid':<16}  {'done?':>6}")
-        print("-" * 32)
+        print(f"{'#':>3}  {'grid':<24}  {'done?':>6}")
+        print("-" * 40)
         for i, grid in enumerate(EXPERIMENTS, 1):
             done = "✓" if is_done(grid) else ""
-            print(f"{i:>3}  {grid:<16}  {done:>6}")
+            print(f"{i:>3}  {grid:<24}  {done:>6}")
         return
+
+    if args.merge:
+        if args.index is None:
+            # Merge all experiments.
+            for grid in EXPERIMENTS:
+                merge_shards(grid)
+        else:
+            idx = args.index - 1
+            if not (0 <= idx < len(EXPERIMENTS)):
+                log.error("index must be 1–%d", len(EXPERIMENTS))
+                sys.exit(1)
+            merge_shards(EXPERIMENTS[idx])
+        return
+
+    if args.n_shards < 1:
+        log.error("--n-shards must be >= 1")
+        sys.exit(1)
+    if args.n_shards > 1 and not (1 <= args.shard <= args.n_shards):
+        log.error(
+            "When --n-shards=%d, --shard must be in [1, %d]",
+            args.n_shards, args.n_shards,
+        )
+        sys.exit(1)
 
     if args.index is not None:
         idx = args.index - 1
@@ -282,8 +481,11 @@ def main():
         if args.resume and is_done(grid):
             log.info("Skipping #%d (grid=%s) — already done.", args.index, grid)
             return
-        run_experiment(grid)
+        run_experiment(grid, shard=args.shard, n_shards=args.n_shards)
     else:
+        if args.n_shards > 1:
+            log.error("--n-shards >1 requires explicit INDEX (one shard per call)")
+            sys.exit(1)
         total = len(EXPERIMENTS)
         done_n = 0
         skip_n = 0
