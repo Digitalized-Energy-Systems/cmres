@@ -431,7 +431,7 @@ class CascadingModel(StepModel):
             if isinstance(c.model, mm.PowerLoad) and c.active and not c.ignored
         )
         heat = sum(
-            mm.upper(c.model.q_w) / 1e6
+            mm.upper(c.model.q_mw)
             for c in net.childs + net.branches
             if isinstance(c.model, mm.HeatExchangerLoad) and c.active and not c.ignored
         )
