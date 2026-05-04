@@ -43,7 +43,7 @@ echo "  Auto-merge    : ${SUBMIT_MERGE}"
 echo "============================================================"
 
 # ── RUN phase ─────────────────────────────────────────────────────────────────
-RUN_OUT=$(sbatch --parsable --array="1-${TOTAL_TASKS}" "${WORKER}" "$@")
+RUN_OUT=$(sbatch -p rosa.p --parsable --array="1-${TOTAL_TASKS}" "${WORKER}" "$@")
 RUN_JOBID=$(echo "${RUN_OUT}" | tr -d '\n')
 if [[ -z "${RUN_JOBID}" ]]; then
     echo "ERROR: RUN-phase sbatch failed.  See SLURM error above." >&2
