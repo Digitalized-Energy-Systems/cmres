@@ -2,6 +2,7 @@ from typing import Dict
 import os
 import sys
 import pickle
+import traceback
 from pathlib import PurePath, Path
 from statistics import mean
 
@@ -16,7 +17,7 @@ import networkx as nx
 sys.path.insert(0, str(Path(__file__).parent))
 from cp_metric import mes_all_components_metric, CPMetricConfig
 
-INPUT = "/home/rschrage/experiments/aeer/temp/res"
+INPUT = "/home/rschrage/experiments/0503/res"
 OUTPUT = "data/out"
 SMALL_NUMBER = 0.00000000001
 
@@ -82,24 +83,22 @@ def extend_impact_df(net_type_to_net: Dict[str, Network], metrics_df, impact_df)
     return pandas.concat([impact_df, new_impact_df])
 
 
-def create_impact_df(perf_df: pandas.DataFrame, repair_df, fail_df, metrics_df):
+def create_impact_df(perf_df: pandas.DataFrame, fail_df, metrics_df):
     global_rows = []
     perf_df = perf_df.rename(columns={"Unnamed: 0": "step"}).dropna()
-    usable_fail_df = fail_df
-    usable_repair_df = repair_df
+    usable_fail_df = fail_df.copy()
     usable_fail_df["node"] = usable_fail_df["node"].apply(
-        lambda c: get_id_type(c) + ":" + c.split(":")[-1]
-    )
-    usable_repair_df["node"] = usable_repair_df["node"].apply(
         lambda c: get_id_type(c) + ":" + c.split(":")[-1]
     )
     # knoten/edge resilience in zeiträumen in denen aktiv / resilience
     # in zeiträumen in denen inaktiv -> impact/influence
+    # Failures now persist from f.step to the end of the run (no repair) — see
+    # SimpleResilienceModel.step where process_network_state is disabled.
     for _, row in metrics_df.iterrows():
         node_edge_id = row["id"]
         type = row["type"]
 
-        # For branch IDs, the stored tuple order in fail/repair CSVs may be reversed
+        # For branch IDs, the stored tuple order in fail CSV may be reversed
         # relative to metrics_df (e.g. "(9, 2, 0)" vs "(2, 9, 0)").
         # Build a set of candidate IDs to query against.
         candidate_ids = {node_edge_id}
@@ -110,42 +109,28 @@ def create_impact_df(perf_df: pandas.DataFrame, repair_df, fail_df, metrics_df):
                 reversed_id = f"branch:({parts[1]}, {parts[0]}, {parts[2]})"
                 candidate_ids.add(reversed_id)
 
-        node_usable_fail_df = usable_fail_df[usable_fail_df["node"].isin(candidate_ids)]
-        node_usable_repair_df = usable_repair_df[usable_repair_df["node"].isin(candidate_ids)]
+        node_usable_fail_df = usable_fail_df[usable_fail_df["node"].isin(candidate_ids)].copy()
         # Normalise the stored ID back to metrics_df convention so downstream joins work
-        node_usable_fail_df = node_usable_fail_df.copy()
-        node_usable_repair_df = node_usable_repair_df.copy()
         node_usable_fail_df["node"] = node_edge_id
-        node_usable_repair_df["node"] = node_edge_id
-
-        concated_fail_node_df = pandas.concat(
-            [node_usable_fail_df, node_usable_repair_df]
-        )
 
         rules = {}
         network_type = row["network_type"]
-        concated_fail_node_df_with_net_type = concated_fail_node_df[
-            concated_fail_node_df["network_type"] == network_type
+        node_fail_with_net_type = node_usable_fail_df[
+            node_usable_fail_df["network_type"] == network_type
         ]
         perf_df_with_net_type = perf_df[perf_df["network_type"] == network_type]
-        for name, group in concated_fail_node_df_with_net_type.groupby(["experiment", "id"]):
-            if len(group) != 2:
+        for name, group in node_fail_with_net_type.groupby(["experiment", "id"]):
+            failure_rows = group.query("type == 'failure'")
+            if len(failure_rows["step"]) == 0:
                 continue
-            failure_row = group.query("type == 'failure'")
-            repair_row = group.query("type == 'repair'")
-            if len(repair_row["step"]) == 0 or len(failure_row["step"]) == 0:
-                continue
-            rules[(name[1], name[0])] = (
-                failure_row["step"].iloc[0],
-                repair_row["step"].iloc[0],
-            )
+            # Use earliest failure step; failure persists to end of run.
+            rules[(name[1], name[0])] = int(failure_rows["step"].min())
 
         node_in_perf_df = perf_df_with_net_type[
             perf_df_with_net_type.apply(
                 lambda row: (
                     (row["id"], row["experiment"]) in rules
-                    and row["step"] >= rules[(row["id"], row["experiment"])][0]
-                    and row["step"] <= rules[(row["id"], row["experiment"])][1]
+                    and row["step"] >= rules[(row["id"], row["experiment"])]
                 ),
                 axis=1,
             )
@@ -154,8 +139,7 @@ def create_impact_df(perf_df: pandas.DataFrame, repair_df, fail_df, metrics_df):
             perf_df_with_net_type.apply(
                 lambda row: (
                     (row["id"], row["experiment"]) not in rules
-                    or row["step"] < rules[(row["id"], row["experiment"])][0]
-                    or row["step"] > rules[(row["id"], row["experiment"])][1]
+                    or row["step"] < rules[(row["id"], row["experiment"])]
                 ),
                 axis=1,
             )
@@ -183,22 +167,25 @@ def create_impact_df(perf_df: pandas.DataFrame, repair_df, fail_df, metrics_df):
     return pandas.DataFrame(global_rows)
 
 
-def create_or_load_impact_df(fail_df, perf_df, repair_df, metrics_df, folder_id):
+def create_or_load_impact_df(fail_df, perf_df, metrics_df, folder_id):
     impact_out = OUTPUT + f"/{folder_id}/impact.csv"
     if Path(impact_out).exists():
         return pandas.read_csv(impact_out)
-    impact_df = create_impact_df(perf_df, repair_df, fail_df, metrics_df)
+    impact_df = create_impact_df(perf_df, fail_df, metrics_df)
     impact_df.to_csv(Path(impact_out))
     return impact_df
 
 
 def create_metrics_df(monee_net: Network, network_type: str):
     try:
-        monee_net = run_energy_flow(monee_net).network
+        result = run_energy_flow(monee_net, solver=PyomoSolver(), solver_name="gurobi")
+        monee_net = result.network
         for edge in monee_net._network_internal.edges:
             branch_model = monee_net.branch_by_id(edge).model
             monee_net._network_internal.edges[edge]["weight"] = branch_model.loss_percent()
     except Exception as e:
+        traceback.print_exc()
+
         print(f"Warning: energy flow failed for {network_type}, using uniform weights: {e}")
         for edge in monee_net._network_internal.edges:
             monee_net._network_internal.edges[edge]["weight"] = 1.0
@@ -326,7 +313,6 @@ def load_dfs(folder_id):
 
     failure_dfs = []
     performance_dfs = []
-    repair_dfs = []
 
     net_type_to_net = {}
 
@@ -360,17 +346,9 @@ def load_dfs(folder_id):
         append_desc_df(performance_df, experiment_desc, network_type)
         performance_dfs.append(performance_df)
 
-        # repair
-        repair_path = Path(experiment_desc) / Path("repair.csv")
-        if repair_path.exists():
-            repair_df = pandas.read_csv(repair_path)
-            append_desc_df(repair_df, experiment_desc, network_type)
-            repair_dfs.append(repair_df)
-
     return (
         pandas.concat(failure_dfs),
         pandas.concat(performance_dfs),
-        pandas.concat(repair_dfs),
         create_or_load_metrics_df(net_type_to_net, folder_id),
         net_type_to_net,
     )
@@ -1653,9 +1631,9 @@ def pooled_metric_comparison(pooled_df, output_dir):
 
 
 def evaluate(folder_id):
-    fail_df, perf_df, repair_df, metrics_df, net_type_to_net = load_dfs(folder_id)
+    fail_df, perf_df, metrics_df, net_type_to_net = load_dfs(folder_id)
     impact_df = create_or_load_impact_df(
-        fail_df, perf_df, repair_df, metrics_df, folder_id
+        fail_df, perf_df, metrics_df, folder_id
     )
     impact_df = extend_impact_df(net_type_to_net, metrics_df, impact_df)
 
@@ -1663,7 +1641,7 @@ def evaluate(folder_id):
 
     for network_type, monee_net in net_type_to_net.items():
         if network_type == "large_urban_balanced":
-            result = run_energy_flow(monee_net, solver=PyomoSolver())
+            result = run_energy_flow(monee_net, solver=PyomoSolver(), solver_name="gurobi")
             print(result.full())
             print(result.network.as_result_dataframe_dict_str())
             monee_net = result.network

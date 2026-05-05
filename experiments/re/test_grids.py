@@ -25,27 +25,24 @@ Coupling point parameters:
   - P2H:  η    = 0.95               (heat pump / resistance heater)
 """
 
-import numpy as np
 import monee.model as mm
-from monee import TimeseriesData
+import monee.problem as mp
+import numpy as np
+import simbench
 from monee import (
     PyomoSolver,
+    TimeseriesData,
     run_energy_flow_optimization,
 )
-from monee.model.formulation import MISOCP_NETWORK_FORMULATION
-import monee.problem as mp
-from monee.network import (
-    create_urban_district_net,
-    create_resilient_urban_mes_net,
-    create_balanced_urban_mes_timeseries,
-)
-
 from monee.io.from_pandapower import from_pandapower_net
 from monee.model.formulation import (
+    MISOCP_NETWORK_FORMULATION,
     make_mccormick_dhs_formulation,
 )
-from monee.network import generate_supply_return_mes_based_on_power_net
-import simbench
+from monee.network import (
+    create_urban_district_net,
+    generate_supply_return_mes_based_on_power_net,
+)
 
 # =============================================================================
 # Helpers
