@@ -143,7 +143,7 @@ def make_regional_mes_timeseries(
 # =============================================================================
 
 def create_large_lv_simbench(density):
-    def create_large_lv_simbench():
+    def create():
         net = simbench.get_simbench_net("1-LV-rural3--1-no_sw")
         mn = from_pandapower_net(net)
         mes = generate_supply_return_mes_based_on_power_net(
@@ -155,9 +155,9 @@ def create_large_lv_simbench(density):
             heat_kwargs={"node_based_heat_loads": True},
         )
         mes.apply_formulation(MISOCP_NETWORK_FORMULATION)
-        mes.apply_formulation(make_mccormick_dhs_formulation(num_partitions=4))
+        mes.apply_formulation(make_mccormick_dhs_formulation(num_partitions=16))
         return mes
-    return create_large_lv_simbench
+    return create
 
 def create_large_lv_simbench_ts(
             net: mm.Network, n_steps: int = 96, seed: int = 0
@@ -167,12 +167,61 @@ def create_large_lv_simbench_ts(
 ALL_GRIDS = {
     "simbench_lv": (create_large_lv_simbench(0.5), create_large_lv_simbench_ts),
     "simbench_lv_low": (create_large_lv_simbench(0.1), create_large_lv_simbench_ts),
-    "simbench_lv_low_high": (create_large_lv_simbench(0.9), create_large_lv_simbench_ts),
+    "simbench_lv_high": (create_large_lv_simbench(0.9), create_large_lv_simbench_ts),
     # "large_urban_balanced": (create_resilient_urban_mes_net, create_balanced_urban_mes_timeseries),
     # "urban_district": (create_urban_district_net, make_urban_district_timeseries),
     # "industrial_hub": (create_industrial_hub_net, make_industrial_hub_timeseries),
     # "regional_mes": (create_regional_mes_net, make_regional_mes_timeseries),
 }
+
+def print_demands(net: mm.Network) -> None:
+    """Print every demand setpoint in MW for the given network.
+
+    Conversions:
+      PowerLoad.p_mw           — already MW
+      Sink (gas)               — kg/s × hhv [kWh/kg] × 3.6 → MW
+      HeatExchangerLoad.q_mw   — MW (q_mw_set stored as −q_mw)
+    """
+    rows = []
+
+    for c in net.childs:
+        m = c.model
+        if isinstance(m, mm.PowerLoad):
+            rows.append(("electricity", "PowerLoad", c.id, float(mm.value(m.p_mw))))
+        elif isinstance(m, mm.HeatLoad):
+            rows.append(("heat", "HeatLoad", c.id, float(mm.value(m.q_mw_heat))))
+        elif isinstance(m, mm.Sink):
+            gname = getattr(c.grid, "name", "?")
+            if gname == "gas":
+                hhv = getattr(c.grid, "higher_heating_value", 15.3)
+                mw = float(mm.value(m.mass_flow)) * 3.6 * hhv
+                rows.append(("gas", "Sink", c.id, mw))
+            else:
+                # water sinks: no MW without ΔT context
+                rows.append((gname, "Sink", c.id, float("nan")))
+
+    for b in net.branches:
+        m = b.model
+        if isinstance(m, mm.HeatExchangerLoad):
+            q_set = float(mm.value(m.q_mw_set))
+            rows.append(("heat", type(m).__name__, b.id, -q_set))
+
+    by_carrier: dict[str, list] = {}
+    for carrier, typ, cid, mw in rows:
+        by_carrier.setdefault(carrier, []).append((typ, cid, mw))
+
+    print("\n=== Demands (MW) ===")
+    grand = 0.0
+    for carrier in sorted(by_carrier):
+        items = by_carrier[carrier]
+        total = sum(mw for _, _, mw in items if mw == mw)
+        grand += total
+        print(f"\n[{carrier}]  count={len(items)}  total={total:.4f} MW")
+        for typ, cid, mw in sorted(items, key=lambda r: -(r[2] if r[2] == r[2] else 0)):
+            mw_str = f"{mw:10.4f} MW" if mw == mw else "       nan"
+            print(f"  {typ:24s} id={str(cid):30s}  {mw_str}")
+    print(f"\n[grand total]  {grand:.4f} MW")
+
 
 def solve(network):
     optimization_problem = mp.create_min_load_shedding_problem(
@@ -203,16 +252,10 @@ if __name__ == "__main__":
 
     print("URBAN")
     print("-------")
-    net = create_urban_district_net()
-    td = make_urban_district_timeseries(net)
-    net.apply_formulation(MISOCP_NETWORK_FORMULATION)
-
-    # for step in range(20):
-    #     td.apply_to_network(net, step)
-    #     print(solve(net, optimization_problem=None, solver=PyomoSolver()))
-    net.deactivate(net.branches_by_type(mm.GasPipe)[0])
-    # run_timeseries(net, td, solver=PyomoSolver())
-    print(solve(net))
+    net = create_large_lv_simbench(0.5)()
+    print_demands(net)
+    res = solve(net)
+    print(res.summary())
 
     # print("Industrial")
     # print("-------")

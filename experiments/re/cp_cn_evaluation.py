@@ -57,110 +57,146 @@ def get_id_type(id_str: str):
 
 
 def extend_impact_df(net_type_to_net: Dict[str, Network], metrics_df, impact_df):
-    new_impact_df = pandas.DataFrame()
-    for _, row in metrics_df[
-        metrics_df.apply(lambda row: row["id"].startswith("node"), axis=1)
-    ].iterrows():
-        node_id = int(row["id"].split(":")[1])
-        node = net_type_to_net[row["network_type"]].node_by_id(node_id)
-        child_impact_df = impact_df[
-            impact_df.apply(
-                lambda row_impact: (
-                    row_impact["id"].startswith("child")
-                    and int(row_impact["id"].split(":")[1]) in node.child_ids
-                    and row_impact["network_type"] == row["network_type"]
-                ),
-                axis=1,
-            )
-        ]
+    impact_df = impact_df.reset_index(drop=True)
+    impact_id_str = impact_df["id"].astype(str)
+    is_child = impact_id_str.str.startswith("child")
+    if not is_child.any():
+        return impact_df
 
-        node_impacts_df = (
-            child_impact_df.groupby(["carrier", "network_type"]).mean().reset_index()
-        )
-        node_impacts_df["id"] = row["id"]
-        node_impacts_df["type"] = type(node.model)
-        new_impact_df = pandas.concat([new_impact_df, node_impacts_df])
-    return pandas.concat([impact_df, new_impact_df])
+    child_impact_df = impact_df.loc[is_child, ["id", "carrier", "network_type", "impact"]].copy()
+    child_impact_df["_child_id"] = (
+        child_impact_df["id"].astype(str).str.split(":").str[1].astype(int)
+    )
+
+    metrics_id_str = metrics_df["id"].astype(str)
+    node_metrics = metrics_df[metrics_id_str.str.startswith("node")]
+    if node_metrics.empty:
+        return impact_df
+
+    pair_rows = []
+    parent_type = {}
+    for _, row in node_metrics.iterrows():
+        nt = row["network_type"]
+        try:
+            node_id = int(str(row["id"]).split(":")[1])
+            node = net_type_to_net[nt].node_by_id(node_id)
+        except (KeyError, ValueError, IndexError):
+            continue
+        parent_type[row["id"]] = type(node.model)
+        for cid in node.child_ids:
+            pair_rows.append(
+                {"_parent_id": row["id"], "network_type": nt, "_child_id": int(cid)}
+            )
+    if not pair_rows:
+        return impact_df
+
+    pairs_df = pandas.DataFrame(pair_rows)
+    merged = child_impact_df.merge(pairs_df, on=["network_type", "_child_id"], how="inner")
+    if merged.empty:
+        return impact_df
+
+    agg = (
+        merged.groupby(["_parent_id", "carrier", "network_type"], as_index=False)["impact"]
+        .mean()
+        .rename(columns={"_parent_id": "id"})
+    )
+    agg["type"] = agg["id"].map(parent_type)
+    return pandas.concat([impact_df, agg], ignore_index=True)
 
 
 def create_impact_df(perf_df: pandas.DataFrame, fail_df, metrics_df):
-    global_rows = []
+    # Vectorised: replaces a per-metric-row double-axis-1 apply over perf_df.
+    # Failures now persist from f.step to the end of the run (no repair) — see
+    # SimpleResilienceModel.step where process_network_state is disabled.
     perf_df = perf_df.rename(columns={"Unnamed: 0": "step"}).dropna()
+    perf_df = perf_df.copy()
+    perf_df["id"] = perf_df["id"].astype(str)
+    perf_df["experiment"] = perf_df["experiment"].astype(str)
+    perf_df["network_type"] = perf_df["network_type"].astype(str)
+
     usable_fail_df = fail_df.copy()
     usable_fail_df["node"] = usable_fail_df["node"].apply(
         lambda c: get_id_type(c) + ":" + c.split(":")[-1]
     )
-    # knoten/edge resilience in zeiträumen in denen aktiv / resilience
-    # in zeiträumen in denen inaktiv -> impact/influence
-    # Failures now persist from f.step to the end of the run (no repair) — see
-    # SimpleResilienceModel.step where process_network_state is disabled.
-    for _, row in metrics_df.iterrows():
-        node_edge_id = row["id"]
-        type = row["type"]
 
-        # For branch IDs, the stored tuple order in fail CSV may be reversed
-        # relative to metrics_df (e.g. "(9, 2, 0)" vs "(2, 9, 0)").
-        # Build a set of candidate IDs to query against.
-        candidate_ids = {node_edge_id}
-        if node_edge_id.startswith("branch:"):
-            inner = node_edge_id[len("branch:"):]
-            parts = [p.strip() for p in inner.strip("()").split(",")]
+    # Build map from fail-df node id → canonical metrics_df id (handles branch
+    # tuple-order reversal: "(9, 2, 0)" in fail csv ↔ "(2, 9, 0)" in metrics_df).
+    metric_id_map = {}
+    for mid in metrics_df["id"].astype(str).unique():
+        metric_id_map.setdefault(mid, mid)
+        if mid.startswith("branch:"):
+            inner = mid[len("branch:"):].strip("()")
+            parts = [p.strip() for p in inner.split(",")]
             if len(parts) >= 3:
                 reversed_id = f"branch:({parts[1]}, {parts[0]}, {parts[2]})"
-                candidate_ids.add(reversed_id)
+                metric_id_map.setdefault(reversed_id, mid)
 
-        node_usable_fail_df = usable_fail_df[usable_fail_df["node"].isin(candidate_ids)].copy()
-        # Normalise the stored ID back to metrics_df convention so downstream joins work
-        node_usable_fail_df["node"] = node_edge_id
+    usable_fail_df["metric_id"] = usable_fail_df["node"].map(metric_id_map)
+    fail_matched = usable_fail_df.dropna(subset=["metric_id"])
+    failure_only = fail_matched[fail_matched["type"] == "failure"]
 
-        rules = {}
-        network_type = row["network_type"]
-        node_fail_with_net_type = node_usable_fail_df[
-            node_usable_fail_df["network_type"] == network_type
-        ]
-        perf_df_with_net_type = perf_df[perf_df["network_type"] == network_type]
-        for name, group in node_fail_with_net_type.groupby(["experiment", "id"]):
-            failure_rows = group.query("type == 'failure'")
-            if len(failure_rows["step"]) == 0:
-                continue
-            # Use earliest failure step; failure persists to end of run.
-            rules[(name[1], name[0])] = int(failure_rows["step"].min())
+    rules_df = (
+        failure_only
+        .groupby(["metric_id", "network_type", "experiment", "id"], as_index=False)["step"]
+        .min()
+        .rename(columns={"step": "fail_step"})
+    )
+    rules_df["id"] = rules_df["id"].astype(str)
+    rules_df["experiment"] = rules_df["experiment"].astype(str)
+    rules_df["network_type"] = rules_df["network_type"].astype(str)
 
-        node_in_perf_df = perf_df_with_net_type[
-            perf_df_with_net_type.apply(
-                lambda row: (
-                    (row["id"], row["experiment"]) in rules
-                    and row["step"] >= rules[(row["id"], row["experiment"])]
-                ),
-                axis=1,
-            )
-        ]
-        node_not_in_perf_df = perf_df_with_net_type[
-            perf_df_with_net_type.apply(
-                lambda row: (
-                    (row["id"], row["experiment"]) not in rules
-                    or row["step"] < rules[(row["id"], row["experiment"])]
-                ),
-                axis=1,
-            )
-        ]
+    # Totals per network_type — basis for "not during fault" stats.
+    totals = perf_df.groupby("network_type")[["0", "1", "2"]].agg(["sum", "count"])
 
-        node_in_perf_df_mean = node_in_perf_df[["0", "1", "2"]].mean()
-        node_not_in_perf_df_mean = node_not_in_perf_df[["0", "1", "2"]].mean()
-        for carrier in [("heat", "1"), ("gas", "2"), ("electricity", "0")]:
-            # Absolute degradation: performance drop caused by this component's failure.
-            # Positive = component caused loss; negative = performance was better during failure
-            # (can happen if the component was a bottleneck consuming rather than supplying).
-            impact = (
-                node_not_in_perf_df_mean[carrier[1]]
-                - node_in_perf_df_mean[carrier[1]]
-            )
+    # "In fault" rows: perf rows that match a rule and have step ≥ fail_step.
+    if not rules_df.empty:
+        in_merge = perf_df.merge(
+            rules_df, on=["network_type", "experiment", "id"], how="inner"
+        )
+        in_active = in_merge[in_merge["step"] >= in_merge["fail_step"]]
+        in_agg = (
+            in_active.groupby(["metric_id", "network_type"])[["0", "1", "2"]]
+            .agg(["sum", "count"])
+        )
+    else:
+        in_agg = pandas.DataFrame()
+
+    # Convert to plain dicts for fast lookup in the per-metric emit loop.
+    totals_dict = {nt: totals.loc[nt] for nt in totals.index}
+    in_agg_dict = {idx: in_agg.loc[idx] for idx in in_agg.index} if not in_agg.empty else {}
+
+    carrier_pairs = (("heat", "1"), ("gas", "2"), ("electricity", "0"))
+    global_rows = []
+    for row in metrics_df.itertuples(index=False):
+        metric_id = str(row.id)
+        network_type = row.network_type
+        type_ = row.type
+        total_for_nt = totals_dict.get(network_type)
+        if total_for_nt is None:
+            continue
+
+        in_for_metric = in_agg_dict.get((metric_id, network_type))
+        for carrier_name, carrier_col in carrier_pairs:
+            t_sum = total_for_nt[(carrier_col, "sum")]
+            t_cnt = total_for_nt[(carrier_col, "count")]
+            if in_for_metric is not None:
+                in_sum = in_for_metric[(carrier_col, "sum")]
+                in_cnt = in_for_metric[(carrier_col, "count")]
+            else:
+                in_sum = 0.0
+                in_cnt = 0
+            out_sum = t_sum - in_sum
+            out_cnt = t_cnt - in_cnt
+            in_mean = in_sum / in_cnt if in_cnt > 0 else float("nan")
+            out_mean = out_sum / out_cnt if out_cnt > 0 else float("nan")
+            # Absolute degradation: out - in. Positive = component caused loss.
+            impact = out_mean - in_mean
             global_rows.append(
                 {
-                    "id": node_edge_id,
-                    "carrier": carrier[0],
+                    "id": metric_id,
+                    "carrier": carrier_name,
                     "impact": impact,
-                    "type": type,
+                    "type": type_,
                     "network_type": network_type,
                 }
             )
@@ -467,9 +503,9 @@ def impact_over_metrics(
         metrics_df.astype({"id": "string"}), on=["id", "network_type"]
     )
     metric_impact_df["type_y"] = (
-        metric_impact_df["type_y"].astype(str).apply(lambda v: v.split(".")[-1][:-2])
+        metric_impact_df["type_y"].astype(str).str.split(".").str[-1].str[:-2]
     )
-    metric_impact_df["impact"] = metric_impact_df["impact"].apply(lambda v: abs(v))
+    metric_impact_df["impact"] = metric_impact_df["impact"].abs()
     figures = []
     titles = []
     metric_impact_df = metric_impact_df[metric_impact_df["impact"].notnull()]
@@ -610,13 +646,11 @@ def impact_over_metrics(
 
 def impact_aggregated_component_carrier(impact_df: pandas.DataFrame, folder_id):
     new_impact_df = impact_df.copy()
-    new_impact_df["impact"] = new_impact_df["impact"].apply(lambda v: abs(v))
+    new_impact_df["impact"] = new_impact_df["impact"].abs()
     new_impact_df["type"] = (
-        impact_df["type"].astype(str).apply(lambda v: v.split(".")[-1][:-2])
+        impact_df["type"].astype(str).str.split(".").str[-1].str[:-2]
     )
-    new_impact_df["type_carrier"] = new_impact_df.apply(
-        lambda row: TYPE_TO_CARRIER[row["type"]], axis=1
-    )
+    new_impact_df["type_carrier"] = new_impact_df["type"].map(TYPE_TO_CARRIER)
     new_impact_df = new_impact_df[new_impact_df["impact"].notnull()]
     """
     new_impact_df["carrier"] = (
@@ -802,31 +836,39 @@ def impact_aggregated_component_carrier(impact_df: pandas.DataFrame, folder_id):
     )
 
 
-def _match_impact_id(cp_id, cp_type, impact_ids):
+def _build_branch_lookup(impact_ids):
+    """Map (a_str, b_str) → impact_id for every branch impact id (both directions)."""
+    branch_lookup = {}
+    for iid in impact_ids:
+        if not iid.startswith("branch:"):
+            continue
+        inner = iid[len("branch:"):].strip("()")
+        parts = [p.strip() for p in inner.split(",")]
+        if len(parts) >= 2:
+            a, b = parts[0], parts[1]
+            branch_lookup.setdefault((a, b), iid)
+            branch_lookup.setdefault((b, a), iid)
+    return branch_lookup
+
+
+def _match_impact_id(cp_id, cp_type, impact_ids, branch_lookup=None):
     """Find the impact_df id string for a given metric entry."""
     if cp_type in ("CHP", "PowerToHeat"):
         candidate = f"compound:{cp_id}"
         return candidate if candidate in impact_ids else None
+
+    if branch_lookup is None:
+        branch_lookup = _build_branch_lookup(impact_ids)
 
     # Non-CP branches: cp_id is already str(edge_tuple) e.g. "(10, 4, 0)"
     if cp_type in ("PowerLine", "GasPipe", "WaterPipe", "HeatExchanger"):
         candidate = f"branch:{cp_id}"
         if candidate in impact_ids:
             return candidate
-        # Fallback: fuzzy match ignoring trailing uid
         inner = str(cp_id).strip("()")
         parts = [p.strip() for p in inner.split(",")]
         if len(parts) >= 2:
-            a, b = parts[0], parts[1]
-            for iid in impact_ids:
-                if not iid.startswith("branch:"):
-                    continue
-                iinner = iid[len("branch:"):].strip("()")
-                iparts = [p.strip() for p in iinner.split(",")]
-                if len(iparts) >= 2:
-                    ia, ib = iparts[0], iparts[1]
-                    if (ia == a and ib == b) or (ia == b and ib == a):
-                        return iid
+            return branch_lookup.get((parts[0], parts[1]))
         return None
 
     # branch CPs (GasToPower, PowerToGas): cp_id = "from→to"
@@ -835,17 +877,7 @@ def _match_impact_id(cp_id, cp_type, impact_ids):
         from_id, to_id = from_id.strip(), to_id.strip()
     except ValueError:
         return None
-    for iid in impact_ids:
-        if not iid.startswith("branch:"):
-            continue
-        inner = iid[len("branch:"):]  # e.g. "(10, 4, 0)"
-        parts = inner.strip("()").split(",")
-        if len(parts) < 2:
-            continue
-        a, b = parts[0].strip(), parts[1].strip()
-        if (a == from_id and b == to_id) or (a == to_id and b == from_id):
-            return iid
-    return None
+    return branch_lookup.get((from_id, to_id))
 
 
 def cp_metric_vs_actual_impact(monee_net, impact_df_nt, network_type):
@@ -869,40 +901,48 @@ def cp_metric_vs_actual_impact(monee_net, impact_df_nt, network_type):
     )
 
     impact_ids = set(actual_total["id"])
+    branch_lookup = _build_branch_lookup(impact_ids)
+    total_lookup = dict(zip(actual_total["id"], actual_total["actual_total"]))
+    per_carrier_lookup = {
+        col: dict(zip(actual_per_carrier["id"], actual_per_carrier[col]))
+        for col in actual_per_carrier.columns
+        if col != "id"
+    }
     rows = []
-    for _, score_row in df_scores.iterrows():
-        impact_id = _match_impact_id(score_row["cp_id"], score_row["cp_type"], impact_ids)
+    for score_row in df_scores.itertuples(index=False):
+        impact_id = _match_impact_id(
+            score_row.cp_id, score_row.cp_type, impact_ids, branch_lookup
+        )
         if impact_id is None:
             continue
-        actual_row = actual_total[actual_total["id"] == impact_id]
-        if len(actual_row) == 0:
+        actual_total_val = total_lookup.get(impact_id)
+        if actual_total_val is None:
             continue
+        score_dict = score_row._asdict()
         entry = {
-            "cp_id": str(score_row["cp_id"]),
-            "cp_type": score_row["cp_type"],
-            "predicted_score": score_row["score"],
-            "predicted_stress": score_row["total_stress"],
-            "topo_factor": score_row["topo_factor"],
-            "topo_bc": score_row["topo_bc"],
-            "stress_bc": score_row.get("stress_bc", 0.0),
-            "stress_score": score_row.get("stress_score", score_row["score"]),
-            "local_score": score_row.get("local_score", score_row["score"]),
-            "self_score": score_row.get("self_score", score_row["score"]),
-            "katz_score": score_row.get("katz_score", 0.0),
-            "vitality_score": score_row.get("vitality_score", 0.0),
-            "actual_total": actual_row["actual_total"].iloc[0],
+            "cp_id": str(score_row.cp_id),
+            "cp_type": score_row.cp_type,
+            "predicted_score": score_row.score,
+            "predicted_stress": score_row.total_stress,
+            "topo_factor": score_row.topo_factor,
+            "topo_bc": score_row.topo_bc,
+            "stress_bc": score_dict.get("stress_bc", 0.0),
+            "stress_score": score_dict.get("stress_score", score_row.score),
+            "local_score": score_dict.get("local_score", score_row.score),
+            "self_score": score_dict.get("self_score", score_row.score),
+            "katz_score": score_dict.get("katz_score", 0.0),
+            "vitality_score": score_dict.get("vitality_score", 0.0),
+            "actual_total": actual_total_val,
         }
         for metric_col, carrier_col in [
             ("power_stress", "electricity"),
             ("gas_stress", "gas"),
             ("heat_stress", "heat"),
         ]:
-            entry[f"predicted_{metric_col}"] = score_row.get(metric_col, 0.0)
-            carrier_actual = actual_per_carrier[actual_per_carrier["id"] == impact_id]
+            entry[f"predicted_{metric_col}"] = score_dict.get(metric_col, 0.0)
+            carrier_map = per_carrier_lookup.get(carrier_col)
             entry[f"actual_{carrier_col}"] = (
-                carrier_actual[carrier_col].iloc[0]
-                if len(carrier_actual) > 0 and carrier_col in carrier_actual.columns
-                else 0.0
+                carrier_map.get(impact_id, 0.0) if carrier_map is not None else 0.0
             )
         rows.append(entry)
 
@@ -1640,13 +1680,13 @@ def evaluate(folder_id):
     per_network_dfs = []
 
     for network_type, monee_net in net_type_to_net.items():
-        if network_type == "large_urban_balanced":
-            result = run_energy_flow(monee_net, solver=PyomoSolver(), solver_name="gurobi")
-            print(result.full())
-            print(result.network.as_result_dataframe_dict_str())
-            monee_net = result.network
-        else:
-            continue
+        # if network_type == "large_urban_balanced":
+        #     result = run_energy_flow(monee_net, solver=PyomoSolver(), solver_name="gurobi")
+        #     print(result.full())
+        #     print(result.network.as_result_dataframe_dict_str())
+        #     monee_net = result.network
+        # else:
+        #     continue
 
         Path(OUTPUT + f"/{network_type}").mkdir(exist_ok=True, parents=True)
 
