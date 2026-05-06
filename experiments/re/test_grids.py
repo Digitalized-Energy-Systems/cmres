@@ -167,7 +167,7 @@ ALL_GRIDS = {
     "simbench_lv_no": (create_large_lv_simbench(0), create_large_lv_simbench_ts),
     "simbench_lv_low": (create_large_lv_simbench(0.25), create_large_lv_simbench_ts),
     "simbench_lv": (create_large_lv_simbench(0.5), create_large_lv_simbench_ts),
-    "simbench_lv_centralized": (create_large_lv_simbench(0.5, centralized=True), create_large_lv_simbench_ts),
+    "simbench_lv_centralized": (create_large_lv_simbench(0.5, central=True), create_large_lv_simbench_ts),
     "simbench_lv_high": (create_large_lv_simbench(0.75), create_large_lv_simbench_ts),
     "simbench_lv_max": (create_large_lv_simbench(1), create_large_lv_simbench_ts),
     # "large_urban_balanced": (create_resilient_urban_mes_net, create_balanced_urban_mes_timeseries),
