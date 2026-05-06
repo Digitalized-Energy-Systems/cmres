@@ -7,8 +7,9 @@ from pathlib import PurePath, Path
 from statistics import mean
 
 import cmres.evaluation.evaluation as eval
-from monee import Network, run_energy_flow, PyomoSolver
+from monee import Network, run_energy_flow, run_energy_flow_optimization, PyomoSolver
 from monee.model.core import Node
+import monee.problem as mp
 import scipy.stats
 
 import pandas
@@ -409,12 +410,42 @@ COLUMN_EXPERIMENT_NAME = "experiment"
 
 CARRIER_REPLACE_MAP = {"0": "electricity", "1": "heat", "2": "gas"}
 
+# Maps the technical scenario / network-type identifiers used on disk (and as
+# the suffix in folder names of the form ``<EXPERIMENT_NAME>-<grid>``) to
+# human-readable labels for plots. Unknown keys are returned unchanged so the
+# pipeline does not crash if a new grid is registered without an entry here.
+SCENARIO_NAME_MAP = {
+    "simbench_lv_no": "No CPs",
+    "simbench_lv_low": "Low CP density",
+    "simbench_lv": "Medium CP density",
+    "simbench_lv_centralized": "Centralized",
+    "simbench_lv_high": "High CP density",
+    "simbench_lv_max": "Max CP density",
+    "large_urban_balanced": "Balanced urban",
+    "urban_district": "Urban district",
+    "industrial_hub": "Industrial hub",
+    "regional_mes": "Regional MES",
+}
+
+
+def pretty_scenario(name) -> str:
+    """Map a technical scenario / network-type id to its display label.
+
+    Returns the input unchanged when no mapping is registered, so file paths
+    and join keys (which still use the raw id) keep working as before.
+    """
+    if name is None:
+        return ""
+    return SCENARIO_NAME_MAP.get(str(name), str(name))
+
 
 def resilience_per_scenario(perf_df: pandas.DataFrame, folder_id):
     # experiment, id 0 1 2
+    # Per run: average instantaneous load shed across the 16-step horizon (MW).
+    # Across runs: MC expectation. Result is bounded by total grid demand.
     resilience_per_carrier_per_scenario = (
         perf_df.groupby(["network_type", "experiment", "id"])[["0", "1", "2"]]
-        .sum()
+        .mean()
         .reset_index()
         .groupby(["network_type", "experiment"])
         .mean()
@@ -437,6 +468,11 @@ def resilience_per_scenario(perf_df: pandas.DataFrame, folder_id):
         resilience_per_carrier_per_scenario["carrier"].apply(
             lambda v: CARRIER_REPLACE_MAP[v]
         )
+    )
+    # Replace technical scenario keys with display labels (file paths still
+    # use the raw key, only the chart-visible columns are remapped).
+    resilience_per_carrier_per_scenario["experiment"] = (
+        resilience_per_carrier_per_scenario["experiment"].map(pretty_scenario)
     )
     eval.create_bar(
         resilience_per_carrier_per_scenario,
@@ -473,7 +509,7 @@ def resilience_per_scenario(perf_df: pandas.DataFrame, folder_id):
             ],
             ["#ffa000", "#d32f2f", "#388e3c"],
             ["electricity", "heat", "gas"],
-            [f"<b>{net_type}</b>" for net_type in unique_network_types],
+            [f"<b>{pretty_scenario(net_type)}</b>" for net_type in unique_network_types],
             len(unique_experiments),
             [str(exp) for exp in unique_experiments] * len(unique_network_types),
             yaxis_title="<b>mean performance loss in MW</b>",
@@ -756,7 +792,7 @@ def impact_aggregated_component_carrier(impact_df: pandas.DataFrame, folder_id):
     average_impact_per_carrier_net_type["carrier_net_type"] = (
         average_impact_per_carrier_net_type["type_carrier"].astype(str)
         + "-"
-        + average_impact_per_carrier_net_type["network_type"].astype(str)
+        + average_impact_per_carrier_net_type["network_type"].map(pretty_scenario)
     )
     impact_per_carrier_net_type = (
         new_impact_df.groupby(["type_carrier", "carrier", "network_type"])
@@ -766,7 +802,7 @@ def impact_aggregated_component_carrier(impact_df: pandas.DataFrame, folder_id):
     impact_per_carrier_net_type["carrier_net_type"] = (
         impact_per_carrier_net_type["type_carrier"].astype(str)
         + "-"
-        + impact_per_carrier_net_type["network_type"].astype(str)
+        + impact_per_carrier_net_type["network_type"].map(pretty_scenario)
     )
     figures += [
         eval.create_bar(
@@ -802,13 +838,15 @@ def impact_aggregated_component_carrier(impact_df: pandas.DataFrame, folder_id):
     average_impact_per_net_type = (
         new_impact_df.groupby(["carrier", "network_type"]).mean().reset_index()
     )
-    average_impact_per_net_type["network_type"] = average_impact_per_net_type["network_type"].astype(
-        str
+    average_impact_per_net_type["network_type"] = (
+        average_impact_per_net_type["network_type"].map(pretty_scenario)
     )
     total_impact_per_net_type = (
         new_impact_df.groupby(["carrier", "network_type"]).sum().reset_index()
     )
-    total_impact_per_net_type["network_type"] = total_impact_per_net_type["network_type"].astype(str)
+    total_impact_per_net_type["network_type"] = (
+        total_impact_per_net_type["network_type"].map(pretty_scenario)
+    )
 
     figures += [
         eval.create_bar(
@@ -1151,11 +1189,44 @@ def cp_metric_vs_actual_impact(monee_net, impact_df_nt, network_type):
     df = df.copy()
     df["network_type"] = network_type
 
-    # Compute ranks for every metric (1 = highest)
-    for col, _label in METRICS:
-        df[f"rank_{col}"] = df[col].rank(ascending=False, method="min").astype(int)
+    # Replace any ±inf with NaN so dropna catches them too — without this they
+    # would survive the dropna, then crash plotly / Spearman.
+    metric_cols = [col for col, _ in METRICS]
+    df[metric_cols] = df[metric_cols].replace([_np.inf, -_np.inf], _np.nan)
 
-    valid = df.dropna(subset=[col for col, _ in METRICS])
+    # Diagnostic: where do the non-finite metric values come from? Report
+    # per-column counts and the offending cp_id / cp_type so the issue can be
+    # traced back into mes_all_components_metric (PTDF stress, throughput,
+    # topology factor, etc.).
+    nan_per_col = {c: int(df[c].isna().sum()) for c in metric_cols if df[c].isna().any()}
+    if nan_per_col:
+        print(
+            f"[warn] cp_metric_vs_actual_impact[{network_type}]: "
+            f"NaN/inf in metric columns → {nan_per_col}"
+        )
+        bad = df[df[metric_cols].isna().any(axis=1)][["cp_id", "cp_type"] + metric_cols]
+        print(f"[warn] offending rows (showing up to 8):\n{bad.head(8).to_string(index=False)}")
+
+    # Drop rows missing any metric *before* ranking — otherwise the rank()
+    # output keeps NaN slots and astype(int) raises IntCastingNaNError.
+    valid = df.dropna(subset=metric_cols).copy()
+
+    for col, _label in METRICS:
+        valid[f"rank_{col}"] = valid[col].rank(ascending=False, method="min").astype(int)
+
+    # Carry ranks back onto df for the bump-chart / df-iteration code below.
+    # Rows that were dropped get NaN ranks (Int64 nullable so we can persist).
+    for col, _label in METRICS:
+        df[f"rank_{col}"] = (
+            df[col].rank(ascending=False, method="min").astype("Int64")
+        )
+
+    if len(valid) < len(df):
+        print(
+            f"[info] cp_metric_vs_actual_impact[{network_type}]: "
+            f"{len(df) - len(valid)}/{len(df)} components dropped from rank/ρ analysis "
+            f"due to non-finite metric values."
+        )
 
     # 1. ρ bar chart with 95% CI error bars
     rho_rows = []
@@ -1228,12 +1299,14 @@ def cp_metric_vs_actual_impact(monee_net, impact_df_nt, network_type):
     rank_cols    = [f"rank_{col}" for col, _ in METRICS]
     cp_colors    = px.colors.qualitative.Plotly
     cp_type_color = {t: cp_colors[i % len(cp_colors)]
-                     for i, t in enumerate(df["cp_type"].unique())}
+                     for i, t in enumerate(valid["cp_type"].unique())}
 
     seen_cp_types = set()
     bump_fig = go.Figure()
-    for _, row in df.iterrows():
-        ranks = [row[rc] for rc in rank_cols]
+    # Bump chart only plots components with finite ranks across every metric;
+    # `valid` already excludes rows containing NaN/inf in any metric column.
+    for _, row in valid.iterrows():
+        ranks = [int(row[rc]) for rc in rank_cols]
         cp_type = row["cp_type"]
         first_of_type = cp_type not in seen_cp_types
         seen_cp_types.add(cp_type)
@@ -1250,7 +1323,7 @@ def cp_metric_vs_actual_impact(monee_net, impact_df_nt, network_type):
         ))
 
     bump_fig.update_layout(
-        height=max(400, 20 * len(df)),
+        height=max(400, 20 * len(valid)),
         width=900,
         template="plotly_white",
         yaxis=dict(title="Rank (1 = highest impact)", autorange="reversed",
@@ -1432,7 +1505,7 @@ def pooled_resilience_per_scenario(perf_df: pandas.DataFrame, output_dir: str):
         lambda v: v.split("/")[-1].split("-", 1)[1]
     )
     pooled["carrier"] = pooled["carrier"].map(CARRIER_REPLACE_MAP)
-    pooled["scenario"] = pooled["network_type"].astype(str) + " / " + pooled["experiment"].astype(str)
+    pooled["scenario"] = pooled["network_type"].map(pretty_scenario)
     pooled = pooled.sort_values(["network_type", "experiment", "carrier"]).reset_index(drop=True)
 
     fig = eval.create_bar(
@@ -1445,7 +1518,7 @@ def pooled_resilience_per_scenario(perf_df: pandas.DataFrame, output_dir: str):
         legend_text="carrier",
         template="plotly_white+publish3",
         yaxis_title="mean performance loss in MW",
-        xaxis_title="scenario (network_type / grid)",
+        xaxis_title="scenario",
         title="Pooled performance drop by scenario, by carrier",
         barmode="group",
         width=max(800, 80 * len(pooled["scenario"].unique())),
@@ -1582,7 +1655,7 @@ def pooled_metric_comparison(pooled_df, output_dir):
             sub = valid[valid["network_type"] == nt]
             scatter_fig.add_trace(go.Scatter(
                 x=sub[x_col], y=sub["actual_total"],
-                mode="markers", name=nt,
+                mode="markers", name=pretty_scenario(nt),
                 marker=dict(color=net_colors[nt], size=7),
                 legendgroup=nt, showlegend=(idx == 0),
             ), row=r + 1, col=c + 1)
@@ -1649,7 +1722,7 @@ def pooled_metric_comparison(pooled_df, output_dir):
                 nt_errs_hi.append(ci_hi - rho)
             nt_rho_fig.add_trace(go.Bar(
                 name=label,
-                x=net_types,
+                x=[pretty_scenario(nt) for nt in net_types],
                 y=nt_rhos,
                 error_y=dict(type="data", symmetric=False,
                              array=nt_errs_hi, arrayminus=nt_errs_lo),
@@ -1768,14 +1841,53 @@ def evaluate(folder_id):
     per_network_dfs = []
 
     for network_type, monee_net in net_type_to_net.items():
-        # if network_type == "large_urban_balanced":
-        #     result = run_energy_flow(monee_net, solver=PyomoSolver(), solver_name="gurobi")
-        #     print(result.full())
-        #     print(result.network.as_result_dataframe_dict_str())
-        #     monee_net = result.network
-        # else:
-        #     continue
-
+        print(network_type)
+        # Plain run_energy_flow is a hard feasibility solve and goes infeasible
+        # whenever the demanded load exceeds what the (sparse) coupling points
+        # plus the heat slack can deliver — e.g. simbench_lv_low: ~0.534 MW
+        # heat demand vs ~0.012 MW heat injection from 6 CHPHGs + 1 P2HHG. Try
+        # the hard solve first (fast path); if it reports infeasible, fall back
+        # to the same load-shedding optimisation that produced the pickle in
+        # the first place, so the metric layer sees a well-defined operating
+        # point instead of NaN-laden Pyomo Vars.
+        try:
+            result = run_energy_flow(
+                monee_net, solver=PyomoSolver(), solver_name="gurobi"
+            )
+            monee_net = result.network
+            print(f"  energy flow: feasible (objective={getattr(result, 'objective', '?')})")
+        except Exception as e_hard:
+            print(f"  plain energy flow failed ({type(e_hard).__name__}: {e_hard}) "
+                  f"— falling back to min-load-shedding optimisation")
+            opt = mp.create_min_load_shedding_problem(
+                bounds_el=(0.9, 1.1),
+                bounds_gas=(0.9, 1.1),
+                bounds_heat=(0.7, 1.3),
+                ext_grid_el_bounds=(-0.25, 0.25),
+                ext_grid_gas_bounds=(-1.5, 1.5),
+                ext_grid_heat_bounds=(-100, 100),
+                include_ext_grids=True,
+                check_vm=True,
+                check_pressure=True,
+                check_temperature=True,
+                check_line_loading=True,
+            )
+            try:
+                result = run_energy_flow_optimization(
+                    monee_net,
+                    solver=PyomoSolver(),
+                    solver_name="gurobi",
+                    optimization_problem=opt,
+                    exclude_unconnected_nodes=True,
+                )
+                monee_net = result.network
+                print(f"  load-shedding solve: objective={getattr(result, 'objective', '?')} "
+                      f"(non-zero ⇒ load was shed)")
+            except Exception as e_opt:
+                print(f"  load-shedding solve also failed ({type(e_opt).__name__}: {e_opt}) "
+                      f"— continuing with pickled network state as-is")
+        print("Finished")
+        
         Path(OUTPUT + f"/{network_type}").mkdir(exist_ok=True, parents=True)
 
         perf_df_nt = perf_df[perf_df["network_type"] == network_type]

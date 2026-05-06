@@ -156,11 +156,21 @@ def start_resilience_simulation(
     id=0,
     registry=None,
     scenario=None,
+    ext_grid_el_bounds=None,
+    ext_grid_gas_bounds=None,
+    ext_grid_heat_bounds=None,
 ):
     def iteration_step(net, step, step_state, step_result, base_net):
         resilience_measurement_model.gather(net, step)
 
-    cascading_model = CascadingModel()
+    cm_kwargs = {}
+    if ext_grid_el_bounds is not None:
+        cm_kwargs["ext_grid_el_bounds"] = ext_grid_el_bounds
+    if ext_grid_gas_bounds is not None:
+        cm_kwargs["ext_grid_gas_bounds"] = ext_grid_gas_bounds
+    if ext_grid_heat_bounds is not None:
+        cm_kwargs["ext_grid_heat_bounds"] = ext_grid_heat_bounds
+    cascading_model = CascadingModel(**cm_kwargs)
 
     def init_func(net):
         _, __ = cascading_model.calc_performance(net, 0)

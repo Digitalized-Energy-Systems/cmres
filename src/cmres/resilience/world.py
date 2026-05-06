@@ -7,10 +7,8 @@ import cmres.data.observer as observer
 import monee.model as mm
 from monee import (
     Network,
-    PyomoSolver,
     StepHook,
     TimeseriesData,
-    run_energy_flow,
     run_timeseries,
 )
 
@@ -91,9 +89,6 @@ class CentralFaultyMoneeWorld:
         log.debug(
             "Faults (%d): %s", len(self.faults), ", ".join(str(f) for f in self.faults)
         )
-
-        # initial single run for initial observation
-        run_energy_flow(self.__net, solver=PyomoSolver())
 
         self._init_func(self.__net)
 

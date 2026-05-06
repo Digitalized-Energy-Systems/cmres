@@ -338,18 +338,32 @@ def calc_relative_violation(component, attribute, target, rel_allowed_diff):
 
 
 class CascadingModel(StepModel):
-    def __init__(self, performance_accuracy=100) -> None:
+    def __init__(
+        self,
+        performance_accuracy=100,
+        ext_grid_el_bounds=ms.DEFAULT_EXT_GRID_EL_BOUNDS,
+        ext_grid_gas_bounds=ms.DEFAULT_EXT_GRID_GAS_BOUNDS,
+        ext_grid_heat_bounds=ms.DEFAULT_EXT_GRID_HEAT_BOUNDS,
+    ) -> None:
         self._cascading_metric = CascadingResilienceMetric()
         self._performance_metric = GeneralResiliencePerformanceMetric()
         self._current_failures = []
         self._iteration_number_omef = performance_accuracy
         self._faults = None
         self._last_performance = None
+        self._ext_grid_el_bounds = ext_grid_el_bounds
+        self._ext_grid_gas_bounds = ext_grid_gas_bounds
+        self._ext_grid_heat_bounds = ext_grid_heat_bounds
 
     def calc_performance(self, network: Network, without_load=False):
         log.info("Solving network for performance calculation")
         # print(network)
-        result = ms.solve(network)
+        result = ms.solve(
+            network,
+            ext_grid_el_bounds=self._ext_grid_el_bounds,
+            ext_grid_gas_bounds=self._ext_grid_gas_bounds,
+            ext_grid_heat_bounds=self._ext_grid_heat_bounds,
+        )
         log.info("Network solve complete")
         return self._performance_metric.calc(result.network), result
 

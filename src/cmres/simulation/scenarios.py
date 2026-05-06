@@ -20,6 +20,9 @@ def start_res_simulation(
     id=0,
     registry=None,
     scenario=None,
+    ext_grid_el_bounds=None,
+    ext_grid_gas_bounds=None,
+    ext_grid_heat_bounds=None,
 ):
     """Run one resilience simulation.
 
@@ -49,4 +52,7 @@ def start_res_simulation(
         id=id,
         registry=registry,
         scenario=scenario,
+        ext_grid_el_bounds=ext_grid_el_bounds,
+        ext_grid_gas_bounds=ext_grid_gas_bounds,
+        ext_grid_heat_bounds=ext_grid_heat_bounds,
     )

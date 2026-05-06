@@ -12,7 +12,6 @@ import pandas as pd
 
 import monee
 import monee.model as mm
-import monee.network.mes as mes
 from monee.model.core import Node as MNode
 
 jax.config.update("jax_enable_x64", True)
@@ -107,12 +106,28 @@ def _val(x, default=None):
             return default
 
 
+def _is_finite(v) -> bool:
+    """True iff v is a real, finite scalar (not None, NaN, or ±inf)."""
+    if v is None:
+        return False
+    try:
+        return bool(np.isfinite(float(v)))
+    except (TypeError, ValueError):
+        return False
+
+
 def _first_attr(obj, names: List[str], default=None):
+    """Return the first attribute on *obj* whose value is finite.
+
+    NaN/inf are now treated as missing — solved Pyomo variables can be NaN
+    (e.g. unbounded duals after a relaxed solve) and feeding those into
+    margins/PTDF cascades non-finite values through every metric.
+    """
     for n in names:
         if hasattr(obj, n):
             v = getattr(obj, n)
             vv = _val(v, default=None)
-            if vv is not None:
+            if _is_finite(vv):
                 return vv
     return default
 
@@ -405,13 +420,16 @@ def _calc_C_squared(diameter_m, length_m, t_k, compressibility):
 def _darcy_resistance(pipe_model):
     d = _val(getattr(pipe_model, "diameter_m", None), None)
     L = _val(getattr(pipe_model, "length_m", None), None)
-    if d is None or L is None or d == 0:
+    # Reject non-finite geometry — solved Pyomo Vars can resolve to NaN, and
+    # NaN comparisons silently pass `d == 0` then poison every downstream b.
+    if not (_is_finite(d) and _is_finite(L)) or d == 0:
         return None
     A = math.pi * d**2 / 4.0
     friction = getattr(pipe_model, "friction", None)
     f_raw = _val(friction, 0.02)
-    f = max(float(f_raw), 1e-6)
-    return f * (L / d) / (2.0 * _WATER_DENSITY * A**2)
+    f = max(float(f_raw) if _is_finite(f_raw) else 0.02, 1e-6)
+    Rm = f * (L / d) / (2.0 * _WATER_DENSITY * A**2)
+    return Rm if _is_finite(Rm) and Rm > 0 else None
 
 
 def _connected_components_from_edges(n, edges):
@@ -584,17 +602,22 @@ def build_gas_susceptance(monee_net, cfg: CPMetricConfig):
         if fi is None or ti is None:
             continue
 
-        m0 = abs(_val(pipe.model.mass_flow, 0.0))
+        m0_raw = _val(pipe.model.mass_flow, 0.0)
+        if not _is_finite(m0_raw):
+            continue
+        m0 = abs(float(m0_raw))
         if m0 < cfg.FLOW_MIN:
             continue
 
-        C2 = _calc_C_squared(
-            float(_val(pipe.model.diameter_m, 0.0)),
-            float(_val(pipe.model.length_m, 1.0)),
-            t_k,
-            z,
-        )
+        d_raw = _val(pipe.model.diameter_m, 0.0)
+        L_raw = _val(pipe.model.length_m, 1.0)
+        if not (_is_finite(d_raw) and _is_finite(L_raw)):
+            continue
+
+        C2 = _calc_C_squared(float(d_raw), float(L_raw), t_k, z)
         b = C2 / (2.0 * m0)
+        if not _is_finite(b):
+            continue
 
         B[fi, fi] += b
         B[ti, ti] += b
@@ -645,14 +668,19 @@ def build_heat_susceptance(monee_net, cfg: CPMetricConfig):
             continue
 
         Rm = _darcy_resistance(pipe.model)
-        if Rm is None or Rm <= 0:
+        if Rm is None or Rm <= 0 or not _is_finite(Rm):
             continue
 
-        m0 = abs(_val(pipe.model.mass_flow, 0.0))
+        m0_raw = _val(pipe.model.mass_flow, 0.0)
+        if not _is_finite(m0_raw):
+            continue
+        m0 = abs(float(m0_raw))
         if m0 < cfg.FLOW_MIN:
             continue
 
         b = 1.0 / (2.0 * Rm * m0)
+        if not _is_finite(b):
+            continue
         _add_edge(fi, ti, b)
         water_b_list.append(b)
         pipe_ids.append(pipe.id)
@@ -971,41 +999,45 @@ def _cp_throughput_proxy(cp_or_branch, label: str, monee_net=None) -> float:
     """
     sn_mva = _system_sn_mva(monee_net) if monee_net is not None else 100.0
 
+    def _safe(x, default=0.0):
+        v = _val(x, default)
+        return float(v) if _is_finite(v) else float(default)
+
     try:
         if label == "CHP":
             ctrl = cp_or_branch.model._control_node
-            el_mw = abs(_val(getattr(ctrl, "el_mw", 0.0), 0.0))
-            heat_mw = abs(_val(getattr(ctrl, "heat_w", 0.0), 0.0)) / 1e6
+            el_mw = abs(_safe(getattr(ctrl, "el_mw", 0.0)))
+            heat_mw = abs(_safe(getattr(ctrl, "heat_w", 0.0))) / 1e6
             return max((el_mw + heat_mw) / sn_mva, 1e-6)
 
         if label == "CHPHG":
             # CHPHG control node stores el_mw and heat_mw directly in MW.
             ctrl = cp_or_branch.model._control_node
-            el_mw = abs(_val(getattr(ctrl, "el_mw", 0.0), 0.0))
-            heat_mw = abs(_val(getattr(ctrl, "heat_mw", 0.0), 0.0))
+            el_mw = abs(_safe(getattr(ctrl, "el_mw", 0.0)))
+            heat_mw = abs(_safe(getattr(ctrl, "heat_mw", 0.0)))
             return max((el_mw + heat_mw) / sn_mva, 1e-6)
 
         if label == "PowerToHeat":
             ctrl = cp_or_branch.model._control_node
-            heat_w = _val(getattr(ctrl, "heat_w", None), None)
-            if heat_w is not None:
-                return max(abs(float(heat_w)) / (1e6 * sn_mva), 1e-6)
-            heat_mw = _val(getattr(cp_or_branch.model, "heat_energy_mw", 0.0), 0.0)
-            return max(abs(float(heat_mw)) / sn_mva, 1e-6)
+            heat_w_raw = _val(getattr(ctrl, "heat_w", None), None)
+            if _is_finite(heat_w_raw):
+                return max(abs(float(heat_w_raw)) / (1e6 * sn_mva), 1e-6)
+            heat_mw = abs(_safe(getattr(cp_or_branch.model, "heat_energy_mw", 0.0)))
+            return max(heat_mw / sn_mva, 1e-6)
 
         if label in ("PowerToHeatHG", "GasToHeatHG"):
             # 2-endpoint HG branches store heat_energy_mw on the model itself.
-            heat_mw = abs(_val(getattr(cp_or_branch.model, "heat_energy_mw", 0.0), 0.0))
+            heat_mw = abs(_safe(getattr(cp_or_branch.model, "heat_energy_mw", 0.0)))
             return max(heat_mw / sn_mva, 1e-6)
 
         if label == "GasToPower":
             # Use fixed rated capacity (el_mw), not the solved Pyomo Var (p_to_mw=0 when idle)
-            p_mw = abs(_val(getattr(cp_or_branch.model, "el_mw", 0.0), 0.0))
+            p_mw = abs(_safe(getattr(cp_or_branch.model, "el_mw", 0.0)))
             return max(p_mw / sn_mva, 1e-6)
 
         if label == "PowerToGas":
             # Use fixed rated capacity (gas_kgps), not the solved Pyomo Var (to_mass_flow=0 when idle)
-            m_dot = abs(_val(getattr(cp_or_branch.model, "gas_kgps", 0.0), 0.0))
+            m_dot = abs(_safe(getattr(cp_or_branch.model, "gas_kgps", 0.0)))
             hhv = _get_gas_hhv(monee_net) if monee_net is not None else 15.3
             # HHV is stored in kWh/kg; power [MW] = m_dot [kg/s] * HHV [kWh/kg] * 3.6 [MJ/kWh]
             return max((m_dot * hhv * 3.6) / sn_mva, 1e-6)
@@ -1022,8 +1054,16 @@ def _cp_throughput_proxy(cp_or_branch, label: str, monee_net=None) -> float:
 
 
 def _stress_from_ptdf(ptdf: np.ndarray, margins: np.ndarray, cfg: CPMetricConfig):
+    ptdf = np.asarray(ptdf, dtype=float)
+    margins = np.asarray(margins, dtype=float)
     denom = margins + cfg.EPS_MARGIN
-    s = np.abs(ptdf) / denom
+    with np.errstate(invalid="ignore", divide="ignore"):
+        s = np.abs(ptdf) / denom
+    # Drop NaN / ±inf samples instead of letting them poison the aggregate.
+    # NaN typically signals an ill-conditioned PTDF (singular Laplacian, NaN
+    # in the susceptance matrix, etc.) — better to score the well-defined
+    # branches than to return NaN for the whole component.
+    s = s[np.isfinite(s)]
     s = np.clip(s, 0.0, cfg.CLIP_STRESS)
     if s.size == 0:
         return 0.0, 0.0, 0.0
@@ -2143,6 +2183,31 @@ def mes_all_components_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig())
         df_all["stress_topo_factor"] = 1.0
         df_all["stress_score"] = df_all["score"]
         print(f"[warn] stress topology failed: {e}")
+
+    # Diagnostic: surface any non-finite values still present in metric columns
+    # so the caller can trace them back to the originating component (otherwise
+    # they propagate silently to ranks / Spearman / NDCG and bomb downstream).
+    metric_cols = [
+        "score", "total_stress", "throughput", "topo_factor", "topo_bc",
+        "stress_bc", "stress_score", "local_score", "self_score",
+        "katz_score", "vitality_score", "loading", "n_critical_nbrs",
+        "carrier_coupling",
+    ]
+    bad_mask = df_all[[c for c in metric_cols if c in df_all.columns]].apply(
+        lambda s: ~np.isfinite(s.astype(float)), axis=0
+    ).any(axis=1)
+    if bad_mask.any():
+        bad_rows = df_all.loc[bad_mask, ["cp_id", "cp_type"] + [c for c in metric_cols if c in df_all.columns]]
+        per_col_bad = {
+            c: int((~np.isfinite(df_all[c].astype(float))).sum())
+            for c in metric_cols if c in df_all.columns
+        }
+        per_col_bad = {c: n for c, n in per_col_bad.items() if n > 0}
+        print(
+            f"[warn] mes_all_components_metric: {int(bad_mask.sum())}/{len(df_all)} "
+            f"rows contain non-finite metric values. Per-column NaN/inf counts: {per_col_bad}"
+        )
+        print(f"[warn] first few offending rows:\n{bad_rows.head(8).to_string(index=False)}")
 
     if cfg.RETURN_DEBUG:
         return df_all, df_debug

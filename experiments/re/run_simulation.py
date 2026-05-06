@@ -110,10 +110,11 @@ EXPERIMENTS = list(ALL_GRIDS.keys())
 def build_network_and_timeseries(grid_name: str):
     """Construct the named test grid and its demand profiles."""
     create_fn, timeseries_fn = ALL_GRIDS[grid_name]
-    net = create_fn()
+    container = create_fn()
+    net = container.network
     net.apply_formulation(MISOCP_NETWORK_FORMULATION)
     td = timeseries_fn(net, n_steps=TIME_STEPS, seed=SEED)
-    return net, td
+    return container, td
 
 
 # ── Per-experiment output path ────────────────────────────────────────────────
@@ -165,7 +166,8 @@ def run_experiment(grid_name: str, shard: int = 0, n_shards: int = 1):
     log.info("─" * 60)
 
     # ── Network + timeseries ──────────────────────────────────────────────────
-    net, td = build_network_and_timeseries(grid_name)
+    container, td = build_network_and_timeseries(grid_name)
+    net = container.network
     if not is_shard or shard == 1:
         # Network is identical across shards; only one writer needed.
         with (out_dir / "network.p").open("wb") as fp:
@@ -251,6 +253,9 @@ def run_experiment(grid_name: str, shard: int = 0, n_shards: int = 1):
             id=run_id,
             registry=registry,
             scenario=scenario,
+            ext_grid_el_bounds=container.ext_grid_el_bounds,
+            ext_grid_gas_bounds=container.ext_grid_gas_bounds,
+            ext_grid_heat_bounds=container.ext_grid_heat_bounds,
         )
         return carrier_sums  # shape (3,): [power, heat, gas]
 

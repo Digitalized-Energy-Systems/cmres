@@ -25,6 +25,8 @@ Coupling point parameters:
   - P2H:  η    = 0.95               (heat pump / resistance heater)
 """
 
+from dataclasses import dataclass
+
 import monee.model as mm
 import monee.problem as mp
 import numpy as np
@@ -42,6 +44,16 @@ from monee.model.formulation import (
 from monee.network import (
     generate_supply_return_mes_based_on_power_net,
 )
+
+
+@dataclass
+class MESContainer:
+    """A network bundled with the ext-grid bounds the solver should use."""
+
+    network: mm.Network
+    ext_grid_el_bounds: tuple = (-0.05, 0.05)
+    ext_grid_gas_bounds: tuple = (-0.006, 0.006)
+    ext_grid_heat_bounds: tuple = (0.0, 6.0)
 
 # =============================================================================
 # Helpers
@@ -155,7 +167,13 @@ def create_large_lv_simbench(density, central=False):
         )
         mes.apply_formulation(MISOCP_NETWORK_FORMULATION)
         mes.apply_formulation(make_mccormick_dhs_formulation(num_partitions=16))
-        return mes
+
+        return MESContainer(
+            network=mes,
+            ext_grid_el_bounds=(-0.05, 0.05),
+            ext_grid_gas_bounds=(-0.006, 0.006),
+            ext_grid_heat_bounds=(-6, 6),
+        )
     return create
 
 def create_large_lv_simbench_ts(
@@ -225,14 +243,19 @@ def print_demands(net: mm.Network) -> None:
     print(f"\n[grand total]  {grand:.4f} MW")
 
 
-def solve(network):
+def solve(
+    network,
+    ext_grid_el_bounds=(-0.25, 0.25),
+    ext_grid_gas_bounds=(-1.5, 1.5),
+    ext_grid_heat_bounds=(-100, 100),
+):
     optimization_problem = mp.create_min_load_shedding_problem(
         bounds_el=(0.9, 1.1),
         bounds_gas=(0.9, 1.1),
         bounds_heat=(0.7, 1.3),
-        ext_grid_el_bounds=(-0.25, 0.25),
-        ext_grid_gas_bounds=(-1.5, 1.5),
-        ext_grid_heat_bounds=(-100, 100),
+        ext_grid_el_bounds=ext_grid_el_bounds,
+        ext_grid_gas_bounds=ext_grid_gas_bounds,
+        ext_grid_heat_bounds=ext_grid_heat_bounds,
         include_ext_grids=True,
         check_vm=True,
         check_pressure=True,
@@ -254,9 +277,15 @@ if __name__ == "__main__":
 
     print("URBAN")
     print("-------")
-    net = create_large_lv_simbench(0.5)()
+    container = create_large_lv_simbench(0.5)()
+    net = container.network
     print_demands(net)
-    res = solve(net)
+    res = solve(
+        net,
+        ext_grid_el_bounds=container.ext_grid_el_bounds,
+        ext_grid_gas_bounds=container.ext_grid_gas_bounds,
+        ext_grid_heat_bounds=container.ext_grid_heat_bounds,
+    )
     print(res.summary())
 
     # print("Industrial")
