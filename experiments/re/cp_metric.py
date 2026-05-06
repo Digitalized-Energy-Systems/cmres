@@ -70,9 +70,25 @@ class CPMetricConfig:
 
 DEFAULT_FAIL_PROB = {
     mm.CHP: 0.1,
+    mm.CHPHG: 0.1,
     mm.PowerToHeat: 0.1,
+    mm.PowerToHeatHG: 0.1,
+    mm.GasToHeatHG: 0.1,
     mm.PowerToGas: 0.1,
     mm.GasToPower: 0.1,
+}
+
+# CP type labels — kept here so multiple call sites stay in sync. Compound CPs
+# instantiate a multi-grid control node + sub-children; branch CPs are
+# 2-endpoint multi-grid branches.
+COMPOUND_CP_LABELS = ("CHP", "CHPHG", "PowerToHeat")
+BRANCH_CP_LABELS = ("PowerToGas", "GasToPower", "PowerToHeatHG", "GasToHeatHG")
+ALL_CP_LABELS = COMPOUND_CP_LABELS + BRANCH_CP_LABELS
+
+_COMPOUND_CP_CLASSES = {
+    "CHP": mm.CHP,
+    "CHPHG": mm.CHPHG,
+    "PowerToHeat": mm.PowerToHeat,
 }
 
 
@@ -962,6 +978,13 @@ def _cp_throughput_proxy(cp_or_branch, label: str, monee_net=None) -> float:
             heat_mw = abs(_val(getattr(ctrl, "heat_w", 0.0), 0.0)) / 1e6
             return max((el_mw + heat_mw) / sn_mva, 1e-6)
 
+        if label == "CHPHG":
+            # CHPHG control node stores el_mw and heat_mw directly in MW.
+            ctrl = cp_or_branch.model._control_node
+            el_mw = abs(_val(getattr(ctrl, "el_mw", 0.0), 0.0))
+            heat_mw = abs(_val(getattr(ctrl, "heat_mw", 0.0), 0.0))
+            return max((el_mw + heat_mw) / sn_mva, 1e-6)
+
         if label == "PowerToHeat":
             ctrl = cp_or_branch.model._control_node
             heat_w = _val(getattr(ctrl, "heat_w", None), None)
@@ -969,6 +992,11 @@ def _cp_throughput_proxy(cp_or_branch, label: str, monee_net=None) -> float:
                 return max(abs(float(heat_w)) / (1e6 * sn_mva), 1e-6)
             heat_mw = _val(getattr(cp_or_branch.model, "heat_energy_mw", 0.0), 0.0)
             return max(abs(float(heat_mw)) / sn_mva, 1e-6)
+
+        if label in ("PowerToHeatHG", "GasToHeatHG"):
+            # 2-endpoint HG branches store heat_energy_mw on the model itself.
+            heat_mw = abs(_val(getattr(cp_or_branch.model, "heat_energy_mw", 0.0), 0.0))
+            return max(heat_mw / sn_mva, 1e-6)
 
         if label == "GasToPower":
             # Use fixed rated capacity (el_mw), not the solved Pyomo Var (p_to_mw=0 when idle)
@@ -1382,7 +1410,11 @@ def mes_cp_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig()):
     # ------------------------
     # Compound CPs
     # ------------------------
-    for cp_type, label in [(mm.CHP, "CHP"), (mm.PowerToHeat, "PowerToHeat")]:
+    for cp_type, label in [
+        (mm.CHP, "CHP"),
+        (mm.CHPHG, "CHPHG"),
+        (mm.PowerToHeat, "PowerToHeat"),
+    ]:
         for cp in monee_net.compounds_by_type(cp_type):
             p_fail = float(fail_prob.get(cp_type, 0.1))
             connected = _compound_connected_nodes(cp)
@@ -1474,6 +1506,8 @@ def mes_cp_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig()):
     for cp_type, label in [
         (mm.PowerToGas, "PowerToGas"),
         (mm.GasToPower, "GasToPower"),
+        (mm.PowerToHeatHG, "PowerToHeatHG"),
+        (mm.GasToHeatHG, "GasToHeatHG"),
     ]:
         for br in monee_net.branches_by_type(cp_type):
             if not br.active:
@@ -1683,7 +1717,7 @@ def mes_all_components_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig())
 
     # CP branch ids to skip (already covered above)
     cp_branch_ids = set()
-    for cp_type in (mm.GasToPower, mm.PowerToGas):
+    for cp_type in (mm.GasToPower, mm.PowerToGas, mm.PowerToHeatHG, mm.GasToHeatHG):
         for br in monee_net.branches_by_type(cp_type):
             cp_branch_ids.add(br.id)
 
@@ -1879,8 +1913,8 @@ def mes_all_components_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig())
         if not nids:
             cp_type = row.get("cp_type", "")
             cp_id = row.get("cp_id")
-            if cp_type in ("CHP", "PowerToHeat"):
-                cp_cls = mm.CHP if cp_type == "CHP" else mm.PowerToHeat
+            cp_cls = _COMPOUND_CP_CLASSES.get(cp_type)
+            if cp_cls is not None:
                 for cp in monee_net.compounds_by_type(cp_cls):
                     if cp.id == cp_id:
                         nids = list(cp.connected_to.values())
@@ -1901,12 +1935,14 @@ def mes_all_components_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig())
     def _carrier_coupling(row):
         """Number of distinct energy carriers this component connects (1–3)."""
         cp_type = row.get("cp_type", "")
-        if cp_type in ("CHP",):
-            return 2.0  # electricity + heat
-        if cp_type in ("PowerToHeat",):
-            return 2.0  # electricity + heat
+        if cp_type in ("CHP", "CHPHG"):
+            return 2.0  # power + heat (matches existing CHP convention)
+        if cp_type in ("PowerToHeat", "PowerToHeatHG"):
+            return 2.0  # power + heat
+        if cp_type == "GasToHeatHG":
+            return 2.0  # gas + heat
         if cp_type in ("GasToPower", "PowerToGas"):
-            return 2.0  # gas + electricity
+            return 2.0  # gas + power
         # Single-carrier branches
         return 1.0
 
@@ -1919,7 +1955,7 @@ def mes_all_components_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig())
         cp_id = row.get("cp_id")
         throughput = float(row.get("throughput", 1.0))
 
-        if cp_type in ("CHP", "PowerToHeat", "GasToPower", "PowerToGas"):
+        if cp_type in ALL_CP_LABELS:
             return throughput  # rated-capacity proxy; no global state needed
 
         try:
@@ -1983,8 +2019,8 @@ def mes_all_components_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig())
         cp_type = row.get("cp_type", "")
         cp_id = row.get("cp_id")
 
-        if cp_type in ("CHP", "PowerToHeat"):
-            cp_cls = mm.CHP if cp_type == "CHP" else mm.PowerToHeat
+        cp_cls = _COMPOUND_CP_CLASSES.get(cp_type)
+        if cp_cls is not None:
             for cp in monee_net.compounds_by_type(cp_cls):
                 if cp.id == cp_id:
                     vals = [katz_individual.get(nid, 0.0)
@@ -2034,8 +2070,8 @@ def mes_all_components_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig())
         cp_type = row.get("cp_type", "")
         cp_id = row.get("cp_id")
 
-        if cp_type in ("CHP", "PowerToHeat"):
-            cp_cls = mm.CHP if cp_type == "CHP" else mm.PowerToHeat
+        cp_cls = _COMPOUND_CP_CLASSES.get(cp_type)
+        if cp_cls is not None:
             for cp in monee_net.compounds_by_type(cp_cls):
                 if cp.id == cp_id:
                     vals = [vitality_individual.get(nid, 0.0)
@@ -2071,8 +2107,8 @@ def mes_all_components_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig())
             cp_type = row.get("cp_type", "")
             cp_id = row.get("cp_id")
 
-            if cp_type in ("CHP", "PowerToHeat"):
-                cp_cls = mm.CHP if cp_type == "CHP" else mm.PowerToHeat
+            cp_cls = _COMPOUND_CP_CLASSES.get(cp_type)
+            if cp_cls is not None:
                 for cp in monee_net.compounds_by_type(cp_cls):
                     if cp.id == cp_id:
                         return float(_group_bc(_G_stress, cp, weight="stress_weight"))

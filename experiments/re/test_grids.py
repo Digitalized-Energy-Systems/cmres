@@ -40,7 +40,6 @@ from monee.model.formulation import (
     make_mccormick_dhs_formulation,
 )
 from monee.network import (
-    create_urban_district_net,
     generate_supply_return_mes_based_on_power_net,
 )
 
@@ -142,14 +141,14 @@ def make_regional_mes_timeseries(
 # Convenience registry
 # =============================================================================
 
-def create_large_lv_simbench(density):
+def create_large_lv_simbench(density, central=False):
     def create():
         net = simbench.get_simbench_net("1-LV-rural3--1-no_sw")
         mn = from_pandapower_net(net)
         mes = generate_supply_return_mes_based_on_power_net(
             mn,
             coupling_density=density,
-            centralized=False,
+            centralized=central,
             couplings=("chp", "p2g", "p2h"),
             coupling_kwargs={"seed": 1, "use_hg_variants": True},
             heat_kwargs={"node_based_heat_loads": True},
@@ -165,9 +164,12 @@ def create_large_lv_simbench_ts(
     return TimeseriesData()
 
 ALL_GRIDS = {
+    "simbench_lv_no": (create_large_lv_simbench(0), create_large_lv_simbench_ts),
+    "simbench_lv_low": (create_large_lv_simbench(0.25), create_large_lv_simbench_ts),
     "simbench_lv": (create_large_lv_simbench(0.5), create_large_lv_simbench_ts),
-    "simbench_lv_low": (create_large_lv_simbench(0.1), create_large_lv_simbench_ts),
-    "simbench_lv_high": (create_large_lv_simbench(0.9), create_large_lv_simbench_ts),
+    "simbench_lv_centralized": (create_large_lv_simbench(0.5, centralized=True), create_large_lv_simbench_ts),
+    "simbench_lv_high": (create_large_lv_simbench(0.75), create_large_lv_simbench_ts),
+    "simbench_lv_max": (create_large_lv_simbench(1), create_large_lv_simbench_ts),
     # "large_urban_balanced": (create_resilient_urban_mes_net, create_balanced_urban_mes_timeseries),
     # "urban_district": (create_urban_district_net, make_urban_district_timeseries),
     # "industrial_hub": (create_industrial_hub_net, make_industrial_hub_timeseries),

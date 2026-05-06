@@ -17,7 +17,7 @@ import networkx as nx
 sys.path.insert(0, str(Path(__file__).parent))
 from cp_metric import mes_all_components_metric, CPMetricConfig
 
-INPUT = "/home/rschrage/experiments/0503/res"
+INPUT = "/home/rschrage/experiments/0506/res"
 OUTPUT = "data/out"
 SMALL_NUMBER = 0.00000000001
 
@@ -25,6 +25,7 @@ TYPE_TO_CARRIER = {
     "Junction": "heat/gas",
     "Bus": "electricity",
     "CHP": "multi",
+    "CHPHG": "multi",
     "GasPipe": "gas",
     "GenericPowerBranch": "electricity",
     "PowerLine": "electricity",
@@ -32,10 +33,15 @@ TYPE_TO_CARRIER = {
     "PowerToGas": "multi",
     "GasToPower": "multi",
     "PowerToHeat": "multi",
+    "PowerToHeatHG": "multi",
+    "GasToHeatHG": "multi",
     "WaterPipe": "heat",
     "PowerToHeatControlNode": "multi",
     "CHPControlNode": "multi",
+    "CHPHGControlNode": "multi",
+    "SubHG": "heat",
     "PowerLoad": "electricity",
+    "HeatLoad": "heat",
     "Sink": "gas",
     "Source": "gas",
     "ExtPowerGrid": "electricity",
@@ -47,12 +53,16 @@ TYPE_TO_CARRIER = {
 }
 
 def get_id_type(id_str: str):
-    if "CHP" in id_str or "PowerToHeat" in id_str:
-        return "compound"
-    if ".child." in id_str:
-        return "child"
+    # Branches first: their id is rendered as a tuple "(from, to, key)" so the
+    # whole string ends with ")". Must precede the CHP / PowerToHeat substring
+    # check because HG-variant branches (PowerToHeatHG, GasToHeatHG) contain
+    # "PowerToHeat" / "Heat" in their class repr.
     if id_str.endswith(")"):
         return "branch"
+    if ".child." in id_str:
+        return "child"
+    if "CHP" in id_str or "PowerToHeat" in id_str:
+        return "compound"
     return "node"
 
 
@@ -485,7 +495,11 @@ def resilience_per_scenario(perf_df: pandas.DataFrame, folder_id):
 TYPE_SPECIALS_CN = {
     "branches": ["GenericPowerBranch", "WaterPipe", "GasPipe"],
     "nodes": ["PowerGenerator", "Source", "HeatExchanger"],
-    "CPs": ["PowerToHeat", "CHP", "PowerToGas"],
+    "CPs": [
+        "PowerToHeat", "PowerToHeatHG", "GasToHeatHG",
+        "CHP", "CHPHG",
+        "PowerToGas", "GasToPower",
+    ],
     "power lines": ["GenericPowerBranch"],
     "gas pipes": ["GasPipe"],
     "water pipes": ["WaterPipe"],
@@ -851,9 +865,13 @@ def _build_branch_lookup(impact_ids):
     return branch_lookup
 
 
+_COMPOUND_CP_TYPES = ("CHP", "CHPHG", "PowerToHeat")
+_NON_CP_BRANCH_TYPES = ("PowerLine", "GasPipe", "WaterPipe", "HeatExchanger")
+
+
 def _match_impact_id(cp_id, cp_type, impact_ids, branch_lookup=None):
     """Find the impact_df id string for a given metric entry."""
-    if cp_type in ("CHP", "PowerToHeat"):
+    if cp_type in _COMPOUND_CP_TYPES:
         candidate = f"compound:{cp_id}"
         return candidate if candidate in impact_ids else None
 
@@ -861,7 +879,7 @@ def _match_impact_id(cp_id, cp_type, impact_ids, branch_lookup=None):
         branch_lookup = _build_branch_lookup(impact_ids)
 
     # Non-CP branches: cp_id is already str(edge_tuple) e.g. "(10, 4, 0)"
-    if cp_type in ("PowerLine", "GasPipe", "WaterPipe", "HeatExchanger"):
+    if cp_type in _NON_CP_BRANCH_TYPES:
         candidate = f"branch:{cp_id}"
         if candidate in impact_ids:
             return candidate
@@ -871,7 +889,8 @@ def _match_impact_id(cp_id, cp_type, impact_ids, branch_lookup=None):
             return branch_lookup.get((parts[0], parts[1]))
         return None
 
-    # branch CPs (GasToPower, PowerToGas): cp_id = "from→to"
+    # Branch CPs (GasToPower, PowerToGas, PowerToHeatHG, GasToHeatHG):
+    # cp_id is rendered as "from→to".
     try:
         from_id, to_id = str(cp_id).split("→")
         from_id, to_id = from_id.strip(), to_id.strip()
@@ -1383,6 +1402,75 @@ def cp_metric_vs_actual_impact(monee_net, impact_df_nt, network_type):
     return df
 
 
+def pooled_resilience_per_scenario(perf_df: pandas.DataFrame, output_dir: str):
+    """Pooled performance loss per carrier across all scenarios / network types.
+
+    One figure showing the mean per-carrier performance loss for every scenario
+    (= folder = grid) found in *perf_df*, grouped on the x-axis by network type.
+    Mirrors the per-network ``resilience_per_scenario`` aggregation but
+    consolidates everything into a single output.
+    """
+    if perf_df.empty:
+        print("Pooled resilience plot: empty perf_df — skipping.")
+        return
+
+    pooled = (
+        perf_df.groupby(["network_type", "experiment", "id"])[["0", "1", "2"]]
+        .sum()
+        .reset_index()
+        .groupby(["network_type", "experiment"])
+        .mean()
+        .reset_index()
+        .melt(
+            id_vars=["network_type", "experiment"],
+            value_vars=["0", "1", "2"],
+            var_name="carrier",
+            value_name="resilience_mean",
+        )
+    )
+    pooled["experiment"] = pooled["experiment"].apply(
+        lambda v: v.split("/")[-1].split("-", 1)[1]
+    )
+    pooled["carrier"] = pooled["carrier"].map(CARRIER_REPLACE_MAP)
+    pooled["scenario"] = pooled["network_type"].astype(str) + " / " + pooled["experiment"].astype(str)
+    pooled = pooled.sort_values(["network_type", "experiment", "carrier"]).reset_index(drop=True)
+
+    fig = eval.create_bar(
+        pooled,
+        x_label="scenario",
+        y_label="resilience_mean",
+        color="carrier",
+        color_discrete_map=eval.NETWORK_COLOR_MAP,
+        pattern_shape_map=eval.NETWORK_PATTERN_MAP,
+        legend_text="carrier",
+        template="plotly_white+publish3",
+        yaxis_title="mean performance loss in MW",
+        xaxis_title="scenario (network_type / grid)",
+        title="Pooled performance drop by scenario, by carrier",
+        barmode="group",
+        width=max(800, 80 * len(pooled["scenario"].unique())),
+        height=480,
+    )
+
+    Path(output_dir).mkdir(exist_ok=True, parents=True)
+    eval.write_all_in_one(
+        [fig],
+        "Figure",
+        Path("."),
+        output_dir + "/resilience_per_carrier_per_scenario_pooled.html",
+        titles=[
+            f"Pooled performance drop by scenario "
+            f"(n_scenarios={pooled['scenario'].nunique()}, "
+            f"n_network_types={pooled['network_type'].nunique()})"
+        ],
+    )
+    print(
+        f"Pooled resilience plot: "
+        f"{pooled['scenario'].nunique()} scenarios across "
+        f"{pooled['network_type'].nunique()} network types → {output_dir}"
+    )
+
+
 def pooled_metric_comparison(pooled_df, output_dir):
     """Run metric comparison figures on data pooled across all network types.
 
@@ -1707,11 +1795,13 @@ def evaluate(folder_id):
         if net_df is not None and len(net_df) > 0:
             per_network_dfs.append(net_df)
 
+    pooled_resilience_per_scenario(perf_df, OUTPUT + "/pooled")
+
     if len(per_network_dfs) > 1:
         pooled_df = pandas.concat(per_network_dfs, ignore_index=True)
         pooled_metric_comparison(pooled_df, OUTPUT + "/pooled")
     elif len(per_network_dfs) == 1:
-        print("Only one network type found — skipping pooled analysis.")
+        print("Only one network type found — skipping pooled metric analysis.")
 
 
 def main():
