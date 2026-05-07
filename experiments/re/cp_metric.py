@@ -89,6 +89,18 @@ class CPMetricConfig:
     HEAT_REMOTENESS_ALPHA: float = 1.0
     HEAT_PIPE_U_W_M2_K: float = 1.5        # external heat-transfer coeff for DH pipe
 
+    # ── CP input-adequacy multiplier ─────────────────────────────────────
+    # A CP only delivers into its output sector(s) when its input sector can
+    # supply it. We extend CP criticality with a structural conditional term:
+    #   score(c) ← score(c) × P(input adequate at c)
+    # where P(input adequate) is computed analytically from base failure
+    # probabilities along the most-likely path from c's input node to the
+    # nearest input-sector slack (ExtPowerGrid for power inputs, ExtHydrGrid
+    # for gas inputs). Edge weights are −log(1 − p_fail), so the shortest-path
+    # distance d gives P = exp(−d). Exact for radial input grids; a
+    # pessimistic lower bound on adequacy when meshed.
+    CP_INPUT_ADEQUACY_ENABLE: bool = True
+
     # Diagnostics
     RETURN_DEBUG: bool = True
 
@@ -114,6 +126,19 @@ _COMPOUND_CP_CLASSES = {
     "CHP": mm.CHP,
     "CHPHG": mm.CHPHG,
     "PowerToHeat": mm.PowerToHeat,
+}
+
+# Input-side carrier per CP type. Used by the analytical input-adequacy
+# multiplier: the CP's criticality is conditioned on its input sector being
+# able to feed it.
+CP_INPUT_CARRIER = {
+    "CHP": "gas",
+    "CHPHG": "gas",
+    "GasToPower": "gas",
+    "GasToHeatHG": "gas",
+    "PowerToGas": "power",
+    "PowerToHeat": "power",
+    "PowerToHeatHG": "power",
 }
 
 
@@ -1797,6 +1822,157 @@ def _carrier_nodes_for_branch(monee_net, branch):
     return carrier_nodes
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# CP input-adequacy: structural P(input sector can feed this CP)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _carrier_input_adequacy_graph(monee_net, carrier: str):
+    """Build a per-carrier graph used for analytical CP input-adequacy.
+
+    Edge weights are −log(1 − p_fail(branch)) using the same
+    ``DEFAULT_BRANCH_FAIL_PROB`` table the failure model uses, so the
+    shortest-path distance d from any slack to a given node satisfies
+    P(path-available) = exp(−d). Nodes are the carrier's grid nodes; the
+    second return value is the set of slack node ids on that grid.
+
+    The map ``"power" → Bus``, ``"gas"|"heat" → Junction``, ``"heat" → grid name "water"``
+    is enforced here so callers don't have to know monee internals.
+    """
+    G = nx.Graph()
+    grid_name = {"power": "power", "gas": "gas", "heat": "water"}.get(carrier)
+    if grid_name is None:
+        return G, set()
+
+    if carrier == "power":
+        node_iter = monee_net.nodes_by_type(mm.Bus)
+        slack_iter = monee_net.childs_by_type(mm.ExtPowerGrid)
+    else:
+        node_iter = monee_net.nodes_by_type(mm.Junction)
+        slack_iter = monee_net.childs_by_type(mm.ExtHydrGrid)
+
+    valid = set()
+    for n in node_iter:
+        grid = getattr(n, "grid", None)
+        if grid is not None and getattr(grid, "name", None) == grid_name:
+            G.add_node(n.id)
+            valid.add(n.id)
+
+    for b in monee_net.branches:
+        if not b.active:
+            continue
+        bm = b.model
+        if carrier == "power":
+            if not isinstance(bm, mm.GenericPowerBranch):
+                continue
+        elif carrier == "gas":
+            if not isinstance(bm, mm.GasPipe):
+                continue
+        else:  # heat (water)
+            if not isinstance(bm, (mm.WaterPipe, mm.HeatExchanger)):
+                continue
+        if b.from_node_id not in valid or b.to_node_id not in valid:
+            continue
+        p_fail = float(DEFAULT_BRANCH_FAIL_PROB.get(type(bm), 0.05))
+        if p_fail >= 1.0:
+            weight = float("inf")
+        elif p_fail <= 0.0:
+            weight = 0.0
+        else:
+            weight = -math.log(1.0 - p_fail)
+        if G.has_edge(b.from_node_id, b.to_node_id):
+            # Parallel branches → keep the lower-failure-probability edge.
+            if weight < G[b.from_node_id][b.to_node_id]["weight"]:
+                G[b.from_node_id][b.to_node_id]["weight"] = weight
+        else:
+            G.add_edge(b.from_node_id, b.to_node_id, weight=weight)
+
+    slack_nodes = set()
+    for c in slack_iter:
+        grid = getattr(c, "grid", None)
+        if grid is not None and getattr(grid, "name", None) == grid_name:
+            slack_nodes.add(c.node_id)
+
+    return G, slack_nodes
+
+
+def _build_input_adequacy_cache(monee_net, cfg: CPMetricConfig):
+    """Pre-compute, for each carrier, the per-node adequacy probability
+    ``P(adequate at v) = exp(−min-cost path from any slack to v)``.
+
+    Returns ``{carrier → {node_id → P}}`` plus a debug dict.
+    """
+    cache: Dict[str, Dict[int, float]] = {}
+    debug: Dict[str, Dict[str, float]] = {}
+    for carrier in ("power", "gas", "heat"):
+        G, slacks = _carrier_input_adequacy_graph(monee_net, carrier)
+        if not G.number_of_nodes() or not slacks:
+            cache[carrier] = {}
+            debug[carrier] = {"n_nodes": G.number_of_nodes(),
+                              "n_slacks": len(slacks)}
+            continue
+        # Slacks themselves are P=1 (not failed; even if they were, they're
+        # the boundary condition by definition). Multi-source Dijkstra gives
+        # min-cost path from any slack to every reachable node.
+        try:
+            dists = nx.multi_source_dijkstra_path_length(
+                G, sources=list(slacks), weight="weight"
+            )
+        except Exception:
+            dists = {}
+        adequacy = {nid: math.exp(-float(d)) for nid, d in dists.items()}
+        # Unreachable nodes stay absent → caller maps them to 0.0.
+        cache[carrier] = adequacy
+        if adequacy:
+            vals = list(adequacy.values())
+            debug[carrier] = {
+                "n_nodes": G.number_of_nodes(),
+                "n_slacks": len(slacks),
+                "n_reachable": len(adequacy),
+                "P_min": float(min(vals)),
+                "P_med": float(np.median(vals)),
+                "P_max": float(max(vals)),
+            }
+        else:
+            debug[carrier] = {"n_nodes": G.number_of_nodes(),
+                              "n_slacks": len(slacks),
+                              "n_reachable": 0}
+    return cache, debug
+
+
+def _cp_input_adequacy(
+    cp,
+    cp_label: str,
+    monee_net,
+    adequacy_cache: Dict[str, Dict[int, float]],
+    cfg: CPMetricConfig,
+) -> float:
+    """P(input adequate) for one CP, looked up from the cached per-node table.
+
+    Returns 1.0 (= no down-weighting) when the input carrier is unknown, the
+    cache is empty for that carrier, or the input node sits at a slack.
+    Returns 0.0 when the CP's input node exists but is unreachable from any
+    slack — i.e. the input sector simply cannot feed it.
+    """
+    if not cfg.CP_INPUT_ADEQUACY_ENABLE:
+        return 1.0
+    in_carrier = CP_INPUT_CARRIER.get(cp_label)
+    if in_carrier is None:
+        return 1.0
+    if cp_label in COMPOUND_CP_LABELS:
+        nodes = _compound_connected_nodes(cp)
+    else:
+        nodes = _carrier_nodes_for_branch(monee_net, cp)
+    in_node = nodes.get(in_carrier)
+    if in_node is None:
+        return 1.0
+    table = adequacy_cache.get(in_carrier, {})
+    if not table:
+        return 1.0
+    # Reachable but possibly low; missing → 0 (unreachable from any slack).
+    return float(table.get(in_node, 0.0))
+
+
 # =============================================================================
 # ROW helper
 # =============================================================================
@@ -1813,6 +1989,7 @@ def _row_from_detail(
     score,
     reliable,
     detail,
+    input_adequacy: float = 1.0,
 ):
     row = dict(
         cp_id=cp_id,
@@ -1824,6 +2001,7 @@ def _row_from_detail(
         total_stress=float(total_stress),
         score=float(score),
         reliable=bool(reliable),
+        input_adequacy=float(input_adequacy),
     )
     for c in ("power", "gas", "heat"):
         d = detail.get(c, {})
@@ -1848,6 +2026,15 @@ def mes_cp_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig()):
 
     # PTDF contexts
     ctx = CarrierPTDFContext(cfg)
+
+    # Per-node analytical input-adequacy (P(input sector can feed me)) per
+    # carrier. Cached once; CPs look up their input node when scoring.
+    if cfg.CP_INPUT_ADEQUACY_ENABLE:
+        input_adequacy_cache, input_adequacy_dbg = _build_input_adequacy_cache(
+            monee_net, cfg
+        )
+    else:
+        input_adequacy_cache, input_adequacy_dbg = {}, {}
 
     rows = []
 
@@ -1928,7 +2115,10 @@ def mes_cp_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig()):
                 total_stress += cfg.W_HEAT * agg_s * rem
                 reliable_all = reliable_all and bool(ok)
 
-            score = throughput * total_stress * topo_factor
+            input_adequacy = _cp_input_adequacy(
+                cp, label, monee_net, input_adequacy_cache, cfg
+            )
+            score = throughput * total_stress * topo_factor * input_adequacy
 
             rows.append(
                 _row_from_detail(
@@ -1942,6 +2132,7 @@ def mes_cp_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig()):
                     score=score,
                     reliable=reliable_all,
                     detail=carrier_detail,
+                    input_adequacy=input_adequacy,
                 )
             )
 
@@ -2030,7 +2221,10 @@ def mes_cp_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig()):
                 total_stress += cfg.W_HEAT * agg_s * rem
                 reliable_all = reliable_all and bool(ok)
 
-            score = throughput * total_stress * topo_factor
+            input_adequacy = _cp_input_adequacy(
+                br, label, monee_net, input_adequacy_cache, cfg
+            )
+            score = throughput * total_stress * topo_factor * input_adequacy
 
             rows.append(
                 _row_from_detail(
@@ -2044,6 +2238,7 @@ def mes_cp_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig()):
                     score=score,
                     reliable=reliable_all,
                     detail=carrier_detail,
+                    input_adequacy=input_adequacy,
                 )
             )
 
@@ -2064,6 +2259,8 @@ def mes_cp_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig()):
         d = ctx.debug.get(carrier, {})
         debug_rows.append({"carrier": carrier, **d})
     debug_rows.append({"carrier": "topology", **topo_dbg})
+    for carrier, d in input_adequacy_dbg.items():
+        debug_rows.append({"carrier": f"input_adequacy_{carrier}", **d})
 
     df_debug = pd.DataFrame(debug_rows)
     return df_scores, df_debug

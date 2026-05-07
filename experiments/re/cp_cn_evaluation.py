@@ -1009,6 +1009,9 @@ def cp_metric_vs_actual_impact(monee_net, impact_df_nt, network_type):
         if actual_total_val is None:
             continue
         score_dict = score_row._asdict()
+        # Default to 1.0 so non-CP rows (which don't have an input-adequacy
+        # gate) don't accidentally land at 0 and disappear from the comparison.
+        input_adequacy = float(score_dict.get("input_adequacy", 1.0) or 0.0)
         entry = {
             "cp_id": str(score_row.cp_id),
             "cp_type": score_row.cp_type,
@@ -1022,6 +1025,7 @@ def cp_metric_vs_actual_impact(monee_net, impact_df_nt, network_type):
             "self_score": score_dict.get("self_score", score_row.score),
             "katz_score": score_dict.get("katz_score", 0.0),
             "vitality_score": score_dict.get("vitality_score", 0.0),
+            "input_adequacy": input_adequacy,
             "actual_total": actual_total_val,
         }
         for metric_col, carrier_col in [
@@ -1635,15 +1639,17 @@ def _cp_only_metric_comparison_core(
     from plotly.subplots import make_subplots
 
     METRICS = [
-        ("predicted_score",  "PTDF stress + phys. BC"),
-        ("score_no_topo",    "PTDF stress only"),
-        ("score_topo_only",  "Phys. BC only"),
-        ("stress_bc",        "Stress BC only"),
-        ("local_score",      "1-hop local"),
-        ("self_score",       "0-hop self"),
-        ("katz_score",       "Katz BC only"),
-        ("vitality_score",   "Closeness vitality"),
-        ("actual_total",     "Actual (MC)"),
+        ("predicted_score",     "PTDF + BC + input-adequacy"),
+        ("score_no_adequacy",   "PTDF + BC (no input gate)"),
+        ("input_adequacy",      "Input adequacy alone"),
+        ("score_no_topo",       "PTDF stress only"),
+        ("score_topo_only",     "Phys. BC only"),
+        ("stress_bc",           "Stress BC only"),
+        ("local_score",         "1-hop local"),
+        ("self_score",          "0-hop self"),
+        ("katz_score",          "Katz BC only"),
+        ("vitality_score",      "Closeness vitality"),
+        ("actual_total",        "Actual (MC)"),
     ]
 
     df = df_all.copy()
@@ -1651,6 +1657,17 @@ def _cp_only_metric_comparison_core(
         df["score_no_topo"] = df["predicted_score"] / df["topo_factor"].replace(0, float("nan"))
     if "score_topo_only" not in df.columns:
         df["score_topo_only"] = df["topo_bc"]
+    # score_no_adequacy = the full CP score WITHOUT the input-adequacy gate,
+    # i.e. predicted_score / input_adequacy. Lets the heatmap / ρ-bar show how
+    # much the conditional gate is doing on top of the existing PTDF + BC.
+    if "score_no_adequacy" not in df.columns:
+        if "input_adequacy" in df.columns:
+            adq = df["input_adequacy"].where(df["input_adequacy"] > 0, float("nan"))
+            df["score_no_adequacy"] = df["predicted_score"] / adq
+        else:
+            df["score_no_adequacy"] = df["predicted_score"]
+    if "input_adequacy" not in df.columns:
+        df["input_adequacy"] = 1.0
 
     # 1) Restrict to coupling-point rows.
     df = df[df["cp_type"].astype(str).isin(CP_TYPE_SET)].reset_index(drop=True)
