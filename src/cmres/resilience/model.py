@@ -217,6 +217,11 @@ class SimpleResilienceModel(ResilienceModel):
         failures = []
         # Track components that already have an unresolved failure so that a
         # single component is not faulted twice before its repair time is set.
+        # Keyed by (kind, comp.id) — int comp.id spaces overlap across nodes,
+        # children and compounds (e.g. compound id 0..16 collides with child id
+        # 0..16 in the simbench grids), and a flat set of ints would silently
+        # skip a compound trigger whenever an earlier node or child with the
+        # same int id had already failed in this scenario.
         already_failed: set = set()
         # Fallback for the guaranteed-failure mechanism: (fail_prob, comp, time)
         best_candidate = None
@@ -225,7 +230,8 @@ class SimpleResilienceModel(ResilienceModel):
             time = i + self._incident_shift
 
             for node in net.nodes:
-                if not node.independent or node.id in already_failed:
+                key = ("node", node.id)
+                if not node.independent or key in already_failed:
                     continue
                 if use_scenario:
                     fail_prob, triggered = self._eval_failure_scenario(
@@ -236,14 +242,15 @@ class SimpleResilienceModel(ResilienceModel):
                     triggered = self._bernoulli(fail_prob)
                 if triggered:
                     failures.append(Failure(time, node, fail_prob, Effect.DEAD))
-                    already_failed.add(node.id)
+                    already_failed.add(key)
                 elif fail_prob > 0 and (
                     best_candidate is None or fail_prob > best_candidate[0]
                 ):
                     best_candidate = (fail_prob, node, time)
 
             for branch in net.branches:
-                if not branch.independent or branch.id in already_failed:
+                key = ("branch", branch.id)
+                if not branch.independent or key in already_failed:
                     continue
                 if use_scenario:
                     fail_prob, triggered = self._eval_failure_scenario(
@@ -254,14 +261,15 @@ class SimpleResilienceModel(ResilienceModel):
                     triggered = self._bernoulli(fail_prob)
                 if triggered:
                     failures.append(Failure(time, branch, fail_prob, Effect.DEAD))
-                    already_failed.add(branch.id)
+                    already_failed.add(key)
                 elif fail_prob > 0 and (
                     best_candidate is None or fail_prob > best_candidate[0]
                 ):
                     best_candidate = (fail_prob, branch, time)
 
             for child in net.childs:
-                if not child.independent or child.id in already_failed:
+                key = ("child", child.id)
+                if not child.independent or key in already_failed:
                     continue
                 if use_scenario:
                     fail_prob, triggered = self._eval_failure_scenario(
@@ -272,14 +280,15 @@ class SimpleResilienceModel(ResilienceModel):
                     triggered = self._bernoulli(fail_prob)
                 if triggered:
                     failures.append(Failure(time, child, fail_prob, Effect.DEAD))
-                    already_failed.add(child.id)
+                    already_failed.add(key)
                 elif fail_prob > 0 and (
                     best_candidate is None or fail_prob > best_candidate[0]
                 ):
                     best_candidate = (fail_prob, child, time)
 
             for compound in net.compounds:
-                if not compound.independent or compound.id in already_failed:
+                key = ("compound", compound.id)
+                if not compound.independent or key in already_failed:
                     continue
                 if use_scenario:
                     fail_prob, triggered = self._eval_failure_scenario(
@@ -290,7 +299,7 @@ class SimpleResilienceModel(ResilienceModel):
                     triggered = self._bernoulli(fail_prob)
                 if triggered:
                     failures.append(Failure(time, compound, fail_prob, Effect.DEAD))
-                    already_failed.add(compound.id)
+                    already_failed.add(key)
                 elif fail_prob > 0 and (
                     best_candidate is None or fail_prob > best_candidate[0]
                 ):

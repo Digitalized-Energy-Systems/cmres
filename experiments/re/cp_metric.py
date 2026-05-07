@@ -29,6 +29,15 @@ class CPMetricConfig:
     EPS_MARGIN: float = 1e-6  # numerical epsilon for margin division
     CLIP_STRESS: float = 1e6  # cap stress to avoid domination by a single edge
 
+    # Susceptance build (gas/heat): keep low-flow pipes in the Laplacian instead
+    # of dropping them at FLOW_MIN — dropping fragments the graph and produces
+    # spurious unreliability flags. The flow floor sets a small absolute m0
+    # (kg/s) below which susceptance is computed as if m0 = floor; the cap
+    # bounds any single edge's b at K × median(b_finite) to avoid one stiff
+    # edge dominating the conditioning of B.
+    SUSCEPTANCE_FLOW_FLOOR_KGPS: float = 1e-6
+    SUSCEPTANCE_B_RELATIVE_CAP: float = 100.0
+
     # Aggregation of stress over edges: agg = w_mean*mean + w_max*max
     AGG_MEAN_WEIGHT: float = 0.7
     AGG_MAX_WEIGHT: float = 0.3
@@ -62,6 +71,23 @@ class CPMetricConfig:
 
     # HX scaling relative to typical WaterPipe conductance
     HX_KAPPA: float = 10.0
+
+    # ── Heat / thermal-aware metric ──────────────────────────────────────
+    # (A) Replace pure-hydraulic margins with thermal margins:
+    #     m_min = q_downstream_demand / (cp · ΔT)  (mass flow needed to deliver
+    #     the downstream heat demand at a fixed supply-return spread).
+    #     thermal_margin = max(MIN_MARGIN, m_solved - m_min).
+    HEAT_THERMAL_MARGIN_ENABLE: bool = True
+    HEAT_DELTA_T_K: float = 30.0           # supply-return spread (K)
+    HEAT_CP_J_PER_KG_K: float = 4186.0     # specific heat of water
+
+    # (B) Slack-distance prefactor for heat: scales heat-stress contribution by
+    #     (1 + α · d_thermal) where d_thermal = Σ L·κ on the shortest path
+    #     (per-pipe thermal-loss factor) from the component to the nearest
+    #     heat injector (ExtHydrGrid + heat-supplying CPs).
+    HEAT_REMOTENESS_ENABLE: bool = True
+    HEAT_REMOTENESS_ALPHA: float = 1.0
+    HEAT_PIPE_U_W_M2_K: float = 1.5        # external heat-transfer coeff for DH pipe
 
     # Diagnostics
     RETURN_DEBUG: bool = True
@@ -341,8 +367,12 @@ def _power_operating_point(monee_net, bus_ids):
 
 def _distributed_balancing_vector_power(monee_net, bus_ids, id_to_local, s_local):
     """
-    +1 at source bus, distributed -1 across all ExtPowerGrid buses if present,
-    else distributed across all other buses.
+    +1 at source bus, distributed -1 across ExtPowerGrid buses.
+
+    Returns ``(dP_array, ok)``: ok is False when no ExtPowerGrid bus exists
+    (or only the source itself is a slack and thus excluded). Callers should
+    flag the resulting PTDF unreliable rather than fall back to spreading the
+    balance across non-slack buses, which has no physical analog.
     """
     bus_map = {n.id: n for n in monee_net.nodes_by_type(mm.Bus)}
 
@@ -353,21 +383,17 @@ def _distributed_balancing_vector_power(monee_net, bus_ids, id_to_local, s_local
 
     nb = len(bus_ids)
     dP = np.zeros(nb, dtype=float)
-    dP[s_local] += 1.0
 
-    if slack_locs:
-        bal = [i for i in slack_locs if i != s_local]
-    else:
-        bal = [i for i in range(nb) if i != s_local]
-
+    bal = [i for i in slack_locs if i != s_local]
     if not bal:
-        return jnp.array(dP)
+        return jnp.array(dP), False
 
+    dP[s_local] += 1.0
     w = np.ones(len(bal), dtype=float)
     w = w / w.sum()
     for bi, wi in zip(bal, w):
         dP[bi] -= wi
-    return jnp.array(dP)
+    return jnp.array(dP), True
 
 
 def ac_ptdf_distributed(theta, V, Ybus, branches, bus_types, dP, dQ=None):
@@ -590,9 +616,7 @@ def build_gas_susceptance(monee_net, cfg: CPMetricConfig):
         else 1.0
     )
 
-    B = np.zeros((n, n), dtype=float)
-    pipe_data = []
-    pipe_ids = []
+    raw_pipes: List[Tuple[int, int, float, int]] = []  # (fi, ti, b_raw, pipe_id)
 
     for pipe in monee_net.branches_by_type(mm.GasPipe):
         if not (pipe.active and int(_val(pipe.model.on_off, 1)) == 1):
@@ -603,11 +627,9 @@ def build_gas_susceptance(monee_net, cfg: CPMetricConfig):
             continue
 
         m0_raw = _val(pipe.model.mass_flow, 0.0)
-        if not _is_finite(m0_raw):
-            continue
-        m0 = abs(float(m0_raw))
-        if m0 < cfg.FLOW_MIN:
-            continue
+        m0 = abs(float(m0_raw)) if _is_finite(m0_raw) else 0.0
+        # Floor m0 to keep low-flow pipes in B; b will be capped post-hoc.
+        m0_eff = max(m0, cfg.SUSCEPTANCE_FLOW_FLOOR_KGPS)
 
         d_raw = _val(pipe.model.diameter_m, 0.0)
         L_raw = _val(pipe.model.length_m, 1.0)
@@ -615,16 +637,31 @@ def build_gas_susceptance(monee_net, cfg: CPMetricConfig):
             continue
 
         C2 = _calc_C_squared(float(d_raw), float(L_raw), t_k, z)
-        b = C2 / (2.0 * m0)
-        if not _is_finite(b):
+        b_raw = C2 / (2.0 * m0_eff)
+        if not _is_finite(b_raw) or b_raw <= 0:
             continue
+        raw_pipes.append((fi, ti, b_raw, pipe.id))
 
-        B[fi, fi] += b
-        B[ti, ti] += b
-        B[fi, ti] -= b
-        B[ti, fi] -= b
-        pipe_data.append((fi, ti, b))
-        pipe_ids.append(pipe.id)
+    B = np.zeros((n, n), dtype=float)
+    pipe_data: List[Tuple[int, int, float]] = []
+    pipe_ids: List[int] = []
+
+    if raw_pipes:
+        bs = np.array([p[2] for p in raw_pipes], dtype=float)
+        b_med = float(np.median(bs))
+        b_cap = (
+            cfg.SUSCEPTANCE_B_RELATIVE_CAP * b_med
+            if b_med > 0.0 and cfg.SUSCEPTANCE_B_RELATIVE_CAP > 0.0
+            else float("inf")
+        )
+        for fi, ti, b_raw, pid in raw_pipes:
+            b = min(b_raw, b_cap)
+            B[fi, fi] += b
+            B[ti, ti] += b
+            B[fi, ti] -= b
+            B[ti, fi] -= b
+            pipe_data.append((fi, ti, b))
+            pipe_ids.append(pid)
 
     return B, pipe_data, pipe_ids, junc_ids
 
@@ -645,20 +682,8 @@ def build_heat_susceptance(monee_net, cfg: CPMetricConfig):
     n = len(junc_ids)
     idx = {nid: i for i, nid in enumerate(junc_ids)}
 
-    B = np.zeros((n, n), dtype=float)
-    pipe_data = []
-    pipe_ids = []
+    raw_water: List[Tuple[int, int, float, int]] = []  # (fi, ti, b_raw, pipe_id)
 
-    def _add_edge(fi, ti, b):
-        B[fi, fi] += b
-        B[ti, ti] += b
-        B[fi, ti] -= b
-        B[ti, fi] -= b
-        pipe_data.append((fi, ti, b))
-
-    water_b_list = []
-
-    # WaterPipes
     for pipe in monee_net.branches_by_type(mm.WaterPipe):
         if not (pipe.active and int(_val(pipe.model.on_off, 1)) == 1):
             continue
@@ -672,30 +697,62 @@ def build_heat_susceptance(monee_net, cfg: CPMetricConfig):
             continue
 
         m0_raw = _val(pipe.model.mass_flow, 0.0)
-        if not _is_finite(m0_raw):
-            continue
-        m0 = abs(float(m0_raw))
-        if m0 < cfg.FLOW_MIN:
-            continue
+        m0 = abs(float(m0_raw)) if _is_finite(m0_raw) else 0.0
+        m0_eff = max(m0, cfg.SUSCEPTANCE_FLOW_FLOOR_KGPS)
 
-        b = 1.0 / (2.0 * Rm * m0)
-        if not _is_finite(b):
+        b_raw = 1.0 / (2.0 * Rm * m0_eff)
+        if not _is_finite(b_raw) or b_raw <= 0:
             continue
+        raw_water.append((fi, ti, b_raw, pipe.id))
+
+    # Cap WaterPipe b to bound conditioning.
+    if raw_water:
+        bs = np.array([p[2] for p in raw_water], dtype=float)
+        b_med_water = float(np.median(bs))
+        b_cap = (
+            cfg.SUSCEPTANCE_B_RELATIVE_CAP * b_med_water
+            if b_med_water > 0.0 and cfg.SUSCEPTANCE_B_RELATIVE_CAP > 0.0
+            else float("inf")
+        )
+    else:
+        b_med_water = 0.0
+        b_cap = float("inf")
+
+    B = np.zeros((n, n), dtype=float)
+    pipe_data: List[Tuple[int, int, float]] = []
+    pipe_ids: List[int] = []
+
+    def _add_edge(fi, ti, b):
+        B[fi, fi] += b
+        B[ti, ti] += b
+        B[fi, ti] -= b
+        B[ti, fi] -= b
+        pipe_data.append((fi, ti, b))
+
+    water_b_list: List[float] = []
+    for fi, ti, b_raw, pid in raw_water:
+        b = min(b_raw, b_cap)
         _add_edge(fi, ti, b)
         water_b_list.append(b)
-        pipe_ids.append(pipe.id)
+        pipe_ids.append(pid)
 
-    # HX conductance scaling: scale to median WaterPipe conductance.
-    # Guard: if median is zero (all pipes at flow floor) or no pipes exist,
-    # fall back to the fixed resistance constant.
+    # HX conductance scaling: scale to median (capped) WaterPipe conductance.
     if water_b_list:
         b_med = float(np.median(water_b_list))
         if b_med > 0.0:
             b_hx = cfg.HX_KAPPA * b_med
         else:
-            b_hx = 1.0 / (2.0 * _HX_RESISTANCE_FALLBACK * max(cfg.FLOW_MIN, 1e-6))
+            b_hx = 1.0 / (
+                2.0
+                * _HX_RESISTANCE_FALLBACK
+                * max(cfg.SUSCEPTANCE_FLOW_FLOOR_KGPS, 1e-9)
+            )
     else:
-        b_hx = 1.0 / (2.0 * _HX_RESISTANCE_FALLBACK * max(cfg.FLOW_MIN, 1e-6))
+        b_hx = 1.0 / (
+            2.0
+            * _HX_RESISTANCE_FALLBACK
+            * max(cfg.SUSCEPTANCE_FLOW_FLOOR_KGPS, 1e-9)
+        )
 
     # HeatExchanger branches (hydraulic coupling)
     for hx in monee_net.branches_by_type(mm.HeatExchanger):
@@ -709,6 +766,234 @@ def build_heat_susceptance(monee_net, cfg: CPMetricConfig):
         pipe_ids.append(hx.id)
 
     return B, pipe_data, pipe_ids, junc_ids
+
+
+# =============================================================================
+# HEAT: thermal-aware extensions (A: thermal margin, B: slack distance)
+# =============================================================================
+
+
+def _heat_injector_node_ids(monee_net) -> set:
+    """Heat-grid (water) junctions that act as heat sources.
+
+    Includes nodes with ExtHydrGrid attached on the water grid, and nodes where
+    a heat-supplying CP (CHP, CHPHG, PowerToHeat, PowerToHeatHG, GasToHeatHG)
+    is connected. These are treated as the boundary condition for thermal
+    distance / supply-temperature feasibility.
+    """
+    ids = set()
+    try:
+        for c in monee_net.childs_by_type(mm.ExtHydrGrid):
+            grid = getattr(c, "grid", None)
+            if grid is not None and getattr(grid, "name", None) == "water":
+                ids.add(c.node_id)
+    except Exception:
+        pass
+
+    for cp_type in (mm.CHP, mm.PowerToHeat):
+        try:
+            for cp in monee_net.compounds_by_type(cp_type):
+                connected = _compound_connected_nodes(cp)
+                if "heat" in connected:
+                    ids.add(connected["heat"])
+        except Exception:
+            pass
+
+    for cp_type in (mm.CHPHG, mm.PowerToHeatHG, mm.GasToHeatHG):
+        try:
+            for br in monee_net.branches_by_type(cp_type):
+                for nid in (br.from_node_id, br.to_node_id):
+                    try:
+                        n = monee_net.node_by_id(nid)
+                        grid = getattr(n, "grid", None)
+                        if grid is not None and getattr(grid, "name", None) == "water":
+                            ids.add(nid)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    return ids
+
+
+def _heat_node_demand(monee_net) -> Dict[int, float]:
+    """Per-junction heat demand q_mw (rated). Used to attribute downstream load
+    to each pipe in the supply tree."""
+    demand: Dict[int, float] = {}
+
+    def _add(nid, q):
+        if nid is None or not _is_finite(q):
+            return
+        demand[nid] = demand.get(nid, 0.0) + abs(float(q))
+
+    for c in monee_net.childs:
+        m = c.model
+        if isinstance(m, mm.HeatLoad):
+            _add(c.node_id, _val(getattr(m, "q_mw_heat", 0.0), 0.0))
+        elif isinstance(m, (mm.HeatExchangerLoad, getattr(mm, "PassiveHeatExchangerLoad", mm.HeatExchangerLoad))):
+            _add(c.node_id, _val(getattr(m, "q_mw", 0.0), 0.0))
+
+    for b in monee_net.branches:
+        m = b.model
+        if isinstance(m, mm.HeatExchangerLoad):
+            _add(b.from_node_id, _val(getattr(m, "q_mw", 0.0), 0.0))
+        elif isinstance(m, mm.HeatExchanger):
+            _add(b.from_node_id, _val(getattr(m, "q_mw", 0.0), 0.0))
+
+    return demand
+
+
+def _heat_supply_tree(
+    monee_net, junc_ids: List[int]
+) -> Tuple[Dict[int, Optional[int]], Dict[Tuple[int, int], int]]:
+    """BFS spanning tree on water graph rooted at heat injectors.
+
+    Returns (parent[nid] = parent_nid_or_None, edge_to_pipe[(parent, child)] = pipe_id).
+    For radial supply/return DHS this recovers the exact supply-side topology.
+    For meshed grids the BFS tree is an approximation but downstream-demand
+    attribution still gives a sensible per-edge mass-flow lower bound.
+    """
+    junc_set = set(junc_ids)
+    G = nx.Graph()
+    G.add_nodes_from(junc_ids)
+    edge_to_pipe: Dict[Tuple[int, int], int] = {}
+
+    for pipe in monee_net.branches_by_type(mm.WaterPipe):
+        if not pipe.active:
+            continue
+        if pipe.from_node_id in junc_set and pipe.to_node_id in junc_set:
+            G.add_edge(pipe.from_node_id, pipe.to_node_id)
+            edge_to_pipe[(pipe.from_node_id, pipe.to_node_id)] = pipe.id
+            edge_to_pipe[(pipe.to_node_id, pipe.from_node_id)] = pipe.id
+
+    for hx in monee_net.branches_by_type(mm.HeatExchanger):
+        if not hx.active:
+            continue
+        if hx.from_node_id in junc_set and hx.to_node_id in junc_set:
+            G.add_edge(hx.from_node_id, hx.to_node_id)
+            edge_to_pipe[(hx.from_node_id, hx.to_node_id)] = hx.id
+            edge_to_pipe[(hx.to_node_id, hx.from_node_id)] = hx.id
+
+    injectors = [nid for nid in junc_ids if nid in _heat_injector_node_ids(monee_net)]
+    parent: Dict[int, Optional[int]] = {nid: None for nid in injectors}
+    if not injectors or not G.edges:
+        return parent, edge_to_pipe
+
+    visited = set(injectors)
+    queue = list(injectors)
+    while queue:
+        n = queue.pop(0)
+        for nbr in G.neighbors(n):
+            if nbr in visited:
+                continue
+            visited.add(nbr)
+            parent[nbr] = n
+            queue.append(nbr)
+
+    return parent, edge_to_pipe
+
+
+def _heat_pipe_downstream_demand(
+    monee_net, pipe_ids: List[int], junc_ids: List[int]
+) -> Dict[int, float]:
+    """For each WaterPipe / HeatExchanger id in pipe_ids, the cumulative q_mw of
+    heat loads on its downstream side (in the supply tree rooted at injectors).
+
+    A pipe with no downstream demand returns 0.0; that means the thermal-margin
+    fallback is just the hydraulic margin.
+    """
+    parent, edge_to_pipe = _heat_supply_tree(monee_net, junc_ids)
+    node_demand = _heat_node_demand(monee_net)
+
+    children: Dict[int, List[int]] = {}
+    for child, par in parent.items():
+        if par is None:
+            continue
+        children.setdefault(par, []).append(child)
+
+    subtree: Dict[int, float] = {}
+
+    def _post(v: int) -> float:
+        if v in subtree:
+            return subtree[v]
+        s = float(node_demand.get(v, 0.0))
+        for c in children.get(v, []):
+            s += _post(c)
+        subtree[v] = s
+        return s
+
+    for nid in junc_ids:
+        _post(nid)
+
+    pipe_demand: Dict[int, float] = {pid: 0.0 for pid in pipe_ids}
+    for child, par in parent.items():
+        if par is None:
+            continue
+        pid = edge_to_pipe.get((par, child))
+        if pid is None:
+            continue
+        pipe_demand[pid] = subtree.get(child, 0.0)
+    return pipe_demand
+
+
+def _heat_remoteness_per_node(monee_net, junc_ids: List[int], cfg: CPMetricConfig) -> Dict[int, float]:
+    """Per-junction thermal-loss distance to the nearest heat injector.
+
+    Edge weight: L · U·π·d / (ṁ·cp) — the dimensionless temperature-decay
+    factor along the pipe (so that T_out ≈ T_amb + (T_in − T_amb)·exp(−weight)).
+    HeatExchanger edges get weight 0 (no length-wise loss). Returns 0 for
+    injector nodes; nodes unreachable from any injector get the max finite
+    distance (so they aren't dropped from the score).
+    """
+    G = nx.Graph()
+    G.add_nodes_from(junc_ids)
+    junc_set = set(junc_ids)
+    cp = float(cfg.HEAT_CP_J_PER_KG_K)
+    U = float(cfg.HEAT_PIPE_U_W_M2_K)
+
+    for pipe in monee_net.branches_by_type(mm.WaterPipe):
+        if not pipe.active:
+            continue
+        fi, ti = pipe.from_node_id, pipe.to_node_id
+        if fi not in junc_set or ti not in junc_set:
+            continue
+        d_raw = _val(getattr(pipe.model, "diameter_m", None), None)
+        L_raw = _val(getattr(pipe.model, "length_m", None), None)
+        m_raw = _val(getattr(pipe.model, "mass_flow", 0.0), 0.0)
+        if not (_is_finite(d_raw) and _is_finite(L_raw)):
+            continue
+        d = float(d_raw)
+        L = float(L_raw)
+        if d <= 0 or L <= 0:
+            continue
+        m_dot = max(abs(float(m_raw) if _is_finite(m_raw) else 0.0), cfg.FLOW_MIN)
+        kappa = (U * math.pi * d) / (m_dot * cp)  # 1/m
+        weight = L * kappa
+        if G.has_edge(fi, ti):
+            if weight < G[fi][ti]["weight"]:
+                G[fi][ti]["weight"] = weight
+        else:
+            G.add_edge(fi, ti, weight=weight)
+
+    for hx in monee_net.branches_by_type(mm.HeatExchanger):
+        if not hx.active:
+            continue
+        fi, ti = hx.from_node_id, hx.to_node_id
+        if fi in junc_set and ti in junc_set and not G.has_edge(fi, ti):
+            G.add_edge(fi, ti, weight=0.0)
+
+    injectors = [nid for nid in junc_ids if nid in _heat_injector_node_ids(monee_net)]
+    if not injectors or not G.edges:
+        return {nid: 0.0 for nid in junc_ids}
+
+    try:
+        dists = nx.multi_source_dijkstra_path_length(G, sources=injectors, weight="weight")
+    except Exception:
+        dists = {nid: 0.0 for nid in injectors}
+
+    finite_vals = [v for v in dists.values() if math.isfinite(v)]
+    cap = max(finite_vals) if finite_vals else 0.0
+    return {nid: float(dists.get(nid, cap)) for nid in junc_ids}
 
 
 # =============================================================================
@@ -732,7 +1017,14 @@ def _power_branch_limit_and_flow(
     except Exception:
         return np.inf, 0.0
 
-    flow0 = abs(_first_attr(bm, ["p_from_mw", "p_mw", "p_from", "p"], default=0.0))
+    # Use apparent power S = √(P² + Q²) so the margin (limit − flow) is unit-
+    # consistent with the MVA limit. Falling back to |P| alone overestimates
+    # margin when Q is non-trivial (e.g. low-PF buses).
+    p = _first_attr(bm, ["p_from_mw", "p_mw", "p_from", "p"], default=0.0)
+    q = _first_attr(bm, ["q_from_mvar", "q_mvar", "q_from", "q"], default=0.0)
+    p_v = float(p) if p is not None and _is_finite(p) else 0.0
+    q_v = float(q) if q is not None and _is_finite(q) else 0.0
+    flow0 = math.hypot(p_v, q_v)
 
     # cfg override takes highest priority
     if cfg is not None and cfg.POWER_BRANCH_LIMIT_MVA_OVERRIDE is not None:
@@ -982,6 +1274,40 @@ def _group_bc(G, compound, weight="weight"):
 # =============================================================================
 
 
+def _heat_remoteness_factor(ctx, node_id, cfg: "CPMetricConfig") -> float:
+    """(1 + α · d_thermal(node)) — slack-distance prefactor for heat stress.
+
+    Returns 1.0 when remoteness is disabled, the node is unknown, or it sits
+    at a heat injector. Larger values penalise components farther from any
+    heat source along thermally lossy supply paths.
+    """
+    if not cfg.HEAT_REMOTENESS_ENABLE:
+        return 1.0
+    rem = ctx.heat.get("remoteness") if hasattr(ctx, "heat") else None
+    if not rem:
+        return 1.0
+    d = float(rem.get(node_id, 0.0) or 0.0)
+    return 1.0 + float(cfg.HEAT_REMOTENESS_ALPHA) * d
+
+
+def _loading_proxy(flow0: float, limit: float, cfg: "CPMetricConfig") -> float:
+    """Throughput proxy as |flow| / limit (utilisation ratio in [0, 1+]).
+
+    Replaces the previous flow0/sn_mva which mixed units across carriers
+    (kg/s for gas/heat divided by MVA). With limit and flow0 always in matching
+    units (per-carrier helpers guarantee this), the result is dimensionless.
+    Falls back to |flow| with a small floor when limit is inf/zero (e.g.
+    HeatExchanger without geometry), which still gives meaningful per-component
+    relative weighting.
+    """
+    if not cfg.USE_THROUGHPUT_PROXY:
+        return 1.0
+    f = abs(float(flow0))
+    if np.isfinite(limit) and float(limit) > 0:
+        return max(f / float(limit), 1e-6)
+    return max(f, 1e-6)
+
+
 def _system_sn_mva(monee_net) -> float:
     try:
         buses = monee_net.nodes_by_type(mm.Bus)
@@ -1150,9 +1476,13 @@ class CarrierPTDFContext:
             return z, False
 
         s_local = id_to_local[node_id]
-        dP = _distributed_balancing_vector_power(
+        dP, ok = _distributed_balancing_vector_power(
             monee_net, self.power["bus_ids"], id_to_local, s_local
         )
+        if not ok:
+            z = np.zeros(len(self.power["branches"]), dtype=float)
+            cache[node_id] = z
+            return z, False
 
         dP_lines = ac_ptdf_distributed(
             self.power["theta"],
@@ -1202,6 +1532,11 @@ class CarrierPTDFContext:
             }
         )
 
+        try:
+            cond_b = float(np.linalg.cond(B)) if B.size else float("nan")
+        except Exception:
+            cond_b = float("nan")
+
         self.debug["gas"] = {
             "n_pipes": len(pipe_ids),
             "finite_limit_ratio": float(np.mean(finite_mask))
@@ -1211,6 +1546,7 @@ class CarrierPTDFContext:
             "pseudo_used_ratio": pseudo_ratio,
             "margin_min": float(np.min(margins)) if margins.size else None,
             "margin_med": float(np.median(margins)) if margins.size else None,
+            "B_condition": cond_b,
         }
 
     def gas_ptdf_node(self, monee_net, node_id):
@@ -1227,30 +1563,35 @@ class CarrierPTDFContext:
 
         s_idx = node_ids.index(node_id)
 
-        # balancing nodes: prefer ExtHydrGrid, else all other nodes
-        bal_idxs = []
+        # Balancing nodes: ExtHydrGrid only. No "distribute across all nodes"
+        # fallback — that has no physical analog (there is no mass-balance
+        # mechanism that absorbs gas equally everywhere). If no slack exists in
+        # the source's connected component, flag the PTDF unreliable and
+        # return zeros, matching how cross-component requests are handled.
+        slack_idxs: List[int] = []
         try:
             nodes = [monee_net.node_by_id(nid) for nid in node_ids]
             for i, n in enumerate(nodes):
                 if monee_net.has_any_child_of_type(n, mm.ExtHydrGrid):
-                    bal_idxs.append(i)
+                    slack_idxs.append(i)
         except Exception:
-            bal_idxs = []
+            slack_idxs = []
 
-        if not bal_idxs:
-            bal_idxs = [i for i in range(len(node_ids)) if i != s_idx]
-
-        # Restrict balancing to the same connected component as the source node.
-        # Cross-component balancing makes each component's RHS sum non-zero → infeasible.
         edges = [(fi, ti) for fi, ti, _ in self.gas["pipe_data"]]
         comps = _connected_components_from_edges(len(node_ids), edges)
         src_comp = next((c for c in comps if s_idx in c), None)
-        if src_comp is not None:
-            bal_idxs = [i for i in bal_idxs if i in src_comp]
-            if not bal_idxs:
-                bal_idxs = [i for i in src_comp if i != s_idx]
+        if src_comp is None:
+            z = (np.zeros(len(self.gas["pipe_data"]), dtype=float), False)
+            cache[node_id] = z
+            return z
 
-        # If source IS the slack (ExtHydrGrid), any injection is absorbed locally → zero PTDF (reliable).
+        bal_idxs = [i for i in slack_idxs if i in src_comp]
+        if not bal_idxs:
+            z = (np.zeros(len(self.gas["pipe_data"]), dtype=float), False)
+            cache[node_id] = z
+            return z
+
+        # If source IS the slack, injection is absorbed locally → zero PTDF (reliable).
         if s_idx in bal_idxs:
             z = (np.zeros(len(self.gas["pipe_data"]), dtype=float), True)
             cache[node_id] = z
@@ -1285,6 +1626,52 @@ class CarrierPTDFContext:
             limits, flows0, self.cfg
         )
 
+        # (A) Thermal-aware margin override: each pipe must carry at least
+        # m_min = q_downstream_demand / (cp · ΔT) to deliver the heat its
+        # downstream subtree needs at a fixed supply-return spread. Margin
+        # becomes the headroom *above* that thermal floor (m0 − m_min), which
+        # is the budget for flow-decreasing perturbations under fault. Where
+        # the BFS-tree gives zero downstream demand (return-side pipes,
+        # disconnected components) we fall back to the hydraulic margin.
+        thermal_min: Optional[np.ndarray] = None
+        if self.cfg.HEAT_THERMAL_MARGIN_ENABLE and pipe_ids:
+            try:
+                pipe_demand = _heat_pipe_downstream_demand(
+                    monee_net, pipe_ids, junc_ids
+                )
+                cp_dT = self.cfg.HEAT_CP_J_PER_KG_K * self.cfg.HEAT_DELTA_T_K  # J/kg
+                # q [MW] · 1e6 / (cp·ΔT [J/kg]) → kg/s
+                thermal_min = np.array(
+                    [
+                        float(pipe_demand.get(pid, 0.0)) * 1e6 / cp_dT
+                        for pid in pipe_ids
+                    ],
+                    dtype=float,
+                )
+                # Operating headroom over thermal floor (clipped to MIN_MARGIN).
+                thermal_margins = np.maximum(
+                    np.abs(flows0) - thermal_min, self.cfg.MIN_MARGIN
+                )
+                # Use thermal margin where downstream demand is nonzero, else
+                # keep hydraulic margin from _robust_margins.
+                use_thermal = thermal_min > 0.0
+                margins = np.where(use_thermal, thermal_margins, margins)
+            except Exception:
+                thermal_min = None
+
+        # (B) Per-junction thermal-loss distance to nearest heat injector.
+        # Cached on the context so each heat-bearing component just looks up
+        # its node id when computing the heat-side score multiplier.
+        if self.cfg.HEAT_REMOTENESS_ENABLE and junc_ids:
+            try:
+                heat_remoteness = _heat_remoteness_per_node(
+                    monee_net, junc_ids, self.cfg
+                )
+            except Exception:
+                heat_remoteness = {nid: 0.0 for nid in junc_ids}
+        else:
+            heat_remoteness = {nid: 0.0 for nid in junc_ids}
+
         self.heat.update(
             {
                 "B": B,
@@ -1294,9 +1681,16 @@ class CarrierPTDFContext:
                 "margins": margins,
                 "binding_mask": binding_mask,
                 "ptdf_cache": {},
+                "remoteness": heat_remoteness,
                 "built": True,
             }
         )
+
+        rem_vals = list(heat_remoteness.values()) if heat_remoteness else []
+        try:
+            cond_b = float(np.linalg.cond(B)) if B.size else float("nan")
+        except Exception:
+            cond_b = float("nan")
 
         self.debug["heat"] = {
             "n_edges": len(pipe_ids),
@@ -1307,6 +1701,13 @@ class CarrierPTDFContext:
             "pseudo_used_ratio": pseudo_ratio,
             "margin_min": float(np.min(margins)) if margins.size else None,
             "margin_med": float(np.median(margins)) if margins.size else None,
+            "thermal_margin_pipes": (
+                int(np.sum(thermal_min > 0)) if thermal_min is not None else 0
+            ),
+            "remoteness_min": float(min(rem_vals)) if rem_vals else None,
+            "remoteness_med": float(np.median(rem_vals)) if rem_vals else None,
+            "remoteness_max": float(max(rem_vals)) if rem_vals else None,
+            "B_condition": cond_b,
         }
 
     def heat_ptdf_node(self, monee_net, node_id):
@@ -1323,27 +1724,30 @@ class CarrierPTDFContext:
 
         s_idx = node_ids.index(node_id)
 
-        bal_idxs = []
+        # Slack nodes: ExtHydrGrid only. See gas_ptdf_node for rationale —
+        # distributing slack across arbitrary nodes is not physical.
+        slack_idxs: List[int] = []
         try:
             nodes = [monee_net.node_by_id(nid) for nid in node_ids]
             for i, n in enumerate(nodes):
                 if monee_net.has_any_child_of_type(n, mm.ExtHydrGrid):
-                    bal_idxs.append(i)
+                    slack_idxs.append(i)
         except Exception:
-            bal_idxs = []
+            slack_idxs = []
 
-        if not bal_idxs:
-            bal_idxs = [i for i in range(len(node_ids)) if i != s_idx]
-
-        # Restrict balancing to the same connected component as the source node.
-        # Cross-component balancing makes each component's RHS sum non-zero → infeasible.
         edges = [(fi, ti) for fi, ti, _ in self.heat["pipe_data"]]
         comps = _connected_components_from_edges(len(node_ids), edges)
         src_comp = next((c for c in comps if s_idx in c), None)
-        if src_comp is not None:
-            bal_idxs = [i for i in bal_idxs if i in src_comp]
-            if not bal_idxs:
-                bal_idxs = [i for i in src_comp if i != s_idx]
+        if src_comp is None:
+            z = (np.zeros(len(self.heat["pipe_data"]), dtype=float), False)
+            cache[node_id] = z
+            return z
+
+        bal_idxs = [i for i in slack_idxs if i in src_comp]
+        if not bal_idxs:
+            z = (np.zeros(len(self.heat["pipe_data"]), dtype=float), False)
+            cache[node_id] = z
+            return z
 
         # If source IS the slack (ExtHydrGrid), any injection is absorbed locally → zero PTDF (reliable).
         if s_idx in bal_idxs:
@@ -1513,17 +1917,18 @@ def mes_cp_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig()):
                 if margins.size != ptdf.size:
                     margins = np.zeros_like(ptdf) + cfg.MIN_MARGIN
                 mean_s, max_s, agg_s = _stress_from_ptdf(ptdf, margins, cfg)
+                rem = _heat_remoteness_factor(ctx, nid, cfg)
                 carrier_detail["heat"] = dict(
                     node_id=nid,
                     reliable=bool(ok),
                     stress_mean=mean_s,
                     stress_max=max_s,
-                    stress=agg_s,
+                    stress=agg_s * rem,
                 )
-                total_stress += cfg.W_HEAT * agg_s
+                total_stress += cfg.W_HEAT * agg_s * rem
                 reliable_all = reliable_all and bool(ok)
 
-            score = p_fail * throughput * total_stress * topo_factor
+            score = throughput * total_stress * topo_factor
 
             rows.append(
                 _row_from_detail(
@@ -1614,17 +2019,18 @@ def mes_cp_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig()):
                 if margins.size != ptdf.size:
                     margins = np.zeros_like(ptdf) + cfg.MIN_MARGIN
                 mean_s, max_s, agg_s = _stress_from_ptdf(ptdf, margins, cfg)
+                rem = _heat_remoteness_factor(ctx, nid, cfg)
                 carrier_detail["heat"] = dict(
                     node_id=nid,
                     reliable=bool(ok),
                     stress_mean=mean_s,
                     stress_max=max_s,
-                    stress=agg_s,
+                    stress=agg_s * rem,
                 )
-                total_stress += cfg.W_HEAT * agg_s
+                total_stress += cfg.W_HEAT * agg_s * rem
                 reliable_all = reliable_all and bool(ok)
 
-            score = p_fail * throughput * total_stress * topo_factor
+            score = throughput * total_stress * topo_factor
 
             rows.append(
                 _row_from_detail(
@@ -1753,8 +2159,6 @@ def mes_all_components_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig())
     ctx.gas_prebuild(monee_net)
     ctx.heat_prebuild(monee_net)
 
-    sn_mva = _system_sn_mva(monee_net)
-
     # CP branch ids to skip (already covered above)
     cp_branch_ids = set()
     for cp_type in (mm.GasToPower, mm.PowerToGas, mm.PowerToHeatHG, mm.GasToHeatHG):
@@ -1776,7 +2180,7 @@ def mes_all_components_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig())
 
         p_fail = float(fail_prob_branch.get(mm.GenericPowerBranch, 0.05))
         limit, flow0 = _power_branch_limit_and_flow(monee_net, branch_id, cfg)
-        throughput = max(float(flow0) / sn_mva, 1e-6) if cfg.USE_THROUGHPUT_PROXY else 1.0
+        throughput = _loading_proxy(flow0, limit, cfg)
 
         bc_avg = float(np.mean([
             bc_individual.get(br.from_node_id, 0.0),
@@ -1788,7 +2192,7 @@ def mes_all_components_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig())
             monee_net, ctx, "power", br.from_node_id, br.to_node_id, cfg
         )
         total_stress = cfg.W_POWER * agg_s
-        score = p_fail * throughput * total_stress * topo_factor
+        score = throughput * total_stress * topo_factor
 
         row = dict(
             cp_id=str(branch_id),
@@ -1824,8 +2228,8 @@ def mes_all_components_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig())
 
         p_fail = float(fail_prob_branch.get(mm.GasPipe, 0.05))
         gg = _gas_grid(monee_net)
-        _limit, flow0 = _gas_pipe_limit_and_flow(monee_net, pipe_id, gg)
-        throughput = max(float(flow0) / sn_mva, 1e-6) if cfg.USE_THROUGHPUT_PROXY else 1.0
+        limit, flow0 = _gas_pipe_limit_and_flow(monee_net, pipe_id, gg)
+        throughput = _loading_proxy(flow0, limit, cfg)
 
         bc_avg = float(np.mean([
             bc_individual.get(br.from_node_id, 0.0),
@@ -1837,7 +2241,7 @@ def mes_all_components_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig())
             monee_net, ctx, "gas", br.from_node_id, br.to_node_id, cfg
         )
         total_stress = cfg.W_GAS * agg_s
-        score = p_fail * throughput * total_stress * topo_factor
+        score = throughput * total_stress * topo_factor
 
         row = dict(
             cp_id=str(pipe_id),
@@ -1876,8 +2280,8 @@ def mes_all_components_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig())
         fail_key = mm.HeatExchanger if isinstance(bm, mm.HeatExchanger) else mm.WaterPipe
         p_fail = float(fail_prob_branch.get(fail_key, 0.05))
 
-        _limit, flow0 = _heat_pipe_limit_and_flow(monee_net, pipe_id)
-        throughput = max(float(flow0) / sn_mva, 1e-6) if cfg.USE_THROUGHPUT_PROXY else 1.0
+        limit, flow0 = _heat_pipe_limit_and_flow(monee_net, pipe_id)
+        throughput = _loading_proxy(flow0, limit, cfg)
 
         bc_avg = float(np.mean([
             bc_individual.get(br.from_node_id, 0.0),
@@ -1888,8 +2292,14 @@ def mes_all_components_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig())
         mean_s, max_s, agg_s, reliable = _branch_lodf_stress(
             monee_net, ctx, "heat", br.from_node_id, br.to_node_id, cfg
         )
-        total_stress = cfg.W_HEAT * agg_s
-        score = p_fail * throughput * total_stress * topo_factor
+        # (B) Slack-distance prefactor on heat stress (averaged over the pipe
+        # endpoints, since either endpoint failing splits the supply path).
+        rem = 0.5 * (
+            _heat_remoteness_factor(ctx, br.from_node_id, cfg)
+            + _heat_remoteness_factor(ctx, br.to_node_id, cfg)
+        )
+        total_stress = cfg.W_HEAT * agg_s * rem
+        score = throughput * total_stress * topo_factor
 
         row = dict(
             cp_id=str(pipe_id),
@@ -1910,7 +2320,7 @@ def mes_all_components_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig())
             heat_reliable=reliable,
             heat_stress_mean=mean_s,
             heat_stress_max=max_s,
-            heat_stress=agg_s,
+            heat_stress=agg_s * rem,
         )
         rows_non_cp.append(row)
 
@@ -1924,7 +2334,6 @@ def mes_all_components_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig())
 
     # ---- Local metric ----
     # Uses only information locally available to the device (1-hop at most):
-    #   p_fail             – device failure probability (device parameter)
     #   loading            – |flow| / limit: own utilisation (local measurement)
     #                        For CPs without a meaningful limit: rated throughput proxy.
     #   n_critical_nbrs    – neighbours with degree ≤ 2 (1-hop info only):
@@ -1933,7 +2342,7 @@ def mes_all_components_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig())
     #   carrier_coupling   – number of distinct energy carriers this component connects
     #                        (observable from own port configuration, no network traversal).
     #
-    # local_score = p_fail × loading × (1 + n_critical_nbrs) × carrier_coupling
+    # local_score = loading × (1 + n_critical_nbrs) × carrier_coupling
     #
     # Rationale:
     #   loading           → how much energy actually flows through me right now
@@ -2018,21 +2427,18 @@ def mes_all_components_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig())
     df_all["n_critical_nbrs"] = df_all.apply(_n_critical_nbrs, axis=1)
     df_all["carrier_coupling"] = df_all.apply(_carrier_coupling, axis=1)
     df_all["local_score"] = (
-        df_all["p_fail"]
-        * df_all["loading"]
+        df_all["loading"]
         * (1.0 + df_all["n_critical_nbrs"])
         * df_all["carrier_coupling"]
     )
 
     # ---- Self-only metric (zero-hop) ----
     # Uses exclusively the component's own observable state — no network traversal:
-    #   p_fail           – device failure probability
     #   loading          – own utilisation |flow| / limit
     #   carrier_coupling – number of carriers connected (readable from own ports)
-    # self_score = p_fail × loading × carrier_coupling
+    # self_score = loading × carrier_coupling
     df_all["self_score"] = (
-        df_all["p_fail"]
-        * df_all["loading"]
+        df_all["loading"]
         * df_all["carrier_coupling"]
     )
 

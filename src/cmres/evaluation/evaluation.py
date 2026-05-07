@@ -419,13 +419,29 @@ def create_networkx_plot(
     graph: nx.Graph = network._network_internal
     # pre-compute spring layout for nodes that have no position
     fallback_pos = nx.spring_layout(graph, seed=42)
+
+    # ── Pre-built lookups (replace per-edge / per-node O(N_df) scans) ──────
+    # 1) id -> color: one pass over df instead of df.loc per element.
+    if color_name in df.columns and "id" in df.columns:
+        color_lookup = (
+            df[["id", color_name]]
+            .dropna(subset=["id"])
+            .drop_duplicates(subset="id", keep="first")
+            .set_index("id")[color_name]
+            .to_dict()
+        )
+    else:
+        color_lookup = {}
+    # 2) graph node id -> monee node: avoid network.node_by_id() per edge.
+    m_node_cache = {nid: network.node_by_id(nid) for nid in graph.nodes}
+
     pos = {}
     x_edges = []
     y_edges = []
     color_edges = []
     for from_node, to_node, uid in graph.edges:
-        from_m_node = network.node_by_id(from_node)
-        to_m_node = network.node_by_id(to_node)
+        from_m_node = m_node_cache[from_node]
+        to_m_node = m_node_cache[to_node]
         from_grid = from_m_node.grid[0] if isinstance(from_m_node.grid, list) else from_m_node.grid
         to_grid = to_m_node.grid[0] if isinstance(to_m_node.grid, list) else to_m_node.grid
         add_to_from_x = GRID_NAME_TO_SHIFT_X[from_grid.name]
@@ -444,12 +460,9 @@ def create_networkx_plot(
         )
         pos[from_node] = (x0, y0)
         pos[to_node] = (x1, y1)
-        color_data = 0
-        color_data_list = list(
-            df.loc[df["id"] == f"branch:({from_node}, {to_node}, {uid})"][color_name]
+        color_data = color_lookup.get(
+            f"branch:({from_node}, {to_node}, {uid})", 0
         )
-        if len(color_data_list) > 0:
-            color_data = color_data_list[0]
 
         x_edges.append([x0, x1, None])
         y_edges.append([y0, y1, None])
@@ -475,10 +488,7 @@ def create_networkx_plot(
         x, y = pos.get(node, fallback_pos[node])
         node_data = graph.nodes[node]
         int_node = node_data["internal_node"]
-        color_data = 0
-        color_data_list = list(df.loc[df["id"] == node_id][color_name])
-        if len(color_data_list) > 0:
-            color_data = color_data_list[0]
+        color_data = color_lookup.get(node_id, 0)
         node_text = (
             str(type(int_node.grid).__name__)
             + " - "
@@ -516,29 +526,55 @@ def create_networkx_plot(
         + node_color_power
         + color_edges
     )
+    # Group edges into a small number of color bins so plotly only renders
+    # ~N_BINS Scatter traces instead of one per edge. With 300+ edges, the
+    # per-trace overhead dominates render time; binning shrinks that 20×.
+    # The binning is visually equivalent to the original gradient at
+    # screen resolution.
+    N_BINS = 20
     edge_traces = []
-    for i in range(len(x_edges)):
+    if max_color_val == 0:
+        # Single uniform black trace, all edges flattened.
+        all_x: list = []
+        all_y: list = []
+        for ex, ey in zip(x_edges, y_edges):
+            all_x.extend(ex)
+            all_y.extend(ey)
         edge_traces.append(
             go.Scatter(
-                x=x_edges[i],
-                y=y_edges[i],
-                line=dict(
-                    width=3,
-                    color="rgb(0,0,0)"
-                    if max_color_val == 0
-                    else px.colors.sample_colorscale(
-                        px.colors.sequential.Sunsetdark,
-                        min(1.0, max(0.0, color_edges[i] / max_color_val)),
-                    )[0],
-                ),
-                hoverinfo="text",
+                x=all_x, y=all_y,
+                line=dict(width=3, color="rgb(0,0,0)"),
+                hoverinfo="skip",
                 mode="lines",
-                text=f"{color_edges[i]}",
-                marker=dict(
-                    coloraxis="coloraxis",
-                ),
+                showlegend=False,
             )
         )
+    else:
+        # Pre-sample the colorscale once at N_BINS evenly spaced points.
+        bin_samples = [t / max(N_BINS - 1, 1) for t in range(N_BINS)]
+        bin_colors = px.colors.sample_colorscale(
+            px.colors.sequential.Sunsetdark, bin_samples
+        )
+        # Bucket edges by which sampled color they belong to.
+        bin_x: list = [[] for _ in range(N_BINS)]
+        bin_y: list = [[] for _ in range(N_BINS)]
+        for ex, ey, ec in zip(x_edges, y_edges, color_edges):
+            t = min(1.0, max(0.0, ec / max_color_val))
+            bi = min(N_BINS - 1, int(round(t * (N_BINS - 1))))
+            bin_x[bi].extend(ex)
+            bin_y[bi].extend(ey)
+        for bi in range(N_BINS):
+            if not bin_x[bi]:
+                continue
+            edge_traces.append(
+                go.Scatter(
+                    x=bin_x[bi], y=bin_y[bi],
+                    line=dict(width=3, color=bin_colors[bi]),
+                    hoverinfo="skip",
+                    mode="lines",
+                    showlegend=False,
+                )
+            )
 
     # cp
     node_trace_cp = go.Scatter(

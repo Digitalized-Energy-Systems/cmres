@@ -22,6 +22,25 @@ INPUT = "/home/rschrage/experiments/0506/res"
 OUTPUT = "data/out"
 SMALL_NUMBER = 0.00000000001
 
+# Components whose actual total impact is below this threshold are treated as
+# "never sampled by the MC failure model" and excluded from rank-based metrics
+# (Spearman ρ, Kendall τ, NDCG, precision@k). Including them mostly inflates
+# the apparent ranking quality (NDCG saturated by ties at zero) and biases
+# precision@k. The unfiltered view is still computed and shown alongside for
+# transparency.
+MC_FAILED_EPS = 1e-6
+
+# Coupling-point types as labelled in df_scores by mes_*_metric. Used by the
+# CP-only views (cp_only_metric_comparison / cp_only_pooled_metric_comparison)
+# to filter the matched df down to coupling components and break results out
+# by CP type so it's visible which type each metric predicts well.
+CP_TYPE_SET = frozenset({
+    "CHP", "CHPHG",
+    "PowerToHeat", "PowerToHeatHG",
+    "PowerToGas", "GasToPower",
+    "GasToHeatHG",
+})
+
 TYPE_TO_CARRIER = {
     "Junction": "heat/gas",
     "Bus": "electricity",
@@ -559,6 +578,20 @@ def impact_over_metrics(
     figures = []
     titles = []
     metric_impact_df = metric_impact_df[metric_impact_df["impact"].notnull()]
+    # Filter out per-carrier rows whose component never failed in MC (or only
+    # had a vanishing share of impact in this carrier). Keeps scatter and
+    # correlation views from being dominated by the long flat tail at impact=0
+    # — same rationale as cp_metric_vs_actual_impact. The graph/network view
+    # later in the function uses the network layout itself, so unfiltered
+    # components just don't get coloured rather than being misrepresented.
+    n_before = len(metric_impact_df)
+    metric_impact_df = metric_impact_df[
+        metric_impact_df["impact"] > MC_FAILED_EPS
+    ].reset_index(drop=True)
+    print(
+        f"impact_over_metrics[{folder_id}]: filtered to MC-sampled rows "
+        f"({len(metric_impact_df)} of {n_before}, eps={MC_FAILED_EPS:g})"
+    )
     for carrier in pandas.unique(metric_impact_df["carrier"]):
         metric_impact_df_carrier = metric_impact_df[
             metric_impact_df["carrier"] == carrier
@@ -579,9 +612,9 @@ def impact_over_metrics(
             )
             titles.append(f"{metric} to the components' {carrier_name}-impact")
             for key, value in TYPE_SPECIALS_CN.items():
-                metric_impact_df_carrier_with_types = metric_impact_df_carrier.query(
-                    f"type_y in {value}"
-                )
+                metric_impact_df_carrier_with_types = metric_impact_df_carrier[
+                    metric_impact_df_carrier["type_y"].isin(value)
+                ]
                 figures.append(
                     eval.create_scatter_with_df(
                         metric_impact_df_carrier_with_types,
@@ -643,9 +676,9 @@ def impact_over_metrics(
         )
         titles.append(f"{metric} to the components' impact")
         for key, value in TYPE_SPECIALS_CN.items():
-            metric_impact_df_carrier_with_types = metric_impact_df_all_carrier.query(
-                f"type_y in {value}"
-            )
+            metric_impact_df_carrier_with_types = metric_impact_df_all_carrier[
+                metric_impact_df_all_carrier["type_y"].isin(value)
+            ]
             figures.append(
                 eval.create_scatter_with_df(
                     metric_impact_df_carrier_with_types,
@@ -1007,7 +1040,20 @@ def cp_metric_vs_actual_impact(monee_net, impact_df_nt, network_type):
         print(f"No metric/impact matches found for {network_type}")
         return
 
-    df = pandas.DataFrame(rows)
+    df_all = pandas.DataFrame(rows)
+    # Primary view: only components the MC failure model actually sampled (and
+    # therefore can produce a non-trivial actual_total). Components with zero
+    # impact are unrankable and inflate NDCG / suppress P@k toward random; see
+    # MC_FAILED_EPS docstring above.
+    df = df_all[df_all["actual_total"] > MC_FAILED_EPS].reset_index(drop=True)
+    n_all = len(df_all)
+    n_mc = len(df)
+    if n_mc < 3:
+        print(
+            f"[{network_type}] only {n_mc} components have actual>0; falling "
+            f"back to full set (n={n_all}) for ranking metrics"
+        )
+        df = df_all.copy()
     figures = []
     titles = []
 
@@ -1464,15 +1510,447 @@ def cp_metric_vs_actual_impact(monee_net, impact_df_nt, network_type):
         legend=dict(title="Metric", x=1.01, xanchor="left"),
     )
     figures.append(prec_fig)
-    titles.append("Precision@k: Fraction of True Top-k Components Correctly Identified")
+    titles.append(
+        f"Precision@k: Fraction of True Top-k Components Correctly Identified "
+        f"(n={len(valid)} MC-sampled of {n_all} matched)"
+    )
+
+    # ── Filtered-vs-unfiltered ρ comparison ────────────────────────────────
+    # Each metric scored against actual_total on (a) all matched components,
+    # which includes the long flat tail of zero-impact rows from the MC, and
+    # (b) only MC-sampled components (actual > MC_FAILED_EPS). The filtered
+    # value is the one used in the figures above; the unfiltered value is
+    # what you'd see if the never-failed mass were left in. Same metrics,
+    # same df, just different population — the gap shows how much the zero
+    # tail was distorting things.
+    if n_mc >= 3 and n_all > n_mc:
+        df_all_local = df_all.copy()
+        if "score_no_topo" not in df_all_local.columns:
+            df_all_local["score_no_topo"] = df_all_local["predicted_score"] / (
+                df_all_local["topo_factor"].replace(0, float("nan"))
+            )
+        if "score_topo_only" not in df_all_local.columns:
+            df_all_local["score_topo_only"] = df_all_local["topo_bc"]
+
+        cmp_rows = []
+        for col, label in METRICS[:-1]:
+            try:
+                rho_all, _, lo_all, hi_all = _spearman_with_ci(
+                    df_all_local[col], df_all_local["actual_total"]
+                )
+            except Exception:
+                rho_all, lo_all, hi_all = float("nan"), float("nan"), float("nan")
+            try:
+                rho_mc, _, lo_mc, hi_mc = _spearman_with_ci(
+                    df[col], df["actual_total"]
+                )
+            except Exception:
+                rho_mc, lo_mc, hi_mc = float("nan"), float("nan"), float("nan")
+            cmp_rows.append({
+                "Metric": label,
+                "rho_all": rho_all, "ci_lo_all": lo_all, "ci_hi_all": hi_all,
+                "rho_mc": rho_mc, "ci_lo_mc": lo_mc, "ci_hi_mc": hi_mc,
+            })
+        cmp_df = pandas.DataFrame(cmp_rows).sort_values("rho_mc", ascending=True)
+
+        cmp_fig = go.Figure()
+        cmp_fig.add_trace(go.Bar(
+            name=f"All matched (n={n_all})",
+            x=cmp_df["Metric"], y=cmp_df["rho_all"],
+            error_y=dict(
+                type="data", symmetric=False,
+                array=(cmp_df["ci_hi_all"] - cmp_df["rho_all"]).tolist(),
+                arrayminus=(cmp_df["rho_all"] - cmp_df["ci_lo_all"]).tolist(),
+            ),
+            marker_color="lightgrey",
+        ))
+        cmp_fig.add_trace(go.Bar(
+            name=f"MC-sampled (n={n_mc})",
+            x=cmp_df["Metric"], y=cmp_df["rho_mc"],
+            error_y=dict(
+                type="data", symmetric=False,
+                array=(cmp_df["ci_hi_mc"] - cmp_df["rho_mc"]).tolist(),
+                arrayminus=(cmp_df["rho_mc"] - cmp_df["ci_lo_mc"]).tolist(),
+            ),
+            marker_color=px.colors.qualitative.Plotly[0],
+        ))
+        cmp_fig.update_layout(
+            barmode="group",
+            height=500, width=900,
+            template="plotly_white",
+            yaxis=dict(title="Spearman ρ vs Actual (95% CI)", range=[-1.15, 1.15],
+                       zeroline=True, zerolinecolor="black"),
+            xaxis=dict(title="Metric"),
+            margin={"l": 60, "b": 100, "r": 20, "t": 50},
+            legend=dict(title="Population"),
+        )
+        figures.append(cmp_fig)
+        titles.append(
+            f"Filtered vs unfiltered: ρ when including all matched components "
+            f"(n={n_all}) vs only MC-sampled (n={n_mc}, actual > {MC_FAILED_EPS:g})"
+        )
 
     eval.write_all_in_one(
         figures, "Figure", Path("."),
         OUTPUT + f"/{network_type}/cp_metric_vs_actual.html",
         titles=titles,
     )
-    print(f"Written cp_metric_vs_actual.html for {network_type}")
-    return df
+    print(
+        f"Written cp_metric_vs_actual.html for {network_type} "
+        f"(MC-sampled n={n_mc} of {n_all} matched)"
+    )
+    # Return the full set so the pooled comparison can apply its own filter
+    # and still emit an all-vs-MC comparison panel.
+    return df_all
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CP-only metric comparison (per-network and pooled) — same metric battery as
+# cp_metric_vs_actual_impact / pooled_metric_comparison, restricted to coupling
+# points and broken out by cp_type so per-type predictability is visible.
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _cp_only_metric_comparison_core(
+    df_all: pandas.DataFrame,
+    label: str,
+    output_path: str,
+):
+    """Shared core for both the per-network and pooled CP-only views.
+
+    Parameters
+    ----------
+    df_all : DataFrame
+        Full df returned by ``cp_metric_vs_actual_impact``. Must contain
+        ``cp_id``, ``cp_type``, ``actual_total`` and the predicted-score columns
+        used by the metric battery.
+    label : str
+        Identifier shown in figure titles (network name or ``"pooled"``).
+    output_path : str
+        Destination HTML.
+    """
+    import numpy as _np
+    import plotly.graph_objects as go
+    import plotly.express as px
+    from plotly.subplots import make_subplots
+
+    METRICS = [
+        ("predicted_score",  "PTDF stress + phys. BC"),
+        ("score_no_topo",    "PTDF stress only"),
+        ("score_topo_only",  "Phys. BC only"),
+        ("stress_bc",        "Stress BC only"),
+        ("local_score",      "1-hop local"),
+        ("self_score",       "0-hop self"),
+        ("katz_score",       "Katz BC only"),
+        ("vitality_score",   "Closeness vitality"),
+        ("actual_total",     "Actual (MC)"),
+    ]
+
+    df = df_all.copy()
+    if "score_no_topo" not in df.columns:
+        df["score_no_topo"] = df["predicted_score"] / df["topo_factor"].replace(0, float("nan"))
+    if "score_topo_only" not in df.columns:
+        df["score_topo_only"] = df["topo_bc"]
+
+    # 1) Restrict to coupling-point rows.
+    df = df[df["cp_type"].astype(str).isin(CP_TYPE_SET)].reset_index(drop=True)
+    n_cps_total = len(df)
+    if n_cps_total == 0:
+        print(f"[cp_only:{label}] no CP rows in matched df — skipping")
+        return
+
+    # 2) Drop NaN metric rows so the rank-based metrics don't blow up.
+    valid_all = df.dropna(subset=[col for col, _ in METRICS]).reset_index(drop=True)
+    valid_mc = valid_all[valid_all["actual_total"] > MC_FAILED_EPS].reset_index(drop=True)
+    n_all = len(valid_all)
+    n_mc = len(valid_mc)
+    primary = valid_mc if n_mc >= 3 else valid_all
+    if n_mc < 3 and n_all >= 3:
+        print(
+            f"[cp_only:{label}] only {n_mc} CPs have actual>0; falling back "
+            f"to full CP set (n={n_all}) for ranking metrics"
+        )
+    elif n_all < 3:
+        print(f"[cp_only:{label}] only {n_all} CPs valid — too few for ranking metrics")
+        return
+
+    cp_types_present = sorted(primary["cp_type"].unique())
+    print(
+        f"[cp_only:{label}] CPs: {n_cps_total} matched, {n_all} valid, "
+        f"{n_mc} MC-sampled (used). Types: {cp_types_present}"
+    )
+
+    # ── Helpers (same as in cp_metric_vs_actual_impact) ───────────────────
+    def _spearman_with_ci(a, b, alpha=0.05):
+        res = scipy.stats.spearmanr(a, b)
+        rho, pval = res.statistic, res.pvalue
+        n = len(a)
+        if n > 3 and _np.isfinite(rho):
+            z = _np.arctanh(rho)
+            se = 1.0 / _np.sqrt(n - 3)
+            z_crit = scipy.stats.norm.ppf(1 - alpha / 2)
+            ci_lo = float(_np.tanh(z - z_crit * se))
+            ci_hi = float(_np.tanh(z + z_crit * se))
+        else:
+            ci_lo, ci_hi = float("nan"), float("nan")
+        return float(rho) if _np.isfinite(rho) else float("nan"), float(pval), ci_lo, ci_hi
+
+    def _ndcg(actual_vals, predicted_scores):
+        actual_arr = _np.array(actual_vals, dtype=float)
+        if len(actual_arr) == 0:
+            return 0.0
+        pred_order  = _np.argsort(predicted_scores)[::-1]
+        ideal_order = _np.argsort(actual_arr)[::-1]
+        gains = _np.maximum(actual_arr, 0.0)
+        dcg  = sum(gains[pred_order[i]]  / _np.log2(i + 2) for i in range(len(gains)))
+        idcg = sum(gains[ideal_order[i]] / _np.log2(i + 2) for i in range(len(gains)))
+        return float(dcg / idcg) if idcg > 0 else 0.0
+
+    def _precision_at_k(actual_vals, predicted_scores, k):
+        if k <= 0 or len(actual_vals) == 0:
+            return 0.0
+        actual_top = set(_np.argsort(actual_vals)[-k:])
+        pred_top   = set(_np.argsort(predicted_scores)[-k:])
+        return len(actual_top & pred_top) / k
+
+    figures = []
+    titles  = []
+    pred_metrics = [(col, lab) for col, lab in METRICS if col != "actual_total"]
+    actual_vals = primary["actual_total"].values
+
+    cp_color_map = {
+        t: px.colors.qualitative.Plotly[i % 10]
+        for i, t in enumerate(cp_types_present)
+    }
+
+    # ── 1. Scatter: predicted_score vs actual, coloured by cp_type ────────
+    scatter_fig = go.Figure()
+    for ct in cp_types_present:
+        sub = primary[primary["cp_type"] == ct]
+        scatter_fig.add_trace(go.Scatter(
+            x=sub["predicted_score"], y=sub["actual_total"],
+            mode="markers", name=f"{ct} (n={len(sub)})",
+            marker=dict(color=cp_color_map[ct], size=9,
+                        line=dict(width=0.5, color="rgba(0,0,0,0.3)")),
+            hovertext=sub["cp_id"].astype(str),
+        ))
+    scatter_fig.update_layout(
+        height=500, width=900, template="plotly_white",
+        xaxis=dict(title="Predicted CP Score"),
+        yaxis=dict(title="Actual Total Impact (MC)"),
+        legend=dict(title="CP Type"),
+        margin={"l": 60, "b": 60, "r": 20, "t": 50},
+    )
+    figures.append(scatter_fig)
+    titles.append(f"CP-only [{label}] scatter (n={n_mc} MC-sampled, by CP type)")
+
+    # ── 2. Per-CP-type ρ heatmap: rows = cp_type, cols = metrics ──────────
+    # The cell is Spearman ρ for that CP type's predicted-vs-actual; cells with
+    # n<3 are NaN (shown blank). This is the KEY view: it makes per-type
+    # predictability visible at a glance.
+    rho_matrix = _np.full((len(cp_types_present), len(pred_metrics)), _np.nan)
+    n_matrix = _np.zeros((len(cp_types_present), len(pred_metrics)), dtype=int)
+    for i, ct in enumerate(cp_types_present):
+        sub = primary[primary["cp_type"] == ct]
+        for j, (col, _lab) in enumerate(pred_metrics):
+            n_matrix[i, j] = len(sub)
+            if len(sub) >= 3:
+                rho, _, _, _ = _spearman_with_ci(sub[col], sub["actual_total"])
+                rho_matrix[i, j] = rho
+
+    text_matrix = [
+        [
+            (
+                f"ρ={rho_matrix[i, j]:.2f}<br>n={n_matrix[i, j]}"
+                if _np.isfinite(rho_matrix[i, j])
+                else f"n={n_matrix[i, j]}<br>(too few)"
+            )
+            for j in range(len(pred_metrics))
+        ]
+        for i in range(len(cp_types_present))
+    ]
+    heatmap_fig = go.Figure(go.Heatmap(
+        z=rho_matrix,
+        x=[lab for _, lab in pred_metrics],
+        y=cp_types_present,
+        colorscale="RdBu", zmin=-1, zmax=1,
+        text=text_matrix,
+        texttemplate="%{text}",
+        colorbar=dict(title=dict(text="Spearman ρ", side="right")),
+    ))
+    heatmap_fig.update_layout(
+        height=80 + 60 * len(cp_types_present),
+        width=200 + 110 * len(pred_metrics),
+        template="plotly_white",
+        margin={"l": 140, "b": 140, "r": 60, "t": 50},
+        xaxis=dict(title="Metric", tickangle=-30),
+        yaxis=dict(title="CP type"),
+    )
+    figures.append(heatmap_fig)
+    titles.append(
+        f"CP-only [{label}] per-type Spearman ρ "
+        f"(NaN = fewer than 3 components of that type)"
+    )
+
+    # ── 3. Combined ρ bar chart for all CPs together ──────────────────────
+    rho_rows = []
+    for col, lab in pred_metrics:
+        rho, pval, lo, hi = _spearman_with_ci(primary[col], primary["actual_total"])
+        rho_rows.append({
+            "Metric": lab, "rho": rho, "p": pval, "lo": lo, "hi": hi,
+        })
+    rho_df = pandas.DataFrame(rho_rows).sort_values("rho", ascending=True)
+    rho_fig = go.Figure(go.Bar(
+        x=rho_df["rho"], y=rho_df["Metric"], orientation="h",
+        error_x=dict(
+            type="data", symmetric=False,
+            array=(rho_df["hi"] - rho_df["rho"]).clip(lower=0).tolist(),
+            arrayminus=(rho_df["rho"] - rho_df["lo"]).clip(lower=0).tolist(),
+        ),
+        text=[f"ρ={r:.2f} [{lo:.2f},{hi:.2f}]<br>p={p:.3f}"
+              for r, lo, hi, p in zip(
+                  rho_df["rho"], rho_df["lo"], rho_df["hi"], rho_df["p"])],
+        textposition="outside",
+        marker_color=px.colors.qualitative.Plotly[0],
+    ))
+    rho_fig.update_layout(
+        height=80 + 40 * len(rho_df), width=900,
+        template="plotly_white",
+        xaxis=dict(title="Spearman ρ vs Actual (95% CI)", range=[-1.05, 1.05],
+                   zeroline=True, zerolinecolor="black"),
+        yaxis=dict(title="Metric"),
+        margin={"l": 200, "b": 50, "r": 160, "t": 50},
+    )
+    figures.append(rho_fig)
+    titles.append(f"CP-only [{label}] combined Spearman ρ (n={len(primary)})")
+
+    # ── 4. Kendall τ + NDCG with bootstrap 95 % CI (combined) ─────────────
+    def _bootstrap_ci(stat_fn, actual_arr, pred_arr, n_boot=1000, alpha=0.05, rng=None):
+        if rng is None:
+            rng = _np.random.default_rng(42)
+        n = len(actual_arr)
+        if n == 0:
+            return float("nan"), float("nan")
+        boot = []
+        for _ in range(n_boot):
+            idx = rng.integers(0, n, n)
+            boot.append(stat_fn(actual_arr[idx], pred_arr[idx]))
+        return (float(_np.percentile(boot, 100 * alpha / 2)),
+                float(_np.percentile(boot, 100 * (1 - alpha / 2))))
+
+    rng = _np.random.default_rng(42)
+    acc_rows = []
+    for col, lab in pred_metrics:
+        scores = primary[col].values
+        if len(scores) < 3:
+            continue
+        tau = float(scipy.stats.kendalltau(scores, actual_vals).statistic)
+        ndcg = _ndcg(actual_vals, scores)
+        tau_lo, tau_hi = _bootstrap_ci(
+            lambda a, p: float(scipy.stats.kendalltau(p, a).statistic),
+            actual_vals, scores, rng=rng,
+        )
+        ndcg_lo, ndcg_hi = _bootstrap_ci(
+            lambda a, p: _ndcg(a, p),
+            actual_vals, scores, rng=rng,
+        )
+        acc_rows.append({
+            "Metric": lab,
+            "tau": tau, "tau_lo": tau_lo, "tau_hi": tau_hi,
+            "ndcg": ndcg, "ndcg_lo": ndcg_lo, "ndcg_hi": ndcg_hi,
+        })
+
+    if acc_rows:
+        acc_df = pandas.DataFrame(acc_rows).sort_values("ndcg", ascending=True)
+        acc_fig = make_subplots(
+            rows=1, cols=2,
+            subplot_titles=["Kendall τ (95% CI)", "NDCG (95% CI)"],
+        )
+        for col_idx, (measure, lo_col, hi_col) in enumerate(
+            [("tau", "tau_lo", "tau_hi"), ("ndcg", "ndcg_lo", "ndcg_hi")], start=1
+        ):
+            vals   = acc_df[measure].values
+            err_lo = (vals - acc_df[lo_col].values).clip(0)
+            err_hi = (acc_df[hi_col].values - vals).clip(0)
+            acc_fig.add_trace(go.Bar(
+                x=vals, y=acc_df["Metric"], orientation="h",
+                error_x=dict(type="data", symmetric=False,
+                             array=err_hi.tolist(), arrayminus=err_lo.tolist()),
+                text=[f"{v:.3f} [{lo:.2f},{hi:.2f}]"
+                      for v, lo, hi in zip(vals, acc_df[lo_col], acc_df[hi_col])],
+                textposition="outside",
+                showlegend=False,
+            ), row=1, col=col_idx)
+            ref_range = [-1.05, 1.05] if measure == "tau" else [-0.05, 1.05]
+            acc_fig.update_xaxes(
+                title_text=("Kendall τ" if measure == "tau" else "NDCG"),
+                range=ref_range, zeroline=True, zerolinecolor="black",
+                row=1, col=col_idx,
+            )
+        acc_fig.update_layout(
+            height=80 + 40 * len(acc_df), width=1100,
+            template="plotly_white",
+            margin={"l": 200, "b": 50, "r": 120, "t": 50},
+        )
+        figures.append(acc_fig)
+        titles.append(f"CP-only [{label}] Kendall τ + NDCG (combined, n={len(primary)})")
+
+    # ── 5. Precision@k (combined) ─────────────────────────────────────────
+    n_comp = len(primary)
+    if n_comp >= 2:
+        k_values = list(range(1, n_comp + 1))
+        prec_fig = go.Figure()
+        for col, lab in pred_metrics:
+            scores = primary[col].values
+            prec_fig.add_trace(go.Scatter(
+                x=k_values,
+                y=[_precision_at_k(actual_vals, scores, k) for k in k_values],
+                mode="lines+markers", name=lab, marker=dict(size=5),
+            ))
+        prec_fig.add_trace(go.Scatter(
+            x=k_values, y=[k / n_comp for k in k_values],
+            mode="lines", name="Random baseline",
+            line=dict(dash="dash", color="grey", width=1),
+        ))
+        prec_fig.update_layout(
+            height=450, width=850, template="plotly_white",
+            xaxis=dict(title="k (number of top components considered)",
+                       dtick=max(1, n_comp // 20)),
+            yaxis=dict(title="Precision@k", range=[-0.05, 1.05]),
+            legend=dict(title="Metric", x=1.01, xanchor="left"),
+            margin={"l": 60, "b": 60, "r": 20, "t": 40},
+        )
+        figures.append(prec_fig)
+        titles.append(f"CP-only [{label}] Precision@k (combined, n={n_comp})")
+
+    Path(output_path).parent.mkdir(exist_ok=True, parents=True)
+    eval.write_all_in_one(
+        figures, "Figure", Path("."),
+        output_path,
+        titles=titles,
+    )
+    print(
+        f"[cp_only:{label}] written {output_path} "
+        f"(n_mc={n_mc}, n_all={n_all}, types={cp_types_present})"
+    )
+
+
+def cp_only_metric_comparison(df_all: pandas.DataFrame, network_type: str):
+    """Per-network CP-only view of the metric battery, broken out by cp_type.
+
+    Mirrors ``cp_metric_vs_actual_impact`` but with only coupling-point rows
+    so non-CP branches don't dominate the ranking metrics. Adds a per-CP-type
+    Spearman-ρ heatmap so you can see at a glance which CP types each predictor
+    handles well and which it doesn't.
+    """
+    out = OUTPUT + f"/{network_type}/cp_metric_vs_actual_cp_only.html"
+    _cp_only_metric_comparison_core(df_all, network_type, out)
+
+
+def cp_only_pooled_metric_comparison(pooled_df: pandas.DataFrame, output_dir: str):
+    """Pooled CP-only view across all network types, broken out by cp_type."""
+    out = output_dir + "/cp_metric_vs_actual_cp_only_pooled.html"
+    _cp_only_metric_comparison_core(pooled_df, "pooled", out)
 
 
 def pooled_resilience_per_scenario(perf_df: pandas.DataFrame, output_dir: str):
@@ -1489,7 +1967,7 @@ def pooled_resilience_per_scenario(perf_df: pandas.DataFrame, output_dir: str):
 
     pooled = (
         perf_df.groupby(["network_type", "experiment", "id"])[["0", "1", "2"]]
-        .sum()
+        .mean()
         .reset_index()
         .groupby(["network_type", "experiment"])
         .mean()
@@ -1567,17 +2045,34 @@ def pooled_metric_comparison(pooled_df, output_dir):
         ("actual_total",     "Actual (MC)"),
     ]
 
-    df = pooled_df.copy()
+    df_all_full = pooled_df.copy()
     # Compute score_no_topo if not already present
-    if "score_no_topo" not in df.columns:
-        df["score_no_topo"] = df["predicted_score"] / df["topo_factor"].replace(0, float("nan"))
-    if "score_topo_only" not in df.columns:
-        df["score_topo_only"] = df["topo_bc"]
+    if "score_no_topo" not in df_all_full.columns:
+        df_all_full["score_no_topo"] = df_all_full["predicted_score"] / df_all_full["topo_factor"].replace(0, float("nan"))
+    if "score_topo_only" not in df_all_full.columns:
+        df_all_full["score_topo_only"] = df_all_full["topo_bc"]
 
-    valid = df.dropna(subset=[col for col, _ in METRICS])
+    valid_all = df_all_full.dropna(subset=[col for col, _ in METRICS])
+    # Primary view: pooled MC-sampled components only. Same rationale as in
+    # cp_metric_vs_actual_impact.
+    valid_mc = valid_all[valid_all["actual_total"] > MC_FAILED_EPS].reset_index(drop=True)
+    n_all = len(valid_all)
+    n_mc = len(valid_mc)
+    if n_mc < 3:
+        print(
+            f"Pooled: only {n_mc} components have actual>0; falling back to "
+            f"full set (n={n_all}) for ranking metrics"
+        )
+        valid = valid_all
+    else:
+        valid = valid_mc
+
     n_total = len(valid)
     net_types = sorted(valid["network_type"].unique())
-    print(f"Pooled analysis: {n_total} components across {len(net_types)} network types: {net_types}")
+    print(
+        f"Pooled analysis: {n_total} components (MC-sampled, of {n_all} matched) "
+        f"across {len(net_types)} network types: {net_types}"
+    )
 
     # ── Helpers ────────────────────────────────────────────────────────────
 
@@ -1820,7 +2315,67 @@ def pooled_metric_comparison(pooled_df, output_dir):
         margin={"l": 60, "b": 60, "r": 20, "t": 40},
     )
     figures.append(prec_fig)
-    titles.append(f"Pooled Precision@k (n={n_total})")
+    titles.append(f"Pooled Precision@k (n={n_total} MC-sampled of {n_all} matched)")
+
+    # ── Filtered-vs-unfiltered ρ comparison (pooled) ───────────────────────
+    if n_mc >= 3 and n_all > n_mc:
+        cmp_rows = []
+        for col, label in pred_metrics:
+            try:
+                rho_all, _, lo_all, hi_all = _spearman_with_ci(
+                    valid_all[col], valid_all["actual_total"]
+                )
+            except Exception:
+                rho_all, lo_all, hi_all = float("nan"), float("nan"), float("nan")
+            try:
+                rho_mc, _, lo_mc, hi_mc = _spearman_with_ci(
+                    valid_mc[col], valid_mc["actual_total"]
+                )
+            except Exception:
+                rho_mc, lo_mc, hi_mc = float("nan"), float("nan"), float("nan")
+            cmp_rows.append({
+                "Metric": label,
+                "rho_all": rho_all, "ci_lo_all": lo_all, "ci_hi_all": hi_all,
+                "rho_mc": rho_mc, "ci_lo_mc": lo_mc, "ci_hi_mc": hi_mc,
+            })
+        cmp_df = pandas.DataFrame(cmp_rows).sort_values("rho_mc", ascending=True)
+
+        cmp_fig = go.Figure()
+        cmp_fig.add_trace(go.Bar(
+            name=f"All matched (n={n_all})",
+            x=cmp_df["Metric"], y=cmp_df["rho_all"],
+            error_y=dict(
+                type="data", symmetric=False,
+                array=(cmp_df["ci_hi_all"] - cmp_df["rho_all"]).tolist(),
+                arrayminus=(cmp_df["rho_all"] - cmp_df["ci_lo_all"]).tolist(),
+            ),
+            marker_color="lightgrey",
+        ))
+        cmp_fig.add_trace(go.Bar(
+            name=f"MC-sampled (n={n_mc})",
+            x=cmp_df["Metric"], y=cmp_df["rho_mc"],
+            error_y=dict(
+                type="data", symmetric=False,
+                array=(cmp_df["ci_hi_mc"] - cmp_df["rho_mc"]).tolist(),
+                arrayminus=(cmp_df["rho_mc"] - cmp_df["ci_lo_mc"]).tolist(),
+            ),
+            marker_color=px.colors.qualitative.Plotly[0],
+        ))
+        cmp_fig.update_layout(
+            barmode="group",
+            height=500, width=1000,
+            template="plotly_white",
+            yaxis=dict(title="Spearman ρ vs Actual (95% CI)", range=[-1.15, 1.15],
+                       zeroline=True, zerolinecolor="black"),
+            xaxis=dict(title="Metric"),
+            margin={"l": 60, "b": 100, "r": 20, "t": 50},
+            legend=dict(title="Population"),
+        )
+        figures.append(cmp_fig)
+        titles.append(
+            f"Filtered vs unfiltered (pooled): ρ on all matched (n={n_all}) vs "
+            f"only MC-sampled (n={n_mc}, actual > {MC_FAILED_EPS:g})"
+        )
 
     Path(output_dir).mkdir(exist_ok=True, parents=True)
     eval.write_all_in_one(
@@ -1828,7 +2383,10 @@ def pooled_metric_comparison(pooled_df, output_dir):
         output_dir + "/cp_metric_vs_actual_pooled.html",
         titles=titles,
     )
-    print(f"Written pooled metric comparison (n={n_total}) to {output_dir}/cp_metric_vs_actual_pooled.html")
+    print(
+        f"Written pooled metric comparison (MC-sampled n={n_total} of {n_all} matched) "
+        f"to {output_dir}/cp_metric_vs_actual_pooled.html"
+    )
 
 
 def evaluate(folder_id):
@@ -1905,6 +2463,7 @@ def evaluate(folder_id):
         )
         net_df = cp_metric_vs_actual_impact(monee_net, impact_df_nt, network_type)
         if net_df is not None and len(net_df) > 0:
+            cp_only_metric_comparison(net_df, network_type)
             per_network_dfs.append(net_df)
 
     pooled_resilience_per_scenario(perf_df, OUTPUT + "/pooled")
@@ -1912,8 +2471,10 @@ def evaluate(folder_id):
     if len(per_network_dfs) > 1:
         pooled_df = pandas.concat(per_network_dfs, ignore_index=True)
         pooled_metric_comparison(pooled_df, OUTPUT + "/pooled")
+        cp_only_pooled_metric_comparison(pooled_df, OUTPUT + "/pooled")
     elif len(per_network_dfs) == 1:
         print("Only one network type found — skipping pooled metric analysis.")
+        cp_only_pooled_metric_comparison(per_network_dfs[0], OUTPUT + "/pooled")
 
 
 def main():
