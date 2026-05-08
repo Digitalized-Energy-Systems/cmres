@@ -1,0 +1,1114 @@
+"""Dissertation-grade evaluation experiments.
+
+Each function below corresponds to one experiment in the dissertation plan.
+They all consume the same inputs as the existing ``cp_cn_evaluation.evaluate``
+pipeline (per-network dataframes plus a solved monee Network) so they can be
+called as one extra block at the end of ``evaluate()`` without touching the
+existing pipeline.
+
+Layout
+------
+``run_dissertation_block(...)`` is the entry point — it collects per-scenario
+artefacts and produces, for each experiment, one ``Path`` to the HTML output
+or the dataframe (so callers can decide what to emit further).
+
+Mapping to existing eval functions
+----------------------------------
+E1  cp_metric_vs_actual_impact       (per-network ρ + ranking battery)
+E5  cp_only_metric_comparison        (per-CP-type heatmap)
+E1/E5 pooled equivalents:
+    pooled_metric_comparison, cp_only_pooled_metric_comparison
+
+The functions below add the experiments NOT covered by the existing eval:
+
+E2  experiment_e2_ablation        — per-factor ablation of predicted_score
+E3  experiment_e3_density          — ρ vs CP density across scenarios
+E4  experiment_e4_distribution     — distributed vs centralized comparison
+E6  experiment_e6_sensitivity      — hyperparameter sweep (α, weights, etc.)
+E7  experiment_e7_mc_validity      — RHW(n) curves, AV variance reduction
+E8  experiment_e8_multilayer       — multilayer centralities → df_scores
+E9  experiment_e9_percolation      — robustness curves + AUC per metric
+E10 experiment_e10_structural      — coupling-strength scalars per scenario
+E11 experiment_e11_null_models     — z-scores of structural quantities
+E12 experiment_e12_community       — community + bridge_score
+E13 experiment_e13_spectral        — λ₂, Kirchhoff per scenario / per layer
+E15 experiment_e15_structural      — DDaR, source-sink BC, k-shortest, substitutability
+E16 experiment_e16_single_removal  — single-removal-shed validation (slurm-fed CSV)
+
+Shared logic (matched-df construction, statistical helpers, id matching) is
+imported from ``eval_common`` so the same code paths run here and in
+``cp_cn_evaluation``.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable, Dict, List, Optional
+
+import networkx as nx
+import numpy as np
+import pandas as pd
+import scipy.stats as _stats  # used by E12 partial-correlation residual test
+
+import cmres.evaluation.evaluation as eval
+
+import cp_metric_complex as cmc
+import eval_common as _ec
+from cp_metric import (
+    CPMetricConfig,
+    mes_all_components_metric,
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Container shuttling per-scenario artefacts between experiments
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class ScenarioArtefacts:
+    """Bundle of per-scenario inputs that each experiment may consume.
+
+    ``df_eval``: matched (predicted vs actual) dataframe from
+        ``cp_metric_vs_actual_impact`` — the *unfiltered* one.
+    ``monee_net``: the post-solve network used by cp_metric.
+    ``mc_npz_path``: optional path to the scenario's mc_result.npz; used by
+        E7 for the convergence trace and antithetic effectiveness.
+    ``label``: scenario name (e.g. ``"simbench_lv"``).
+    ``density``: optional CP density for E3 (caller passes through from
+        ``ALL_GRIDS``); ``None`` if unknown.
+    ``distribution``: ``"distributed" | "centralized" | None`` for E4.
+    ``multilayer_G``: cached multilayer graph (built lazily by E8 and reused
+        by E9, E11, E12, E13).
+    """
+
+    label: str
+    df_eval: pd.DataFrame
+    monee_net: object
+    mc_npz_path: Optional[Path] = None
+    density: Optional[float] = None
+    distribution: Optional[str] = None
+    multilayer_G: Optional[nx.Graph] = field(default=None, repr=False)
+
+    def get_multilayer_graph(self) -> nx.Graph:
+        if self.multilayer_G is None:
+            self.multilayer_G = cmc.build_multilayer_graph(self.monee_net)
+        return self.multilayer_G
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared helpers (re-exported from eval_common; aliased to keep the
+# underscore-prefixed call-site convention used throughout this module)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+_spearman_with_ci = _ec.spearman_with_ci
+_wilcoxon = _ec.wilcoxon
+_holm_correct = _ec.holm_correct
+_extract_orig_id = _ec.extract_orig_id
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# E2 — Per-factor ablation of predicted_score
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+_ABLATION_VARIANTS: Dict[str, dict] = {
+    "full":             {},
+    "no_throughput":    {"ABLATE_THROUGHPUT": True},
+    "no_stress":        {"ABLATE_STRESS": True},
+    "no_topo":          {"ABLATE_TOPO": True},
+    "no_adequacy":      {"ABLATE_ADEQUACY": True},
+}
+
+
+def experiment_e2_ablation(
+    monee_net,
+    impact_df_nt,
+    network_type: str,
+    output_dir: Path,
+    eps: float = _ec.MC_FAILED_EPS,
+    df_eval_full: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
+    """Run mes_all_components_metric once per ablation variant and report
+    Spearman ρ vs MC actual_total. Effect of removing factor X is
+    ``ρ(full) − ρ(no_X)``.
+
+    ``df_eval_full`` is the matched dataframe from
+    ``cp_metric_vs_actual_impact`` for this scenario. When provided, the
+    ``"full"`` variant is read from it instead of re-running
+    ``mes_all_components_metric`` — this saves the expensive PTDF computation
+    that has already been done.
+
+    Returns a tidy DataFrame ``(variant, ρ, ρ_lo, ρ_hi, p, delta_vs_full,
+    n)`` ready for plotting.
+    """
+
+    def _rho_for_matched(df_matched: pd.DataFrame):
+        df = df_matched[df_matched["actual_total"].astype(float) > eps]
+        if len(df) < 3:
+            return (float("nan"), float("nan"), float("nan"), float("nan"), len(df))
+        rho, p, lo, hi = _spearman_with_ci(df["predicted_score"], df["actual_total"])
+        return rho, p, lo, hi, len(df)
+
+    rows = []
+    rho_full: Optional[float] = None
+    for variant, kwargs in _ABLATION_VARIANTS.items():
+        if variant == "full" and df_eval_full is not None and len(df_eval_full) > 0:
+            # Reuse the already-computed matched df from the per-scenario run.
+            df_matched = df_eval_full
+        else:
+            cfg = CPMetricConfig(**kwargs)
+            df_scores, _ = mes_all_components_metric(monee_net, cfg=cfg)
+            df_matched = _ec.build_matched_df(df_scores, impact_df_nt)
+        rho, p, lo, hi, n = _rho_for_matched(df_matched)
+        if variant == "full":
+            rho_full = rho
+        rows.append({
+            "variant": variant,
+            "rho": rho, "p": p, "ci_lo": lo, "ci_hi": hi,
+            "n": n,
+            "delta_vs_full": (
+                rho - rho_full
+                if (rho_full is not None and np.isfinite(rho) and np.isfinite(rho_full))
+                else float("nan")
+            ),
+        })
+    out_df = pd.DataFrame(rows)
+    output_dir.mkdir(exist_ok=True, parents=True)
+    out_df.to_csv(output_dir / f"E2_ablation_{network_type}.csv", index=False)
+    return out_df
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# E3 — ρ vs CP density across scenarios
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def experiment_e3_density(
+    artefacts: List[ScenarioArtefacts],
+    output_dir: Path,
+    metrics: Optional[List[str]] = None,
+) -> pd.DataFrame:
+    """For each metric × scenario, compute ρ vs MC actual_total restricted
+    to MC-sampled CPs, then emit one figure with ρ vs density (one line per
+    metric). If multiple distributions are present at the same density, the
+    figure colours them differently so the centralized vs distributed gap
+    is visible at d=0.5.
+    """
+    if metrics is None:
+        metrics = [
+            "predicted_score",   # full (with ablations off)
+            "predicted_stress",  # PTDF stress only
+            "topo_factor",       # 1 + α·BC alone
+            "input_adequacy",
+            "local_score",
+            "self_score",
+            "katz_score",
+            "vitality_score",
+        ]
+    rows: List[dict] = []
+    for art in artefacts:
+        if art.density is None:
+            continue
+        df = art.df_eval.copy()
+        df = df[df["actual_total"].astype(float) > 0]
+        if len(df) < 3:
+            continue
+        for m in metrics:
+            if m not in df.columns:
+                continue
+            rho, p, lo, hi = _spearman_with_ci(df[m], df["actual_total"])
+            rows.append({
+                "scenario": art.label,
+                "density": art.density,
+                "distribution": art.distribution or "distributed",
+                "metric": m,
+                "rho": rho, "p": p, "ci_lo": lo, "ci_hi": hi,
+                "n": len(df),
+            })
+    out_df = pd.DataFrame(rows)
+    output_dir.mkdir(exist_ok=True, parents=True)
+    out_df.to_csv(output_dir / "E3_rho_vs_density.csv", index=False)
+
+    # Plot: ρ vs density per metric, coloured by metric, faceted on
+    # distribution. Bootstrap CI as error bars.
+    if not out_df.empty:
+        import plotly.graph_objects as go
+        import plotly.express as px
+        fig = go.Figure()
+        cmap = {m: c for m, c in zip(metrics, px.colors.qualitative.Plotly)}
+        for m in metrics:
+            sub = out_df[out_df["metric"] == m].sort_values("density")
+            if sub.empty:
+                continue
+            fig.add_trace(go.Scatter(
+                x=sub["density"], y=sub["rho"],
+                error_y=dict(
+                    type="data", symmetric=False,
+                    array=(sub["ci_hi"] - sub["rho"]).clip(lower=0),
+                    arrayminus=(sub["rho"] - sub["ci_lo"]).clip(lower=0),
+                ),
+                mode="lines+markers", name=m, marker=dict(color=cmap.get(m), size=8),
+                hovertext=sub["scenario"],
+            ))
+        fig.update_layout(
+            template="plotly_white",
+            height=520, width=900,
+            xaxis=dict(title="CP density"),
+            yaxis=dict(title="Spearman ρ vs MC actual_total", range=[-1.05, 1.05],
+                       zeroline=True, zerolinecolor="black"),
+            legend=dict(title="Metric"),
+            margin={"l": 60, "b": 60, "r": 20, "t": 40},
+        )
+        eval.write_all_in_one(
+            [fig], "Figure", Path("."),
+            str(output_dir / "E3_rho_vs_density.html"),
+            titles=["E3: Spearman ρ vs CP density per metric"],
+            slugs=["e3_rho_vs_density"],
+        )
+    return out_df
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# E4 — Distributed vs centralized at matched density
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def experiment_e4_distribution(
+    artefacts: List[ScenarioArtefacts],
+    output_dir: Path,
+) -> Dict[str, pd.DataFrame]:
+    """Pair scenarios at matched density across distribution variants.
+    Compute (a) impact concentration (Gini, top-1, top-5 share, entropy)
+    per scenario, (b) per-metric ρ comparison.
+    """
+    out_dir = Path(output_dir)
+    out_dir.mkdir(exist_ok=True, parents=True)
+
+    # (a) Concentration of impact per scenario.
+    conc_rows: List[dict] = []
+    for art in artefacts:
+        df = art.df_eval
+        if df.empty:
+            continue
+        actual = df["actual_total"].astype(float).abs().values
+        c = cmc.criticality_concentration(actual)
+        conc_rows.append({
+            "scenario": art.label,
+            "density": art.density,
+            "distribution": art.distribution or "distributed",
+            **{f"actual_{k}": v for k, v in c.items()},
+        })
+    conc_df = pd.DataFrame(conc_rows)
+    conc_df.to_csv(out_dir / "E4_impact_concentration.csv", index=False)
+
+    # (b) Per-metric ρ table, paired by density.
+    rho_rows: List[dict] = []
+    metrics = [c for c in [
+        "predicted_score", "predicted_stress", "topo_factor",
+        "input_adequacy", "local_score", "self_score",
+    ] if all(c in a.df_eval.columns for a in artefacts)]
+    for art in artefacts:
+        df = art.df_eval[art.df_eval["actual_total"] > 0]
+        if len(df) < 3:
+            continue
+        for m in metrics:
+            rho, p, lo, hi = _spearman_with_ci(df[m], df["actual_total"])
+            rho_rows.append({
+                "scenario": art.label,
+                "density": art.density,
+                "distribution": art.distribution or "distributed",
+                "metric": m, "rho": rho, "n": len(df),
+            })
+    rho_df = pd.DataFrame(rho_rows)
+    rho_df.to_csv(out_dir / "E4_rho_by_distribution.csv", index=False)
+    return {"concentration": conc_df, "rho": rho_df}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# E6 — Hyperparameter sensitivity
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def experiment_e6_sensitivity(
+    monee_net,
+    impact_df_nt,
+    network_type: str,
+    output_dir: Path,
+    sweeps: Optional[Dict[str, List]] = None,
+    base_kwargs: Optional[dict] = None,
+) -> pd.DataFrame:
+    """Sweep hyperparameters and record ρ vs MC actual_total. Default sweep
+    covers TOPO_ALPHA, the carrier weights, HEAT_REMOTENESS_ALPHA,
+    HEAT_DELTA_T_K, SUSCEPTANCE_B_RELATIVE_CAP. Each parameter is varied
+    one-at-a-time around the default config; the result is a tornado-style
+    table where each row is one (parameter, value, ρ).
+    """
+    base_kwargs = base_kwargs or {}
+    if sweeps is None:
+        sweeps = {
+            "TOPO_ALPHA":              [0.0, 0.5, 1.0, 2.0, 5.0],
+            "W_POWER":                 [0.0, 0.5, 1.0, 2.0],
+            "W_GAS":                   [0.0, 0.5, 1.0, 2.0],
+            "W_HEAT":                  [0.0, 0.5, 1.0, 2.0],
+            "HEAT_REMOTENESS_ALPHA":   [0.0, 0.5, 1.0, 2.0, 5.0],
+            "HEAT_DELTA_T_K":          [10.0, 20.0, 30.0, 50.0],
+            "SUSCEPTANCE_B_RELATIVE_CAP": [10.0, 50.0, 100.0, 500.0],
+        }
+
+    def _rho_for(cfg: CPMetricConfig) -> float:
+        df_scores, _ = mes_all_components_metric(monee_net, cfg=cfg)
+        df_matched = _ec.build_matched_df(df_scores, impact_df_nt)
+        df_matched = df_matched[df_matched["actual_total"].astype(float) > _ec.MC_FAILED_EPS]
+        if len(df_matched) < 3:
+            return float("nan")
+        rho, _, _, _ = _spearman_with_ci(df_matched["predicted_score"], df_matched["actual_total"])
+        return rho
+
+    rho_baseline = _rho_for(CPMetricConfig(**base_kwargs))
+    rows: List[dict] = []
+    rows.append({"param": "(baseline)", "value": "default", "rho": rho_baseline,
+                 "delta_vs_baseline": 0.0})
+    for param, values in sweeps.items():
+        for v in values:
+            kw = dict(base_kwargs)
+            kw[param] = v
+            rho = _rho_for(CPMetricConfig(**kw))
+            rows.append({
+                "param": param, "value": v, "rho": rho,
+                "delta_vs_baseline": (rho - rho_baseline)
+                if (np.isfinite(rho) and np.isfinite(rho_baseline)) else float("nan"),
+            })
+    out_df = pd.DataFrame(rows)
+    output_dir.mkdir(exist_ok=True, parents=True)
+    out_df.to_csv(output_dir / f"E6_sensitivity_{network_type}.csv", index=False)
+    return out_df
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# E7 — MC validity diagnostics
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def experiment_e7_mc_validity(
+    artefacts: List[ScenarioArtefacts],
+    output_dir: Path,
+) -> pd.DataFrame:
+    """Read the convergence trace stored by MCEngine in mc_result.npz and
+    emit (a) RHW(n) per carrier per scenario, (b) the antithetic
+    variance-reduction factor estimated from per_run pairs.
+    """
+    out_dir = Path(output_dir)
+    out_dir.mkdir(exist_ok=True, parents=True)
+
+    summary: List[dict] = []
+    rhw_rows: List[dict] = []
+    for art in artefacts:
+        if art.mc_npz_path is None or not art.mc_npz_path.exists():
+            continue
+        with np.load(art.mc_npz_path) as data:
+            conv = data.get("convergence", np.empty((0, 8)))
+            per_run = data.get("per_run", np.empty((0, 3)))
+            n_runs = int(data.get("n_runs", np.array([0]))[0])
+        # RHW vs n.
+        if conv.size:
+            for row in conv:
+                n_now = int(row[0])
+                mean_now = row[1:4]
+                rhw_now = row[4:7]
+                ess_now = float(row[7])
+                for k, name in enumerate(["power", "heat", "gas"]):
+                    rhw_rows.append({
+                        "scenario": art.label, "n": n_now, "carrier": name,
+                        "mean": float(mean_now[k]), "rhw": float(rhw_now[k]),
+                        "ess": ess_now,
+                    })
+        # Antithetic variance reduction: assumes paired (Y, Y_av) layout.
+        # If per_run is shaped (N, 3) with even N and antithetic enabled, then
+        # rows 2k and 2k+1 are a pair.
+        var_y = float("nan")
+        var_pair = float("nan")
+        var_reduction = float("nan")
+        if per_run.size and per_run.shape[0] >= 4 and per_run.shape[0] % 2 == 0:
+            # per-carrier independent variance estimate
+            Y = per_run[0::2]   # (N/2, 3)
+            Y_av = per_run[1::2]  # (N/2, 3)
+            var_y_vec = np.var(per_run, axis=0, ddof=1)        # naive Var(Y)
+            var_pair_vec = np.var((Y + Y_av) / 2.0, axis=0, ddof=1)  # Var of pair-mean
+            var_y = float(np.nanmean(var_y_vec))
+            var_pair = float(np.nanmean(var_pair_vec))
+            if var_pair > 0:
+                var_reduction = float(var_y / (2 * var_pair))
+        summary.append({
+            "scenario": art.label,
+            "n_runs": n_runs,
+            "var_naive": var_y,
+            "var_antithetic_pair_mean": var_pair,
+            "AV_reduction_factor": var_reduction,
+        })
+    summary_df = pd.DataFrame(summary)
+    rhw_df = pd.DataFrame(rhw_rows)
+    summary_df.to_csv(out_dir / "E7_mc_summary.csv", index=False)
+    rhw_df.to_csv(out_dir / "E7_rhw_curves.csv", index=False)
+    return summary_df
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# E8 — Multilayer centralities → df_scores augmentation
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def experiment_e8_multilayer(
+    artefacts: List[ScenarioArtefacts],
+    output_dir: Path,
+) -> pd.DataFrame:
+    """Compute multilayer centralities per scenario and join them onto
+    each artefact's ``df_eval`` so downstream eval can compare ρ for
+    multilayer vs single-layer centralities.
+
+    The join is by the ``carrier`` of the CP's "input" node mapped onto
+    the multilayer (carrier, orig_id) tuple. Non-CP rows are joined by
+    matching (carrier, orig_id) for their primary carrier endpoint.
+
+    Returns a tidy DataFrame ``(scenario, metric, rho, n)`` for the new
+    multilayer metrics so the dissertation can include them in the
+    main-results table.
+    """
+    out_dir = Path(output_dir)
+    out_dir.mkdir(exist_ok=True, parents=True)
+    rows: List[dict] = []
+    for art in artefacts:
+        G = art.get_multilayer_graph()
+        cents_df = cmc.multilayer_centralities(G)
+        if cents_df.empty:
+            continue
+        # Aggregate (carrier, orig_id) → max over its participating layers
+        # so each component gets a single ml_bc / participation / ml_degree
+        # row regardless of how many layers it touches.
+        agg = (
+            cents_df.groupby("orig_id", as_index=False)
+            .agg({"ml_bc": "max", "ml_degree": "max",
+                  "activity": "max", "participation": "max",
+                  "inter_layer_degree": "max"})
+        )
+        # Join onto df_eval. df_eval has cp_id strings — extract numeric id
+        # for compounds and "from" id for branch CPs. Best-effort join.
+        df = art.df_eval.copy()
+        df["_join_id"] = df["cp_id"].astype(str).map(_extract_orig_id)
+        merged = df.merge(agg, left_on="_join_id", right_on="orig_id", how="left")
+        # Update artefact in place so later experiments (E9 ranking) see it.
+        art.df_eval = merged
+
+        valid = merged[merged["actual_total"] > 0]
+        for m in ["ml_bc", "ml_degree", "activity", "participation", "inter_layer_degree"]:
+            if m not in valid.columns or valid[m].notna().sum() < 3:
+                continue
+            sub = valid[valid[m].notna()]
+            rho, p, lo, hi = _spearman_with_ci(sub[m], sub["actual_total"])
+            rows.append({
+                "scenario": art.label, "metric": m, "rho": rho,
+                "p": p, "ci_lo": lo, "ci_hi": hi, "n": int(len(sub)),
+            })
+    out_df = pd.DataFrame(rows)
+    out_df.to_csv(out_dir / "E8_multilayer_rho.csv", index=False)
+    return out_df
+
+
+def _extract_orig_id(cp_id: str):
+    """Pull the integer 'orig_id' out of a cp_id string. ``"compound:5"`` →
+    5, ``"branch:(5, 134, 0)"`` → 5, ``"5→134"`` → 5. Returns None on
+    failure.
+    """
+    s = str(cp_id)
+    try:
+        if s.startswith("compound:"):
+            return int(s[len("compound:"):])
+        if s.startswith("branch:"):
+            inner = s[len("branch:"):].strip("()")
+            return int(inner.split(",")[0].strip())
+        if "→" in s:
+            return int(s.split("→")[0].strip())
+        # Fallback: pure int
+        return int(s)
+    except Exception:
+        return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# E9 — Percolation / robustness curves per metric
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def experiment_e9_percolation(
+    artefacts: List[ScenarioArtefacts],
+    output_dir: Path,
+    metrics: Optional[List[str]] = None,
+    n_random: int = 20,
+) -> pd.DataFrame:
+    """For each scenario and each metric, compute the targeted-attack AUC
+    on the multilayer graph and compare to a random-removal baseline.
+
+    Lower AUC = more effective attack ordering. The z-score of (random
+    AUC − targeted AUC) / std is the effect size.
+    """
+    out_dir = Path(output_dir)
+    out_dir.mkdir(exist_ok=True, parents=True)
+    if metrics is None:
+        metrics = ["predicted_score", "predicted_stress", "topo_factor",
+                   "ml_bc", "input_adequacy", "katz_score", "vitality_score"]
+
+    rng = np.random.default_rng(0)
+    rows: List[dict] = []
+    for art in artefacts:
+        G = art.get_multilayer_graph()
+        if G.number_of_nodes() == 0:
+            continue
+        # Map cp_id → multilayer node tuple. We use a *primary* carrier:
+        # for compound CPs, prefer the connected_to entry; for branch CPs,
+        # use the from-node side.
+        df = art.df_eval.copy()
+        df["_orig_id"] = df["cp_id"].astype(str).map(_extract_orig_id)
+        # Build a per-metric ranking dict {ml_node_id: score}.
+        for m in metrics:
+            if m not in df.columns:
+                continue
+            scoring = df[df[m].notna()].copy()
+            ranking: Dict = {}
+            for r in scoring.itertuples(index=False):
+                if r._orig_id is None:
+                    continue
+                # Try every carrier — whichever exists in G.
+                for carrier in ("power", "gas", "heat"):
+                    nid = (carrier, int(r._orig_id))
+                    if G.has_node(nid):
+                        prev = ranking.get(nid)
+                        if prev is None or float(getattr(r, m)) > prev:
+                            ranking[nid] = float(getattr(r, m))
+                        break
+            if not ranking:
+                continue
+            res = cmc.percolation_for_metric(G, ranking, rng=rng, n_random=n_random)
+            rows.append({
+                "scenario": art.label, "metric": m,
+                "AUC_metric": res["AUC_metric"],
+                "AUC_random_mean": res["AUC_random_mean"],
+                "AUC_random_std": res["AUC_random_std"],
+                "AUC_z": res["AUC_z"],
+                "n_ranked": len(ranking),
+            })
+    out_df = pd.DataFrame(rows)
+    out_df.to_csv(out_dir / "E9_percolation_auc.csv", index=False)
+    return out_df
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# E10 — Coupling-strength characterisation
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def experiment_e10_structural(
+    artefacts: List[ScenarioArtefacts],
+    output_dir: Path,
+) -> pd.DataFrame:
+    """Per-scenario structural summary: σ_c per layer pair, total σ_c,
+    CP-localization Gini. The scenario-level MC ENS is included so a
+    follow-up regression can test the "structural mediator" hypothesis
+    (RQ10).
+    """
+    out_dir = Path(output_dir)
+    out_dir.mkdir(exist_ok=True, parents=True)
+    rows: List[dict] = []
+    for art in artefacts:
+        G = art.get_multilayer_graph()
+        cs = cmc.coupling_strength(G)
+        # Gather scenario-level MC ENS as the sum of |actual_total| over CP
+        # rows (proxy for total expected impact attributable to CPs in MC).
+        df = art.df_eval
+        ens_proxy = float(df["actual_total"].astype(float).abs().sum()) if "actual_total" in df else float("nan")
+        rows.append({
+            "scenario": art.label,
+            "density": art.density,
+            "distribution": art.distribution or "distributed",
+            "n_inter_edges": cs["n_inter_edges"],
+            "sigma_c_total": cs["sigma_c_total"],
+            "cp_localization_gini": cs["cp_localization_gini"],
+            "mc_ens_proxy": ens_proxy,
+            **{f"sigma_c[{k}]": v for k, v in cs["sigma_c"].items()},
+            **{f"intra_edges_{k}": v for k, v in cs["n_intra_edges_per_layer"].items()},
+        })
+    out_df = pd.DataFrame(rows)
+    out_df.to_csv(out_dir / "E10_coupling_strength.csv", index=False)
+    return out_df
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# E11 — Null-model z-scores
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def experiment_e11_null_models(
+    artefacts: List[ScenarioArtefacts],
+    output_dir: Path,
+    n_nulls: int = 100,
+    kinds: Optional[List[str]] = None,
+) -> pd.DataFrame:
+    """For each scenario, compare three structural quantities of the
+    observed multilayer graph against degree-preserving and ER null
+    ensembles:
+      1. Average BC
+      2. Algebraic connectivity λ₂ of the supra-Laplacian
+      3. Targeted-attack AUC under degree ordering
+    """
+    out_dir = Path(output_dir)
+    out_dir.mkdir(exist_ok=True, parents=True)
+    kinds = kinds or ["config", "er"]
+
+    def _avg_bc(G: nx.Graph) -> float:
+        if G.number_of_nodes() == 0:
+            return float("nan")
+        bc = nx.betweenness_centrality(G, normalized=True)
+        return float(np.mean(list(bc.values()))) if bc else float("nan")
+
+    def _supra_lambda2(G: nx.Graph) -> float:
+        return cmc._algebraic_connectivity(G)
+
+    def _attack_auc_by_degree(G: nx.Graph) -> float:
+        if G.number_of_nodes() == 0:
+            return float("nan")
+        order = sorted(G.nodes, key=lambda n: G.degree(n), reverse=True)
+        return cmc.attack_auc(cmc.percolation_curve(G, order))
+
+    stats: Dict[str, Callable] = {
+        "avg_bc": _avg_bc,
+        "lambda2_supra": _supra_lambda2,
+        "AUC_degree_attack": _attack_auc_by_degree,
+    }
+
+    rows: List[dict] = []
+    for art in artefacts:
+        G = art.get_multilayer_graph()
+        for kind in kinds:
+            for name, fn in stats.items():
+                try:
+                    z = cmc.null_model_z_scores(G, fn, n=n_nulls, kind=kind, seed=42)
+                except Exception as e:
+                    z = {"observed": float("nan"), "null_mean": float("nan"),
+                         "null_std": float("nan"), "z": float("nan"),
+                         "p_one_sided_upper": float("nan")}
+                rows.append({
+                    "scenario": art.label, "null_kind": kind,
+                    "statistic": name, **z,
+                })
+    out_df = pd.DataFrame(rows)
+    out_df.to_csv(out_dir / "E11_null_z.csv", index=False)
+    return out_df
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# E12 — Community structure & cross-layer bridges
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def experiment_e12_community(
+    artefacts: List[ScenarioArtefacts],
+    output_dir: Path,
+) -> pd.DataFrame:
+    """Compute community partition + bridge_score per multilayer node,
+    then test whether bridge_score adds explanatory power for MC
+    actual_total beyond BC alone.
+
+    Reports per-scenario partial correlations:
+      - ρ(bridge_score, actual_total)
+      - ρ(bridge_score, actual_total | BC) via residualisation
+    """
+    out_dir = Path(output_dir)
+    out_dir.mkdir(exist_ok=True, parents=True)
+    rows: List[dict] = []
+    for art in artefacts:
+        G = art.get_multilayer_graph()
+        if G.number_of_nodes() == 0:
+            continue
+        partition = cmc.community_partition(G, seed=42)
+        bridge = cmc.bridge_score(G, partition)
+        df = art.df_eval.copy()
+        df["_orig_id"] = df["cp_id"].astype(str).map(_extract_orig_id)
+        # Map to multilayer node and look up bridge / community.
+        comp_bridge: List[float] = []
+        comp_actual: List[float] = []
+        comp_bc: List[float] = []
+        for r in df.itertuples(index=False):
+            if not r._orig_id:
+                continue
+            for carrier in ("power", "gas", "heat"):
+                nid = (carrier, int(r._orig_id))
+                if nid in bridge:
+                    comp_bridge.append(float(bridge[nid]))
+                    comp_actual.append(float(r.actual_total))
+                    comp_bc.append(float(getattr(r, "topo_bc", float("nan"))))
+                    break
+        if len(comp_bridge) < 5:
+            continue
+        rho_raw, p_raw, _, _ = _spearman_with_ci(comp_bridge, comp_actual)
+        # Residualise against BC: regress actual on BC, take residuals,
+        # correlate residuals with bridge.
+        bridge_arr = np.asarray(comp_bridge)
+        actual_arr = np.asarray(comp_actual)
+        bc_arr = np.asarray(comp_bc)
+        mask = np.isfinite(bridge_arr) & np.isfinite(actual_arr) & np.isfinite(bc_arr)
+        bridge_arr, actual_arr, bc_arr = bridge_arr[mask], actual_arr[mask], bc_arr[mask]
+        rho_partial, p_partial = float("nan"), float("nan")
+        if bridge_arr.size >= 5 and np.std(bc_arr) > 0:
+            slope = np.cov(actual_arr, bc_arr, ddof=1)[0, 1] / np.var(bc_arr, ddof=1)
+            intercept = np.mean(actual_arr) - slope * np.mean(bc_arr)
+            actual_resid = actual_arr - (slope * bc_arr + intercept)
+            try:
+                res = _stats.spearmanr(bridge_arr, actual_resid)
+                rho_partial, p_partial = float(res.statistic), float(res.pvalue)
+            except Exception:
+                pass
+        rows.append({
+            "scenario": art.label,
+            "n": int(bridge_arr.size),
+            "n_communities": int(len(set(partition.values()))) if partition else 0,
+            "rho_bridge_vs_actual": rho_raw,
+            "p_bridge_vs_actual": p_raw,
+            "rho_bridge_vs_actual_given_bc": rho_partial,
+            "p_bridge_vs_actual_given_bc": p_partial,
+        })
+    out_df = pd.DataFrame(rows)
+    out_df.to_csv(out_dir / "E12_bridges.csv", index=False)
+    return out_df
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# E13 — Spectral robustness
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def experiment_e13_spectral(
+    artefacts: List[ScenarioArtefacts],
+    output_dir: Path,
+) -> pd.DataFrame:
+    """Per-scenario λ₂ per layer + supra, plus Kirchhoff index of the
+    largest connected component of the supra-graph.
+    """
+    out_dir = Path(output_dir)
+    out_dir.mkdir(exist_ok=True, parents=True)
+    rows: List[dict] = []
+    for art in artefacts:
+        G = art.get_multilayer_graph()
+        spectral = cmc.spectral_robustness(G)
+        # Kirchhoff is undefined if graph is disconnected. Take the largest CC.
+        if G.number_of_nodes() > 0:
+            largest_cc = max(nx.connected_components(G), key=len)
+            sub = G.subgraph(largest_cc).copy()
+            kirchhoff = cmc.kirchhoff_index(sub)
+        else:
+            kirchhoff = float("nan")
+        rows.append({
+            "scenario": art.label,
+            "density": art.density,
+            "distribution": art.distribution or "distributed",
+            "kirchhoff_lcc": kirchhoff,
+            **{k: float(v) for k, v in spectral.items()},
+        })
+    out_df = pd.DataFrame(rows)
+    out_df.to_csv(out_dir / "E13_spectral.csv", index=False)
+    return out_df
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# E15 — Structural metrics (DDaR, source-sink BC, k-shortest, substitutability)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def experiment_e15_structural(
+    artefacts: List[ScenarioArtefacts],
+    output_dir: Path,
+    enable_min_cut: bool = False,
+    k_shortest: int = 3,
+) -> pd.DataFrame:
+    """Attach structural metrics to each scenario's df_eval and report
+    Spearman ρ vs MC actual_total per metric per scenario.
+
+    The structural metrics (ddar_mw_total, ss_bc_total,
+    kshortest_redundancy_total, substitutability, optionally
+    min_cut_criticality_total) are joined onto ``art.df_eval`` so that
+    downstream functions (E2 ablation, E9 percolation) can also see them.
+
+    ``enable_min_cut=True`` adds the expensive min-cut criticality —
+    feasible on simbench LV but takes a few minutes per scenario.
+    """
+    import cp_metric_structural as cms
+
+    out_dir = Path(output_dir)
+    out_dir.mkdir(exist_ok=True, parents=True)
+    rows: List[dict] = []
+    metrics = [
+        "ddar_mw_total",
+        "ss_bc_total",
+        "kshortest_redundancy_total",
+        "substitutability",
+        "rated_capacity_mw",
+    ]
+    if enable_min_cut:
+        metrics.append("min_cut_criticality_total")
+
+    for art in artefacts:
+        try:
+            augmented = cms.attach_structural_metrics(
+                art.df_eval, art.monee_net,
+                enable_min_cut=enable_min_cut, k_shortest=k_shortest,
+            )
+        except Exception as e:
+            print(f"[E15:{art.label}] attach_structural_metrics failed: {type(e).__name__}: {e}")
+            continue
+        # Update the artefact in place so E2/E9/E12 see the new columns.
+        art.df_eval = augmented
+        valid = augmented[augmented["actual_total"].astype(float) > _ec.MC_FAILED_EPS]
+        for m in metrics:
+            if m not in valid.columns:
+                continue
+            sub = valid[valid[m].notna()]
+            if len(sub) < 3:
+                continue
+            rho, p, lo, hi = _spearman_with_ci(sub[m], sub["actual_total"])
+            rows.append({
+                "scenario": art.label,
+                "metric": m,
+                "rho": rho, "p": p, "ci_lo": lo, "ci_hi": hi,
+                "n": int(len(sub)),
+            })
+    out_df = pd.DataFrame(rows)
+    out_df.to_csv(out_dir / "E15_structural_rho.csv", index=False)
+    return out_df
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# E16 — Single-removal-shed validation (analytical ground truth)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def experiment_e16_single_removal_validation(
+    artefacts: List[ScenarioArtefacts],
+    output_dir: Path,
+    shed_dir: Optional[Path] = None,
+    metrics: Optional[List[str]] = None,
+) -> pd.DataFrame:
+    """Compare each metric to the deterministic single-removal load shed.
+
+    For every scenario whose
+    ``shed_dir/single_removal_shed_<scenario>.csv`` exists, join the shed
+    table onto the matched df_eval and compute Spearman ρ between every
+    candidate metric and the analytical shed (the structural ceiling) AND
+    between the analytical shed and the MC actual_total (an upper bound
+    on what any topology metric could achieve on this grid).
+
+    The expected layout is the one written by ``single_removal_shed.py``:
+
+        shed_dir/single_removal_shed_<scenario>.csv
+
+    Each row has ``cp_id, kind, total_shed`` (and per-carrier shed). The
+    join is on cp_id (str). Components for which a row is missing are
+    dropped from the analytical comparison.
+    """
+    out_dir = Path(output_dir)
+    out_dir.mkdir(exist_ok=True, parents=True)
+    if shed_dir is None:
+        shed_dir = out_dir.parent / "single_removal_shed"
+    metrics = metrics or [
+        "predicted_score", "predicted_stress",
+        "topo_factor", "topo_bc",
+        "input_adequacy", "local_score", "self_score",
+        "katz_score", "vitality_score",
+        "ddar_mw_total", "ss_bc_total", "kshortest_redundancy_total",
+        "substitutability", "ml_bc",
+    ]
+
+    rows: List[dict] = []
+    ceiling_rows: List[dict] = []
+    for art in artefacts:
+        shed_csv = Path(shed_dir) / f"single_removal_shed_{art.label}.csv"
+        if not shed_csv.exists():
+            print(f"[E16:{art.label}] no shed CSV at {shed_csv}; skipping")
+            continue
+        shed = pd.read_csv(shed_csv)
+        shed = shed[shed["cp_id"] != "_baseline_"]
+        df = art.df_eval.copy()
+        df["cp_id"] = df["cp_id"].astype(str)
+        shed["cp_id"] = shed["cp_id"].astype(str)
+        merged = df.merge(
+            shed[["cp_id", "total_shed", "power_shed", "heat_shed", "gas_shed"]],
+            on="cp_id", how="inner",
+        )
+        if merged.empty:
+            continue
+
+        # Ceiling: how well does the analytical ground truth itself match MC?
+        if "actual_total" in merged.columns:
+            cmask = merged["actual_total"].astype(float) > _ec.MC_FAILED_EPS
+            if cmask.sum() >= 3:
+                rho, p, lo, hi = _spearman_with_ci(
+                    merged.loc[cmask, "total_shed"],
+                    merged.loc[cmask, "actual_total"],
+                )
+                ceiling_rows.append({
+                    "scenario": art.label,
+                    "rho_shed_vs_mc": rho, "p_shed_vs_mc": p,
+                    "ci_lo": lo, "ci_hi": hi,
+                    "n": int(cmask.sum()),
+                })
+
+        # Per-metric ρ vs analytical shed (the metric quality ceiling).
+        for m in metrics:
+            if m not in merged.columns or merged[m].notna().sum() < 3:
+                continue
+            sub = merged[merged[m].notna() & merged["total_shed"].notna()]
+            if len(sub) < 3:
+                continue
+            rho_shed, p_shed, lo_shed, hi_shed = _spearman_with_ci(sub[m], sub["total_shed"])
+            # Also compare to MC for cross-reference.
+            rho_mc, p_mc, lo_mc, hi_mc = _spearman_with_ci(sub[m], sub["actual_total"])
+            rows.append({
+                "scenario": art.label,
+                "metric": m,
+                "rho_vs_shed": rho_shed, "p_vs_shed": p_shed,
+                "ci_lo_shed": lo_shed, "ci_hi_shed": hi_shed,
+                "rho_vs_mc":   rho_mc,   "p_vs_mc":   p_mc,
+                "ci_lo_mc":   lo_mc,   "ci_hi_mc":   hi_mc,
+                "n": int(len(sub)),
+            })
+    out_df = pd.DataFrame(rows)
+    out_df.to_csv(out_dir / "E16_metric_vs_shed.csv", index=False)
+    if ceiling_rows:
+        ceil_df = pd.DataFrame(ceiling_rows)
+        ceil_df.to_csv(out_dir / "E16_shed_vs_mc_ceiling.csv", index=False)
+    return out_df
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Top-level runner
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def run_dissertation_block(
+    artefacts: List[ScenarioArtefacts],
+    impact_df: pd.DataFrame,
+    output_dir: Path,
+    enabled: Optional[List[str]] = None,
+) -> Dict[str, pd.DataFrame]:
+    """Run the full dissertation experiment battery.
+
+    ``enabled`` selects a subset of experiment IDs (e.g. ``["E2", "E8", "E9"]``).
+    Default = all of E2, E3, E4, E6, E7, E8, E9, E10, E11, E12, E13.
+    """
+    enabled = enabled or [
+        "E2", "E3", "E4", "E6", "E7",
+        "E8", "E9", "E10", "E11", "E12", "E13",
+        "E15", "E16",
+    ]
+    output_dir = Path(output_dir)
+    output_dir.mkdir(exist_ok=True, parents=True)
+    results: Dict[str, pd.DataFrame] = {}
+
+    # E8 and E15 must run before E2/E9/E12/E16 because they augment
+    # df_eval with new columns (ml_bc, ddar_mw_total, ss_bc_total,
+    # substitutability, …). Order: E8 → E15 → everything else.
+    if "E8" in enabled:
+        try:
+            results["E8"] = experiment_e8_multilayer(artefacts, output_dir)
+        except Exception as e:
+            print(f"[E8] FAILED: {type(e).__name__}: {e}")
+
+    if "E15" in enabled:
+        try:
+            results["E15"] = experiment_e15_structural(artefacts, output_dir)
+        except Exception as e:
+            print(f"[E15] FAILED: {type(e).__name__}: {e}")
+
+    if "E2" in enabled:
+        for art in artefacts:
+            scenario_imp = impact_df[impact_df["network_type"] == art.label] \
+                if "network_type" in impact_df.columns else impact_df
+            try:
+                # Pass the matched df from E1/E5 so the "full" variant doesn't
+                # rerun mes_all_components_metric (the slow part).
+                experiment_e2_ablation(
+                    art.monee_net, scenario_imp, art.label, output_dir,
+                    df_eval_full=art.df_eval,
+                )
+            except Exception as e:
+                print(f"[E2:{art.label}] FAILED: {type(e).__name__}: {e}")
+
+    if "E3" in enabled:
+        try:
+            results["E3"] = experiment_e3_density(artefacts, output_dir)
+        except Exception as e:
+            print(f"[E3] FAILED: {type(e).__name__}: {e}")
+
+    if "E4" in enabled:
+        try:
+            results.update({f"E4_{k}": v
+                           for k, v in experiment_e4_distribution(artefacts, output_dir).items()})
+        except Exception as e:
+            print(f"[E4] FAILED: {type(e).__name__}: {e}")
+
+    if "E6" in enabled:
+        for art in artefacts:
+            scenario_imp = impact_df[impact_df["network_type"] == art.label] \
+                if "network_type" in impact_df.columns else impact_df
+            try:
+                experiment_e6_sensitivity(art.monee_net, scenario_imp, art.label, output_dir)
+            except Exception as e:
+                print(f"[E6:{art.label}] FAILED: {type(e).__name__}: {e}")
+
+    if "E7" in enabled:
+        try:
+            results["E7"] = experiment_e7_mc_validity(artefacts, output_dir)
+        except Exception as e:
+            print(f"[E7] FAILED: {type(e).__name__}: {e}")
+
+    if "E9" in enabled:
+        try:
+            results["E9"] = experiment_e9_percolation(artefacts, output_dir)
+        except Exception as e:
+            print(f"[E9] FAILED: {type(e).__name__}: {e}")
+
+    if "E10" in enabled:
+        try:
+            results["E10"] = experiment_e10_structural(artefacts, output_dir)
+        except Exception as e:
+            print(f"[E10] FAILED: {type(e).__name__}: {e}")
+
+    if "E11" in enabled:
+        try:
+            results["E11"] = experiment_e11_null_models(artefacts, output_dir)
+        except Exception as e:
+            print(f"[E11] FAILED: {type(e).__name__}: {e}")
+
+    if "E12" in enabled:
+        try:
+            results["E12"] = experiment_e12_community(artefacts, output_dir)
+        except Exception as e:
+            print(f"[E12] FAILED: {type(e).__name__}: {e}")
+
+    if "E13" in enabled:
+        try:
+            results["E13"] = experiment_e13_spectral(artefacts, output_dir)
+        except Exception as e:
+            print(f"[E13] FAILED: {type(e).__name__}: {e}")
+
+    if "E16" in enabled:
+        # E16 reads the slurm-produced single_removal_shed CSVs from a
+        # parallel directory; if they don't exist, the experiment skips
+        # cleanly with a per-scenario warning.
+        try:
+            results["E16"] = experiment_e16_single_removal_validation(
+                artefacts, output_dir,
+            )
+        except Exception as e:
+            print(f"[E16] FAILED: {type(e).__name__}: {e}")
+
+    return results

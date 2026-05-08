@@ -1,0 +1,406 @@
+"""Analytical single-removal load-shed tool.
+
+For each component on a solved monee network, deactivate it, run a
+min-load-shedding optimisation, record the total load shed, then reactivate.
+The resulting (component_id → total_shed_mw) table is the deterministic,
+MC-independent ground truth that bounds what any structural criticality
+metric could achieve on this grid.
+
+CLI for SLURM
+-------------
+
+Per-shard run::
+
+    python single_removal_shed.py simbench_lv \\
+        --input-dir /path/to/run_simulation_output \\
+        --output-dir data/out/single_removal_shed \\
+        --shard 1 --n-shards 8
+
+Each shard takes a contiguous slice of the component list, runs its
+deactivate-solve-reactivate loop, and writes
+``single_removal_shed_<grid>_shard_<I>_of_<K>.csv``.
+
+Final merge::
+
+    python single_removal_shed.py simbench_lv \\
+        --output-dir data/out/single_removal_shed \\
+        --merge --n-shards 8
+
+Output: ``single_removal_shed_<grid>.csv`` ready to join against df_eval
+on ``cp_id``.
+
+The component slicing is deterministic (sorted by id), so re-running a
+particular shard reproduces its slice.
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import pickle
+import sys
+import time
+import traceback
+from pathlib import Path
+from typing import Iterable, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+
+import monee.model as mm
+import monee.problem as mp
+from monee import PyomoSolver, run_energy_flow, run_energy_flow_optimization
+
+log = logging.getLogger(__name__)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Component enumeration
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _enumerate_targets(monee_net) -> List[Tuple[str, str, object]]:
+    """Return ``(cp_id_str, kind, component)`` triples for everything we'd
+    deactivate. Mirrors the enumeration used by ``mes_all_components_metric``
+    so the cp_id strings match df_eval's keys 1-1.
+    """
+    targets: List[Tuple[str, str, object]] = []
+
+    # Compound CPs (CHP / CHPHG / PowerToHeat) → cp_id "compound:{id}"
+    for cls in (mm.CHP, mm.CHPHG, mm.PowerToHeat):
+        for cp in monee_net.compounds_by_type(cls):
+            targets.append((f"compound:{cp.id}", "compound", cp))
+
+    # Branch CPs (PowerToGas / GasToPower / PowerToHeatHG / GasToHeatHG)
+    # → cp_id "from→to" (matches mes_cp_metric's branch CP rows)
+    for cls in (mm.PowerToGas, mm.GasToPower, mm.PowerToHeatHG, mm.GasToHeatHG):
+        for b in monee_net.branches_by_type(cls):
+            targets.append(
+                (f"{b.from_node_id}→{b.to_node_id}", "branch_cp", b)
+            )
+
+    # Non-CP branches → cp_id is the str of the branch id (e.g. "(5, 134, 0)")
+    cp_branch_ids = set()
+    for cls in (mm.PowerToGas, mm.GasToPower, mm.PowerToHeatHG, mm.GasToHeatHG):
+        cp_branch_ids.update(b.id for b in monee_net.branches_by_type(cls))
+    for cls in (mm.GenericPowerBranch, mm.GasPipe, mm.WaterPipe, mm.HeatExchanger):
+        for b in monee_net.branches_by_type(cls):
+            if b.id in cp_branch_ids:
+                continue
+            targets.append((str(b.id), "branch", b))
+
+    return targets
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# One-component analytical shed
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _solve_load_shed(
+    monee_net,
+    ext_grid_el_bounds: Tuple[float, float] = (-0.25, 0.25),
+    ext_grid_gas_bounds: Tuple[float, float] = (-1.5, 1.5),
+    ext_grid_heat_bounds: Tuple[float, float] = (-100, 100),
+):
+    """Run the same min-load-shedding problem the resilience model uses
+    when the hard solve goes infeasible. Returns the result object on
+    success, ``None`` on failure.
+    """
+    opt = mp.create_min_load_shedding_problem(
+        bounds_el=(0.9, 1.1),
+        bounds_gas=(0.9, 1.1),
+        bounds_heat=(0.7, 1.3),
+        ext_grid_el_bounds=ext_grid_el_bounds,
+        ext_grid_gas_bounds=ext_grid_gas_bounds,
+        ext_grid_heat_bounds=ext_grid_heat_bounds,
+        include_ext_grids=True,
+        check_vm=True,
+        check_pressure=True,
+        check_temperature=True,
+        check_line_loading=True,
+    )
+    try:
+        return run_energy_flow_optimization(
+            monee_net,
+            solver=PyomoSolver(),
+            solver_name="gurobi",
+            optimization_problem=opt,
+            exclude_unconnected_nodes=True,
+        )
+    except Exception:
+        traceback.print_exc()
+        return None
+
+
+def _shed_from_solved(net) -> Tuple[float, float, float, float]:
+    """Extract per-carrier and total load shed from a solved network.
+    Mirrors ``GeneralResiliencePerformanceMetric.calc(network)``.
+
+    Returns (power_mw, heat_mw, gas_mw, total_mw).
+    """
+    passive_hx = getattr(mm, "PassiveHeatExchangerLoad", mm.HeatExchangerLoad)
+
+    power = 0.0
+    for c in net.childs:
+        m = c.model
+        if c.ignored or not c.active:
+            if isinstance(m, mm.PowerLoad):
+                power += float(mm.upper(m.p_mw) or 0.0)
+            continue
+        if isinstance(m, mm.PowerLoad):
+            try:
+                power += float(mm.upper(m.p_mw) or 0.0) - float(
+                    mm.value(m.p_mw) or 0.0
+                ) * float(mm.value(m.regulation) or 1.0)
+            except Exception:
+                pass
+
+    heat = 0.0
+    for c in net.childs:
+        m = c.model
+        if c.ignored or not c.active:
+            if isinstance(m, mm.HeatLoad):
+                heat += float(mm.upper(m.q_mw_heat) or 0.0)
+            elif isinstance(m, (mm.HeatExchangerLoad, passive_hx)):
+                heat += float(mm.upper(m.q_mw) or 0.0)
+            continue
+        if isinstance(m, mm.HeatLoad):
+            try:
+                heat += float(mm.upper(m.q_mw_heat) or 0.0) - float(
+                    mm.value(m.q_mw_heat) or 0.0
+                ) * float(mm.value(m.regulation) or 1.0)
+            except Exception:
+                pass
+        elif isinstance(m, (mm.HeatExchangerLoad, passive_hx)):
+            try:
+                heat += float(mm.upper(m.q_mw) or 0.0) - float(
+                    mm.value(m.q_mw) or 0.0
+                ) * float(mm.value(m.regulation) or 1.0)
+            except Exception:
+                pass
+    for b in net.branches:
+        m = b.model
+        if isinstance(m, (mm.HeatExchangerLoad, passive_hx)):
+            if not b.active or b.ignored:
+                heat += float(mm.upper(m.q_mw) or 0.0)
+            else:
+                try:
+                    heat += float(mm.upper(m.q_mw) or 0.0) - float(
+                        mm.value(m.q_mw) or 0.0
+                    ) * float(mm.value(m.regulation) or 1.0)
+                except Exception:
+                    pass
+
+    gas = 0.0
+    for c in net.childs:
+        m = c.model
+        if isinstance(m, mm.Sink) and getattr(c, "grid", None) is not None:
+            grid = c.grid
+            hhv = float(getattr(grid, "higher_heating_value", 15.3))
+            if c.ignored or not c.active:
+                try:
+                    gas += float(mm.upper(m.mass_flow) or 0.0) * 3.6 * hhv
+                except Exception:
+                    pass
+                continue
+            try:
+                gas += (
+                    float(mm.upper(m.mass_flow) or 0.0)
+                    - float(mm.value(m.mass_flow) or 0.0)
+                    * float(mm.value(m.regulation) or 1.0)
+                ) * 3.6 * hhv
+            except Exception:
+                pass
+
+    total = power + heat + gas
+    return float(power), float(heat), float(gas), float(total)
+
+
+def compute_single_removal_shed(
+    monee_net,
+    targets: Optional[List[Tuple[str, str, object]]] = None,
+    ext_grid_bounds: Optional[dict] = None,
+) -> pd.DataFrame:
+    """Run deactivate-solve-reactivate for each target. The network is
+    mutated in place during the loop and restored after each iteration.
+
+    Returns a DataFrame ``cp_id, kind, power_shed, heat_shed, gas_shed,
+    total_shed, solve_status, elapsed_s``.
+    """
+    targets = targets or _enumerate_targets(monee_net)
+    bounds = ext_grid_bounds or {}
+
+    # Baseline shed (no faults). Reported in the result for normalisation.
+    t0 = time.time()
+    base = _solve_load_shed(monee_net, **bounds)
+    base_p, base_h, base_g, base_t = (
+        _shed_from_solved(base.network) if base is not None else (0.0, 0.0, 0.0, 0.0)
+    )
+    log.info(
+        "baseline: total_shed=%.4f MW (p=%.4f, h=%.4f, g=%.4f) in %.1fs",
+        base_t, base_p, base_h, base_g, time.time() - t0,
+    )
+
+    rows = [
+        {
+            "cp_id": "_baseline_",
+            "kind": "baseline",
+            "power_shed": base_p,
+            "heat_shed": base_h,
+            "gas_shed": base_g,
+            "total_shed": base_t,
+            "solve_status": "ok" if base is not None else "fail",
+            "elapsed_s": float(time.time() - t0),
+        }
+    ]
+
+    for cp_id, kind, comp in targets:
+        t1 = time.time()
+        was_active = getattr(comp, "active", True)
+        try:
+            monee_net.deactivate(comp)
+        except Exception:
+            log.exception("deactivate failed for %s", cp_id)
+            rows.append({
+                "cp_id": cp_id, "kind": kind,
+                "power_shed": float("nan"), "heat_shed": float("nan"),
+                "gas_shed": float("nan"), "total_shed": float("nan"),
+                "solve_status": "deactivate_fail",
+                "elapsed_s": float(time.time() - t1),
+            })
+            continue
+        try:
+            res = _solve_load_shed(monee_net, **bounds)
+            if res is None:
+                p, h, g, tot = float("nan"), float("nan"), float("nan"), float("nan")
+                status = "solve_fail"
+            else:
+                p, h, g, tot = _shed_from_solved(res.network)
+                status = "ok"
+        except Exception:
+            log.exception("shed solve failed for %s", cp_id)
+            p, h, g, tot = float("nan"), float("nan"), float("nan"), float("nan")
+            status = "solve_exception"
+        finally:
+            try:
+                if was_active:
+                    monee_net.activate(comp)
+            except Exception:
+                log.exception("reactivate failed for %s", cp_id)
+        rows.append({
+            "cp_id": cp_id, "kind": kind,
+            "power_shed": p, "heat_shed": h, "gas_shed": g, "total_shed": tot,
+            "solve_status": status,
+            "elapsed_s": float(time.time() - t1),
+        })
+
+    df = pd.DataFrame(rows)
+    return df
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI entry point
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _slice_targets(
+    targets: List[Tuple[str, str, object]], shard: int, n_shards: int
+):
+    """Deterministic shard slicing. ``shard`` is 1-based."""
+    if n_shards <= 1:
+        return targets
+    if not (1 <= shard <= n_shards):
+        raise ValueError(f"shard {shard} out of [1, {n_shards}]")
+    # Sort by cp_id for stability across runs.
+    targets = sorted(targets, key=lambda t: t[0])
+    n = len(targets)
+    # Round-robin striping so wall-clock-imbalance from heterogeneous
+    # solve times averages out across shards.
+    return [t for i, t in enumerate(targets) if (i % n_shards) == (shard - 1)]
+
+
+def _solve_for_eval(net):
+    """Solve the network so all subsequent deactivate-solve cycles start
+    from the same operating point. Mirrors what cp_cn_evaluation does.
+    """
+    try:
+        return run_energy_flow(net, solver=PyomoSolver(), solver_name="gurobi").network
+    except Exception:
+        log.warning("hard energy flow failed; using min-load-shed fallback")
+        res = _solve_load_shed(net)
+        return res.network if res is not None else net
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    parser.add_argument(
+        "grid",
+        help="Grid name as in run_simulation.py (e.g. simbench_lv).",
+    )
+    parser.add_argument(
+        "--input-dir", type=Path,
+        default=Path("/home/rschrage/experiments/0508/res"),
+        help="Directory containing MoneeResilienceExperiment-<grid>/network.p",
+    )
+    parser.add_argument(
+        "--output-dir", type=Path,
+        default=Path("data/out/single_removal_shed"),
+        help="Where to write per-shard CSVs and the merged result.",
+    )
+    parser.add_argument("--shard", type=int, default=0,
+                        help="1-based shard index (0 = unsharded).")
+    parser.add_argument("--n-shards", type=int, default=1)
+    parser.add_argument("--merge", action="store_true",
+                        help="Merge all shards into <grid>.csv and exit.")
+    args = parser.parse_args()
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    final_csv = args.output_dir / f"single_removal_shed_{args.grid}.csv"
+
+    if args.merge:
+        parts: List[pd.DataFrame] = []
+        for k in range(1, args.n_shards + 1):
+            p = args.output_dir / f"single_removal_shed_{args.grid}_shard_{k}_of_{args.n_shards}.csv"
+            if p.exists():
+                parts.append(pd.read_csv(p))
+        if not parts:
+            print(f"no shard CSVs found in {args.output_dir}", file=sys.stderr)
+            return 1
+        merged = pd.concat(parts, ignore_index=True)
+        # Drop duplicate baseline rows (each shard records one).
+        baseline = merged[merged["cp_id"] == "_baseline_"].head(1)
+        rest = merged[merged["cp_id"] != "_baseline_"]
+        out = pd.concat([baseline, rest], ignore_index=True)
+        out.to_csv(final_csv, index=False)
+        print(f"wrote merged: {final_csv}  ({len(out)} rows)")
+        return 0
+
+    # Single-shard or unsharded run.
+    network_pkl = args.input_dir / f"MoneeResilienceExperiment-{args.grid}" / "network.p"
+    with open(network_pkl, "rb") as f:
+        net = pickle.load(f)
+    log.info("loaded %s (%s)", network_pkl, net.statistics())
+
+    net = _solve_for_eval(net)
+    targets = _enumerate_targets(net)
+    log.info(
+        "targets: %d total; shard %d/%d → %d this run",
+        len(targets), args.shard, args.n_shards,
+        len(_slice_targets(targets, args.shard, args.n_shards)) if args.n_shards > 1 else len(targets),
+    )
+
+    sliced = _slice_targets(targets, args.shard, args.n_shards) if args.n_shards > 1 else targets
+    df = compute_single_removal_shed(net, targets=sliced)
+    if args.shard and args.n_shards > 1:
+        path = args.output_dir / f"single_removal_shed_{args.grid}_shard_{args.shard}_of_{args.n_shards}.csv"
+    else:
+        path = final_csv
+    df.to_csv(path, index=False)
+    log.info("wrote %s (%d rows)", path, len(df))
+    return 0
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s")
+    sys.exit(main())
