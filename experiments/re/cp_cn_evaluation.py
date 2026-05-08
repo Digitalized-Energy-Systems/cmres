@@ -17,29 +17,17 @@ import networkx as nx
 
 sys.path.insert(0, str(Path(__file__).parent))
 from cp_metric import mes_all_components_metric, CPMetricConfig
+import eval_common as _ec
 
-INPUT = "/home/rschrage/experiments/0506/res"
+INPUT = "/home/rschrage/experiments/0508/res"
 OUTPUT = "data/out"
 SMALL_NUMBER = 0.00000000001
 
-# Components whose actual total impact is below this threshold are treated as
-# "never sampled by the MC failure model" and excluded from rank-based metrics
-# (Spearman ρ, Kendall τ, NDCG, precision@k). Including them mostly inflates
-# the apparent ranking quality (NDCG saturated by ties at zero) and biases
-# precision@k. The unfiltered view is still computed and shown alongside for
-# transparency.
-MC_FAILED_EPS = 1e-6
-
-# Coupling-point types as labelled in df_scores by mes_*_metric. Used by the
-# CP-only views (cp_only_metric_comparison / cp_only_pooled_metric_comparison)
-# to filter the matched df down to coupling components and break results out
-# by CP type so it's visible which type each metric predicts well.
-CP_TYPE_SET = frozenset({
-    "CHP", "CHPHG",
-    "PowerToHeat", "PowerToHeatHG",
-    "PowerToGas", "GasToPower",
-    "GasToHeatHG",
-})
+# Re-exports from eval_common so existing code (and external callers that
+# imported these names from this module) keep working unchanged. The full
+# rationale for MC_FAILED_EPS lives in eval_common's docstring.
+MC_FAILED_EPS = _ec.MC_FAILED_EPS
+CP_TYPE_SET = _ec.CP_TYPE_SET
 
 TYPE_TO_CARRIER = {
     "Junction": "heat/gas",
@@ -219,7 +207,14 @@ def create_impact_df(perf_df: pandas.DataFrame, fail_df, metrics_df):
             out_cnt = t_cnt - in_cnt
             in_mean = in_sum / in_cnt if in_cnt > 0 else float("nan")
             out_mean = out_sum / out_cnt if out_cnt > 0 else float("nan")
-            # Absolute degradation: out - in. Positive = component caused loss.
+            # Signed degradation: out_mean − in_mean. With in_mean = average
+            # carrier loss while this component is faulted and out_mean = same
+            # while it is not, a component that *causes* extra loss when it
+            # fails has in_mean > out_mean and therefore a NEGATIVE impact.
+            # Downstream consumers (cp_metric_vs_actual_impact,
+            # impact_aggregated_component_carrier, impact_over_metrics) all
+            # take |impact|, so the sign is informational only — we keep it as
+            # documentation of which side of the comparison is larger.
             impact = out_mean - in_mean
             global_rows.append(
                 {
@@ -921,130 +916,33 @@ def impact_aggregated_component_carrier(impact_df: pandas.DataFrame, folder_id):
     )
 
 
-def _build_branch_lookup(impact_ids):
-    """Map (a_str, b_str) → impact_id for every branch impact id (both directions)."""
-    branch_lookup = {}
-    for iid in impact_ids:
-        if not iid.startswith("branch:"):
-            continue
-        inner = iid[len("branch:"):].strip("()")
-        parts = [p.strip() for p in inner.split(",")]
-        if len(parts) >= 2:
-            a, b = parts[0], parts[1]
-            branch_lookup.setdefault((a, b), iid)
-            branch_lookup.setdefault((b, a), iid)
-    return branch_lookup
-
-
-_COMPOUND_CP_TYPES = ("CHP", "CHPHG", "PowerToHeat")
-_NON_CP_BRANCH_TYPES = ("PowerLine", "GasPipe", "WaterPipe", "HeatExchanger")
-
-
-def _match_impact_id(cp_id, cp_type, impact_ids, branch_lookup=None):
-    """Find the impact_df id string for a given metric entry."""
-    if cp_type in _COMPOUND_CP_TYPES:
-        candidate = f"compound:{cp_id}"
-        return candidate if candidate in impact_ids else None
-
-    if branch_lookup is None:
-        branch_lookup = _build_branch_lookup(impact_ids)
-
-    # Non-CP branches: cp_id is already str(edge_tuple) e.g. "(10, 4, 0)"
-    if cp_type in _NON_CP_BRANCH_TYPES:
-        candidate = f"branch:{cp_id}"
-        if candidate in impact_ids:
-            return candidate
-        inner = str(cp_id).strip("()")
-        parts = [p.strip() for p in inner.split(",")]
-        if len(parts) >= 2:
-            return branch_lookup.get((parts[0], parts[1]))
-        return None
-
-    # Branch CPs (GasToPower, PowerToGas, PowerToHeatHG, GasToHeatHG):
-    # cp_id is rendered as "from→to".
-    try:
-        from_id, to_id = str(cp_id).split("→")
-        from_id, to_id = from_id.strip(), to_id.strip()
-    except ValueError:
-        return None
-    return branch_lookup.get((from_id, to_id))
+# Backwards-compat re-exports. The canonical implementations now live in
+# ``eval_common`` so dissertation_eval and this module use the same logic.
+_COMPOUND_CP_TYPES = _ec._COMPOUND_CP_TYPES
+_NON_CP_BRANCH_TYPES = _ec._NON_CP_BRANCH_TYPES
+_build_branch_lookup = _ec.build_branch_lookup
+_match_impact_id = _ec.match_impact_id
 
 
 def cp_metric_vs_actual_impact(monee_net, impact_df_nt, network_type):
+    """E1 / E5: per-network ρ + ranking battery.
+
+    Implements dissertation experiment **E1 (validation)** and feeds
+    ``cp_only_metric_comparison`` (**E5**, per-CP-type breakdown). Returns
+    the unfiltered matched dataframe so dissertation_eval can reuse it for
+    E2 ablations, E3 density, E4 distribution, etc., without re-running
+    ``mes_all_components_metric``.
+    """
     try:
         df_scores, _ = mes_all_components_metric(monee_net, cfg=CPMetricConfig())
     except Exception as e:
         print(f"CP metric failed for {network_type}: {e}")
         raise e
 
-    # Aggregate actual impact per component across carriers
-    impact_abs = impact_df_nt.copy()
-    impact_abs["impact"] = impact_abs["impact"].abs()
-    actual_total = (
-        impact_abs.groupby("id")["impact"].sum()
-        .reset_index()
-        .rename(columns={"impact": "actual_total"})
-    )
-    actual_per_carrier = (
-        impact_abs.pivot_table(index="id", columns="carrier", values="impact", aggfunc="sum")
-        .reset_index()
-    )
-
-    impact_ids = set(actual_total["id"])
-    branch_lookup = _build_branch_lookup(impact_ids)
-    total_lookup = dict(zip(actual_total["id"], actual_total["actual_total"]))
-    per_carrier_lookup = {
-        col: dict(zip(actual_per_carrier["id"], actual_per_carrier[col]))
-        for col in actual_per_carrier.columns
-        if col != "id"
-    }
-    rows = []
-    for score_row in df_scores.itertuples(index=False):
-        impact_id = _match_impact_id(
-            score_row.cp_id, score_row.cp_type, impact_ids, branch_lookup
-        )
-        if impact_id is None:
-            continue
-        actual_total_val = total_lookup.get(impact_id)
-        if actual_total_val is None:
-            continue
-        score_dict = score_row._asdict()
-        # Default to 1.0 so non-CP rows (which don't have an input-adequacy
-        # gate) don't accidentally land at 0 and disappear from the comparison.
-        input_adequacy = float(score_dict.get("input_adequacy", 1.0) or 0.0)
-        entry = {
-            "cp_id": str(score_row.cp_id),
-            "cp_type": score_row.cp_type,
-            "predicted_score": score_row.score,
-            "predicted_stress": score_row.total_stress,
-            "topo_factor": score_row.topo_factor,
-            "topo_bc": score_row.topo_bc,
-            "stress_bc": score_dict.get("stress_bc", 0.0),
-            "stress_score": score_dict.get("stress_score", score_row.score),
-            "local_score": score_dict.get("local_score", score_row.score),
-            "self_score": score_dict.get("self_score", score_row.score),
-            "katz_score": score_dict.get("katz_score", 0.0),
-            "vitality_score": score_dict.get("vitality_score", 0.0),
-            "input_adequacy": input_adequacy,
-            "actual_total": actual_total_val,
-        }
-        for metric_col, carrier_col in [
-            ("power_stress", "electricity"),
-            ("gas_stress", "gas"),
-            ("heat_stress", "heat"),
-        ]:
-            entry[f"predicted_{metric_col}"] = score_dict.get(metric_col, 0.0)
-            carrier_map = per_carrier_lookup.get(carrier_col)
-            entry[f"actual_{carrier_col}"] = (
-                carrier_map.get(impact_id, 0.0) if carrier_map is not None else 0.0
-            )
-        rows.append(entry)
-
-    if not rows:
+    df_all = _ec.build_matched_df(df_scores, impact_df_nt)
+    if df_all.empty:
         print(f"No metric/impact matches found for {network_type}")
         return
-
-    df_all = pandas.DataFrame(rows)
     # Primary view: only components the MC failure model actually sampled (and
     # therefore can produce a non-trivial actual_total). Components with zero
     # impact are unrankable and inflate NDCG / suppress P@k toward random; see
@@ -1061,22 +959,9 @@ def cp_metric_vs_actual_impact(monee_net, impact_df_nt, network_type):
     figures = []
     titles = []
 
-    import numpy as _np2
-
-    def _spearman_with_ci(a, b, alpha=0.05):
-        """Returns (rho, pval, ci_lo, ci_hi) using Fisher z-transform CI."""
-        res = scipy.stats.spearmanr(a, b)
-        rho, pval = res.statistic, res.pvalue
-        n = len(a)
-        if n > 3:
-            z = _np2.arctanh(rho)
-            se = 1.0 / _np2.sqrt(n - 3)
-            z_crit = scipy.stats.norm.ppf(1 - alpha / 2)
-            ci_lo = float(_np2.tanh(z - z_crit * se))
-            ci_hi = float(_np2.tanh(z + z_crit * se))
-        else:
-            ci_lo, ci_hi = float("nan"), float("nan")
-        return float(rho), float(pval), ci_lo, ci_hi
+    # Aliased so existing call sites (ρ-bar, scatter panels, comparison
+    # panel) don't have to be touched.
+    _spearman_with_ci = _ec.spearman_with_ci
 
     def _rho_label(rho, pval, ci_lo, ci_hi):
         return f"ρ={rho:.2f} [{ci_lo:.2f}, {ci_hi:.2f}], p={pval:.3f}"
@@ -1140,7 +1025,12 @@ def cp_metric_vs_actual_impact(monee_net, impact_df_nt, network_type):
     import plotly.express as px
     from plotly.subplots import make_subplots
 
-    df["score_no_topo"] = df["predicted_score"] / df["topo_factor"].replace(0, float("nan"))
+    # "score_no_topo" = pure PTDF stress (carrier-weighted total_stress) with
+    # NO throughput, NO topo factor, NO input-adequacy gate. The earlier
+    # derivation `predicted_score / topo_factor` silently picked up throughput
+    # and (for CPs) the input_adequacy gate, so the label "PTDF stress only"
+    # didn't actually mean what it said.
+    df["score_no_topo"] = df["predicted_stress"]
     # topo_only: use raw BC as the sole predictor
     df["score_topo_only"] = df["topo_bc"]
 
@@ -1166,10 +1056,10 @@ def cp_metric_vs_actual_impact(monee_net, impact_df_nt, network_type):
             # x_col, subplot title (with ρ + 95% CI), x-axis label (exact formula)
             ("predicted_score",
              f"Full: PTDF stress + phys. BC<br>{_rho_label(rho_with, pval_with, ci_lo_with, ci_hi_with)}",
-             "p_fail · τ · PTDF_stress · (1 + α·BC_phys)"),
+             "τ · PTDF_stress · (1 + α·BC_phys) · adequacy"),
             ("score_no_topo",
-             f"PTDF stress only, no BC<br>{_rho_label(rho_without, pval_without, ci_lo_without, ci_hi_without)}",
-             "p_fail · τ · PTDF_stress"),
+             f"PTDF stress only<br>{_rho_label(rho_without, pval_without, ci_lo_without, ci_hi_without)}",
+             "PTDF_stress (carrier-weighted)"),
             ("score_topo_only",
              f"Phys. BC only, no stress<br>{_rho_label(rho_topo_only, pval_topo_only, ci_lo_topo_only, ci_hi_topo_only)}",
              "Phys. betweenness centrality"),
@@ -1178,10 +1068,10 @@ def cp_metric_vs_actual_impact(monee_net, impact_df_nt, network_type):
              "Stress-weighted betweenness centrality"),
             ("local_score",
              f"1-hop local: loading + critical neighbours<br>{_rho_label(rho_local, pval_local, ci_lo_local, ci_hi_local)}",
-             "p_fail · loading · (1 + crit.nbrs) · n_carriers"),
+             "loading · (1 + crit.nbrs) · n_carriers"),
             ("self_score",
              f"0-hop self: own loading only<br>{_rho_label(rho_self, pval_self, ci_lo_self, ci_hi_self)}",
-             "p_fail · loading · n_carriers"),
+             "loading · n_carriers"),
             ("katz_score",
              f"Katz centrality only<br>{_rho_label(rho_katz, pval_katz, ci_lo_katz, ci_hi_katz)}",
              "Katz centrality (phys. graph)"),
@@ -1225,13 +1115,16 @@ def cp_metric_vs_actual_impact(monee_net, impact_df_nt, network_type):
     # ── Metric comparison figures ──────────────────────────────────────────
     import numpy as _np
 
+    # Comments below show the actual formula after the p_fail removal and the
+    # input-adequacy gate (the gate is multiplied into predicted_score for CPs
+    # only; non-CPs have input_adequacy=1.0 so their formula is unchanged).
     METRICS = [
-        ("predicted_score",  "PTDF stress + phys. BC"),   # p_fail·τ·PTDF·(1+α·BC_phys)
-        ("score_no_topo",    "PTDF stress only"),          # p_fail·τ·PTDF  (BC removed)
+        ("predicted_score",  "PTDF stress + phys. BC"),   # τ·PTDF·(1+α·BC_phys)·input_adequacy
+        ("score_no_topo",    "PTDF stress only"),          # carrier-weighted PTDF stress (= predicted_stress)
         ("score_topo_only",  "Phys. BC only"),             # raw betweenness centrality, no stress
         ("stress_bc",        "Stress BC only"),            # raw stress-weighted betweenness centrality, no PTDF
-        ("local_score",      "1-hop local"),               # p_fail·loading·(1+crit.nbrs)·n_carriers
-        ("self_score",       "0-hop self"),                # p_fail·loading·n_carriers
+        ("local_score",      "1-hop local"),               # loading·(1+crit.nbrs)·n_carriers
+        ("self_score",       "0-hop self"),                # loading·n_carriers
         ("katz_score",       "Katz BC only"),              # raw Katz centrality (phys. graph), no stress
         ("vitality_score",   "Closeness vitality"),        # W(G) - W(G\v), phys. weights
         ("actual_total",     "Actual (MC)"),               # ground truth
@@ -1387,42 +1280,10 @@ def cp_metric_vs_actual_impact(monee_net, impact_df_nt, network_type):
     titles.append("Rank Bump Chart: Each Component's Rank Across All Metrics")
 
     # ── Ranking accuracy figures ───────────────────────────────────────────
-    # Helpers (no external dependencies beyond numpy/scipy)
-
-    def _ndcg(actual_vals, predicted_scores):
-        """Normalised Discounted Cumulative Gain.
-        Relevance = max(actual, 0) so components with zero/negative impact get
-        relevance 0 — they are not 'relevant' to identify as critical.
-        Using actual - min() would inflate all scores when the range is wide and
-        arbitrarily reward metrics that rank the least-harmful component last.
-        """
-        actual_arr = _np.array(actual_vals, dtype=float)
-        pred_order = _np.argsort(predicted_scores)[::-1]
-        ideal_order = _np.argsort(actual_arr)[::-1]
-        gains = _np.maximum(actual_arr, 0.0)           # negative impact → relevance 0
-        dcg  = sum(gains[pred_order[i]]  / _np.log2(i + 2) for i in range(len(gains)))
-        idcg = sum(gains[ideal_order[i]] / _np.log2(i + 2) for i in range(len(gains)))
-        return float(dcg / idcg) if idcg > 0 else 0.0
-
-    def _precision_at_k(actual_vals, predicted_scores, k):
-        """Fraction of true top-k components that appear in the predicted top-k."""
-        actual_top = set(_np.argsort(actual_vals)[-k:])
-        pred_top   = set(_np.argsort(predicted_scores)[-k:])
-        return len(actual_top & pred_top) / k
-
-    def _bootstrap_ci(stat_fn, actual_arr, pred_arr, n_boot=1000, alpha=0.05, rng=None):
-        """Bootstrap percentile CI for any scalar statistic.
-        stat_fn(actual, predicted) → float
-        """
-        if rng is None:
-            rng = _np.random.default_rng(42)
-        n = len(actual_arr)
-        boot = []
-        for _ in range(n_boot):
-            idx = rng.integers(0, n, n)
-            boot.append(stat_fn(actual_arr[idx], pred_arr[idx]))
-        return (float(_np.percentile(boot, 100 * alpha / 2)),
-                float(_np.percentile(boot, 100 * (1 - alpha / 2))))
+    # Aliased re-exports so the call sites stay short.
+    _ndcg = _ec.ndcg
+    _precision_at_k = _ec.precision_at_k
+    _bootstrap_ci = _ec.bootstrap_ci
 
     pred_metrics = [(col, label) for col, label in METRICS if col != "actual_total"]
     actual_vals  = valid["actual_total"].values
@@ -1529,10 +1390,11 @@ def cp_metric_vs_actual_impact(monee_net, impact_df_nt, network_type):
     # tail was distorting things.
     if n_mc >= 3 and n_all > n_mc:
         df_all_local = df_all.copy()
+        # score_no_topo = pure PTDF stress (carrier-weighted total_stress).
+        # See the comment on the primary derivation above for why this is no
+        # longer `predicted_score / topo_factor`.
         if "score_no_topo" not in df_all_local.columns:
-            df_all_local["score_no_topo"] = df_all_local["predicted_score"] / (
-                df_all_local["topo_factor"].replace(0, float("nan"))
-            )
+            df_all_local["score_no_topo"] = df_all_local["predicted_stress"]
         if "score_topo_only" not in df_all_local.columns:
             df_all_local["score_topo_only"] = df_all_local["topo_bc"]
 
@@ -1653,8 +1515,11 @@ def _cp_only_metric_comparison_core(
     ]
 
     df = df_all.copy()
+    # "score_no_topo" = pure PTDF stress (carrier-weighted total_stress) —
+    # NO throughput, NO topo factor, NO input gate. Use predicted_stress
+    # directly so the label "PTDF stress only" actually reflects the formula.
     if "score_no_topo" not in df.columns:
-        df["score_no_topo"] = df["predicted_score"] / df["topo_factor"].replace(0, float("nan"))
+        df["score_no_topo"] = df["predicted_stress"]
     if "score_topo_only" not in df.columns:
         df["score_topo_only"] = df["topo_bc"]
     # score_no_adequacy = the full CP score WITHOUT the input-adequacy gate,
@@ -1697,38 +1562,10 @@ def _cp_only_metric_comparison_core(
         f"{n_mc} MC-sampled (used). Types: {cp_types_present}"
     )
 
-    # ── Helpers (same as in cp_metric_vs_actual_impact) ───────────────────
-    def _spearman_with_ci(a, b, alpha=0.05):
-        res = scipy.stats.spearmanr(a, b)
-        rho, pval = res.statistic, res.pvalue
-        n = len(a)
-        if n > 3 and _np.isfinite(rho):
-            z = _np.arctanh(rho)
-            se = 1.0 / _np.sqrt(n - 3)
-            z_crit = scipy.stats.norm.ppf(1 - alpha / 2)
-            ci_lo = float(_np.tanh(z - z_crit * se))
-            ci_hi = float(_np.tanh(z + z_crit * se))
-        else:
-            ci_lo, ci_hi = float("nan"), float("nan")
-        return float(rho) if _np.isfinite(rho) else float("nan"), float(pval), ci_lo, ci_hi
-
-    def _ndcg(actual_vals, predicted_scores):
-        actual_arr = _np.array(actual_vals, dtype=float)
-        if len(actual_arr) == 0:
-            return 0.0
-        pred_order  = _np.argsort(predicted_scores)[::-1]
-        ideal_order = _np.argsort(actual_arr)[::-1]
-        gains = _np.maximum(actual_arr, 0.0)
-        dcg  = sum(gains[pred_order[i]]  / _np.log2(i + 2) for i in range(len(gains)))
-        idcg = sum(gains[ideal_order[i]] / _np.log2(i + 2) for i in range(len(gains)))
-        return float(dcg / idcg) if idcg > 0 else 0.0
-
-    def _precision_at_k(actual_vals, predicted_scores, k):
-        if k <= 0 or len(actual_vals) == 0:
-            return 0.0
-        actual_top = set(_np.argsort(actual_vals)[-k:])
-        pred_top   = set(_np.argsort(predicted_scores)[-k:])
-        return len(actual_top & pred_top) / k
+    # ── Helpers (re-exported from eval_common) ───────────────────────────
+    _spearman_with_ci = _ec.spearman_with_ci
+    _ndcg = _ec.ndcg
+    _precision_at_k = _ec.precision_at_k
 
     figures = []
     titles  = []
@@ -1842,18 +1679,7 @@ def _cp_only_metric_comparison_core(
     titles.append(f"CP-only [{label}] combined Spearman ρ (n={len(primary)})")
 
     # ── 4. Kendall τ + NDCG with bootstrap 95 % CI (combined) ─────────────
-    def _bootstrap_ci(stat_fn, actual_arr, pred_arr, n_boot=1000, alpha=0.05, rng=None):
-        if rng is None:
-            rng = _np.random.default_rng(42)
-        n = len(actual_arr)
-        if n == 0:
-            return float("nan"), float("nan")
-        boot = []
-        for _ in range(n_boot):
-            idx = rng.integers(0, n, n)
-            boot.append(stat_fn(actual_arr[idx], pred_arr[idx]))
-        return (float(_np.percentile(boot, 100 * alpha / 2)),
-                float(_np.percentile(boot, 100 * (1 - alpha / 2))))
+    _bootstrap_ci = _ec.bootstrap_ci
 
     rng = _np.random.default_rng(42)
     acc_rows = []
@@ -2063,9 +1889,11 @@ def pooled_metric_comparison(pooled_df, output_dir):
     ]
 
     df_all_full = pooled_df.copy()
-    # Compute score_no_topo if not already present
+    # score_no_topo = pure PTDF stress. See cp_metric_vs_actual_impact for why
+    # this is no longer `predicted_score / topo_factor` — that derivation
+    # silently included throughput and (for CPs) the input-adequacy gate.
     if "score_no_topo" not in df_all_full.columns:
-        df_all_full["score_no_topo"] = df_all_full["predicted_score"] / df_all_full["topo_factor"].replace(0, float("nan"))
+        df_all_full["score_no_topo"] = df_all_full["predicted_stress"]
     if "score_topo_only" not in df_all_full.columns:
         df_all_full["score_topo_only"] = df_all_full["topo_bc"]
 
@@ -2093,47 +1921,15 @@ def pooled_metric_comparison(pooled_df, output_dir):
 
     # ── Helpers ────────────────────────────────────────────────────────────
 
-    def _spearman_with_ci(a, b, alpha=0.05):
-        res = scipy.stats.spearmanr(a, b)
-        rho, pval = res.statistic, res.pvalue
-        n = len(a)
-        if n > 3:
-            z = _np.arctanh(rho)
-            se = 1.0 / _np.sqrt(n - 3)
-            z_crit = scipy.stats.norm.ppf(1 - alpha / 2)
-            ci_lo = float(_np.tanh(z - z_crit * se))
-            ci_hi = float(_np.tanh(z + z_crit * se))
-        else:
-            ci_lo, ci_hi = float("nan"), float("nan")
-        return float(rho), float(pval), ci_lo, ci_hi
+    # Stat helpers: re-exported from eval_common (same logic as the
+    # per-network and CP-only views).
+    _spearman_with_ci = _ec.spearman_with_ci
+    _ndcg = _ec.ndcg
+    _precision_at_k = _ec.precision_at_k
+    _bootstrap_ci = _ec.bootstrap_ci
 
     def _rho_label(rho, pval, ci_lo, ci_hi):
         return f"ρ={rho:.2f} [{ci_lo:.2f},{ci_hi:.2f}], p={pval:.3f}"
-
-    def _ndcg(actual_vals, predicted_scores):
-        actual_arr = _np.array(actual_vals, dtype=float)
-        pred_order  = _np.argsort(predicted_scores)[::-1]
-        ideal_order = _np.argsort(actual_arr)[::-1]
-        gains = _np.maximum(actual_arr, 0.0)
-        dcg  = sum(gains[pred_order[i]]  / _np.log2(i + 2) for i in range(len(gains)))
-        idcg = sum(gains[ideal_order[i]] / _np.log2(i + 2) for i in range(len(gains)))
-        return float(dcg / idcg) if idcg > 0 else 0.0
-
-    def _precision_at_k(actual_vals, predicted_scores, k):
-        actual_top = set(_np.argsort(actual_vals)[-k:])
-        pred_top   = set(_np.argsort(predicted_scores)[-k:])
-        return len(actual_top & pred_top) / k
-
-    def _bootstrap_ci(stat_fn, actual_arr, pred_arr, n_boot=1000, alpha=0.05, rng=None):
-        if rng is None:
-            rng = _np.random.default_rng(42)
-        n = len(actual_arr)
-        boot = []
-        for _ in range(n_boot):
-            idx = rng.integers(0, n, n)
-            boot.append(stat_fn(actual_arr[idx], pred_arr[idx]))
-        return (float(_np.percentile(boot, 100 * alpha / 2)),
-                float(_np.percentile(boot, 100 * (1 - alpha / 2))))
 
     figures = []
     titles  = []
@@ -2144,12 +1940,12 @@ def pooled_metric_comparison(pooled_df, output_dir):
 
     # ── 1. Scatter panels (one per metric, colored by network type) ────────
     panels = [
-        ("predicted_score",  "PTDF stress + phys. BC",  "p_fail · τ · PTDF_stress · (1 + α·BC_phys)"),
-        ("score_no_topo",    "PTDF stress only",         "p_fail · τ · PTDF_stress"),
+        ("predicted_score",  "PTDF stress + phys. BC",  "τ · PTDF_stress · (1 + α·BC_phys) · adequacy"),
+        ("score_no_topo",    "PTDF stress only",         "PTDF_stress (carrier-weighted)"),
         ("score_topo_only",  "Phys. BC only",            "Phys. betweenness centrality"),
         ("stress_bc",        "Stress BC only",           "Stress-weighted betweenness centrality"),
-        ("local_score",      "1-hop local",              "p_fail · loading · (1 + crit.nbrs) · n_carriers"),
-        ("self_score",       "0-hop self",               "p_fail · loading · n_carriers"),
+        ("local_score",      "1-hop local",              "loading · (1 + crit.nbrs) · n_carriers"),
+        ("self_score",       "0-hop self",               "loading · n_carriers"),
         ("katz_score",       "Katz BC only",             "Katz centrality (phys. graph)"),
         ("vitality_score",   "Closeness vitality",       "W(G) − W(G\\v) (phys. graph)"),
     ]
@@ -2406,6 +2202,49 @@ def pooled_metric_comparison(pooled_df, output_dir):
     )
 
 
+def _scenario_density_distribution(network_type: str):
+    """Map a simbench scenario name to (CP density, distribution label).
+
+    Returns ``(None, None)`` for scenarios that don't follow the
+    ``simbench_lv[...]`` naming convention so the dissertation E3/E4
+    experiments can simply skip them.
+    """
+    name = str(network_type)
+    distribution = "centralized" if "centralized" in name else "distributed"
+    if name.endswith("_no") or name == "simbench_lv_no":
+        return 0.0, distribution
+    if name.endswith("_low_high"):
+        return 0.875, distribution  # informal mid between low and high
+    if name.endswith("_low"):
+        return 0.25, distribution
+    if name.endswith("_high"):
+        return 0.75, distribution
+    if name.endswith("_max"):
+        return 1.0, distribution
+    if name.endswith("_centralized"):
+        return 0.5, "centralized"
+    if name == "simbench_lv":
+        return 0.5, distribution
+    return None, distribution
+
+
+def _make_dissertation_artefact(
+    label, df_eval, monee_net, mc_npz_path, density, distribution
+):
+    """Lazy-import wrapper so cp_cn_evaluation.py doesn't hard-depend on
+    dissertation_eval at module load (the dissertation experiments are
+    optional)."""
+    from dissertation_eval import ScenarioArtefacts
+    return ScenarioArtefacts(
+        label=label,
+        df_eval=df_eval,
+        monee_net=monee_net,
+        mc_npz_path=mc_npz_path,
+        density=density,
+        distribution=distribution,
+    )
+
+
 def evaluate(folder_id):
     fail_df, perf_df, metrics_df, net_type_to_net = load_dfs(folder_id)
     impact_df = create_or_load_impact_df(
@@ -2414,6 +2253,10 @@ def evaluate(folder_id):
     impact_df = extend_impact_df(net_type_to_net, metrics_df, impact_df)
 
     per_network_dfs = []
+    # Bundle of per-scenario inputs the dissertation block consumes after
+    # the per-scenario loop completes. Local to evaluate() so re-runs don't
+    # carry state.
+    dissertation_artefacts = []
 
     for network_type, monee_net in net_type_to_net.items():
         print(network_type)
@@ -2482,6 +2325,21 @@ def evaluate(folder_id):
         if net_df is not None and len(net_df) > 0:
             cp_only_metric_comparison(net_df, network_type)
             per_network_dfs.append(net_df)
+            # Per-scenario artefact for the dissertation block. Density and
+            # distribution map directly off the simbench scenario name; the
+            # mc_result.npz path mirrors the layout used by run_simulation.
+            density, distribution = _scenario_density_distribution(network_type)
+            mc_npz = Path(folder_id) / f"MoneeResilienceExperiment-{network_type}" / "mc_result.npz"
+            dissertation_artefacts.append(
+                _make_dissertation_artefact(
+                    label=network_type,
+                    df_eval=net_df,
+                    monee_net=monee_net,
+                    mc_npz_path=mc_npz if mc_npz.exists() else None,
+                    density=density,
+                    distribution=distribution,
+                )
+            )
 
     pooled_resilience_per_scenario(perf_df, OUTPUT + "/pooled")
 
@@ -2492,6 +2350,22 @@ def evaluate(folder_id):
     elif len(per_network_dfs) == 1:
         print("Only one network type found — skipping pooled metric analysis.")
         cp_only_pooled_metric_comparison(per_network_dfs[0], OUTPUT + "/pooled")
+
+    # ── Dissertation experiments (E2..E13) ─────────────────────────────
+    # Run the full dissertation battery on the per-scenario artefacts we
+    # collected during the loop. Each experiment writes its own CSV (and
+    # HTML where applicable) under data/out/dissertation/.
+    if dissertation_artefacts:
+        try:
+            from dissertation_eval import run_dissertation_block
+            run_dissertation_block(
+                dissertation_artefacts,
+                impact_df,
+                Path(OUTPUT) / "dissertation",
+            )
+        except Exception as e:
+            traceback.print_exc()
+            print(f"[dissertation] block failed: {type(e).__name__}: {e}")
 
 
 def main():

@@ -450,17 +450,40 @@ class CascadingModel(StepModel):
 
     @staticmethod
     def _max_load_shedding(net):
-        """Return (power_MW, heat_MW, gas_MW) assuming all active load is shed."""
+        """Return (power_MW, heat_MW, gas_MW) assuming all active load is shed.
+
+        Mirrors the load-types accounted for by ``GeneralResiliencePerformanceMetric``
+        in ``monee.problem.metric`` so the solver-failure fallback and the
+        successful-solve metric measure the same thing. Specifically:
+          - power: PowerLoad.p_mw
+          - heat:  HeatLoad.q_mw_heat  +  HeatExchangerLoad.q_mw  +  PassiveHeatExchangerLoad.q_mw
+          - gas:   Sink.mass_flow × 3.6 × HHV  (kg/s × kWh/kg → MW)
+
+        Earlier this counted only HeatExchangerLoad, so on simbench LV grids
+        (which use HeatLoad children) the fallback reported heat=0 even when
+        all heat load was effectively shed.
+        """
+        passive_hx = getattr(mm, "PassiveHeatExchangerLoad", mm.HeatExchangerLoad)
+
         power = sum(
             mm.upper(c.model.p_mw)
             for c in net.childs
             if isinstance(c.model, mm.PowerLoad) and c.active and not c.ignored
         )
-        heat = sum(
-            mm.upper(c.model.q_mw)
-            for c in net.childs + net.branches
-            if isinstance(c.model, mm.HeatExchangerLoad) and c.active and not c.ignored
-        )
+        heat = 0.0
+        for c in net.childs:
+            m = c.model
+            if not c.active or c.ignored:
+                continue
+            if isinstance(m, mm.HeatLoad):
+                heat += mm.upper(m.q_mw_heat)
+            elif isinstance(m, (mm.HeatExchangerLoad, passive_hx)):
+                heat += mm.upper(m.q_mw)
+        for b in net.branches:
+            if not b.active or b.ignored:
+                continue
+            if isinstance(b.model, (mm.HeatExchangerLoad, passive_hx)):
+                heat += mm.upper(b.model.q_mw)
         gas = sum(
             mm.upper(c.model.mass_flow) * 3.6 * c.grid.higher_heating_value
             for c in net.childs

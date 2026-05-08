@@ -89,6 +89,16 @@ class CPMetricConfig:
     HEAT_REMOTENESS_ALPHA: float = 1.0
     HEAT_PIPE_U_W_M2_K: float = 1.5        # external heat-transfer coeff for DH pipe
 
+    # ── Ablation flags (E2) ──────────────────────────────────────────────
+    # Each ABLATE_* fixes one factor of the composite score to 1.0 so the
+    # effect of removing it can be measured. The dissertation's E2 ablation
+    # experiment runs `mes_cp_metric` once per ablation variant and compares
+    # ρ vs the full score; effect size is then ρ(full) − ρ(ablated).
+    ABLATE_THROUGHPUT: bool = False
+    ABLATE_STRESS: bool = False
+    ABLATE_TOPO: bool = False
+    ABLATE_ADEQUACY: bool = False  # only affects CP rows; non-CPs are unchanged
+
     # ── CP input-adequacy multiplier ─────────────────────────────────────
     # A CP only delivers into its output sector(s) when its input sector can
     # supply it. We extend CP criticality with a structural conditional term:
@@ -1299,6 +1309,31 @@ def _group_bc(G, compound, weight="weight"):
 # =============================================================================
 
 
+def _apply_ablations(
+    cfg: "CPMetricConfig",
+    throughput: float,
+    total_stress: float,
+    topo_factor: float,
+    input_adequacy: float,
+    is_cp: bool,
+) -> float:
+    """Compose the composite score under the active ablation flags.
+
+    Used by both CP score sites and the non-CP branch sites in
+    ``mes_all_components_metric``. ``ABLATE_ADEQUACY`` is silently ignored on
+    non-CP rows (they don't carry a gate), so non-CP scores are unchanged
+    when only ABLATE_ADEQUACY is set.
+    """
+    t = 1.0 if cfg.ABLATE_THROUGHPUT else float(throughput)
+    s = 1.0 if cfg.ABLATE_STRESS else float(total_stress)
+    o = 1.0 if cfg.ABLATE_TOPO else float(topo_factor)
+    if is_cp:
+        a = 1.0 if cfg.ABLATE_ADEQUACY else float(input_adequacy)
+    else:
+        a = 1.0
+    return t * s * o * a
+
+
 def _heat_remoteness_factor(ctx, node_id, cfg: "CPMetricConfig") -> float:
     """(1 + α · d_thermal(node)) — slack-distance prefactor for heat stress.
 
@@ -1491,23 +1526,27 @@ class CarrierPTDFContext:
     def power_ptdf_node(self, monee_net, node_id):
         self.power_prebuild(monee_net)
         cache = self.power["ptdf_cache"]
+        # Cache stores ``(ptdf, reliable)`` tuples — matching gas/heat — so
+        # the reliable flag survives across repeat queries. The earlier
+        # array-only cache silently flipped unreliable nodes to reliable on
+        # the second call.
         if node_id in cache:
-            return cache[node_id], True
+            return cache[node_id]
 
         id_to_local = self.power["id_to_local"]
         if node_id not in id_to_local:
-            z = np.zeros(len(self.power["branches"]), dtype=float)
+            z = (np.zeros(len(self.power["branches"]), dtype=float), False)
             cache[node_id] = z
-            return z, False
+            return z
 
         s_local = id_to_local[node_id]
         dP, ok = _distributed_balancing_vector_power(
             monee_net, self.power["bus_ids"], id_to_local, s_local
         )
         if not ok:
-            z = np.zeros(len(self.power["branches"]), dtype=float)
+            z = (np.zeros(len(self.power["branches"]), dtype=float), False)
             cache[node_id] = z
-            return z, False
+            return z
 
         dP_lines = ac_ptdf_distributed(
             self.power["theta"],
@@ -1518,9 +1557,9 @@ class CarrierPTDFContext:
             dP,
             dQ=None,
         )
-        out = np.array(dP_lines, dtype=float)
+        out = (np.array(dP_lines, dtype=float), True)
         cache[node_id] = out
-        return out, True
+        return out
 
     # -------- GAS --------
     def gas_prebuild(self, monee_net):
@@ -1881,9 +1920,23 @@ def _carrier_input_adequacy_graph(monee_net, carrier: str):
         else:
             weight = -math.log(1.0 - p_fail)
         if G.has_edge(b.from_node_id, b.to_node_id):
-            # Parallel branches → keep the lower-failure-probability edge.
-            if weight < G[b.from_node_id][b.to_node_id]["weight"]:
-                G[b.from_node_id][b.to_node_id]["weight"] = weight
+            # Parallel branches: disconnection requires *all* parallel pipes to
+            # fail, so P(disconnect) = Π p_fail and the combined edge weight is
+            # −log(1 − Π p_fail). Recover the existing edge's p_fail from its
+            # weight, multiply, then re-encode.
+            existing_w = float(G[b.from_node_id][b.to_node_id]["weight"])
+            if not math.isfinite(existing_w):
+                existing_p = 1.0
+            else:
+                existing_p = 1.0 - math.exp(-existing_w)
+            combined_p = max(0.0, min(1.0, existing_p * p_fail))
+            if combined_p >= 1.0:
+                new_weight = float("inf")
+            elif combined_p <= 0.0:
+                new_weight = 0.0
+            else:
+                new_weight = -math.log(1.0 - combined_p)
+            G[b.from_node_id][b.to_node_id]["weight"] = new_weight
         else:
             G.add_edge(b.from_node_id, b.to_node_id, weight=weight)
 
@@ -2118,7 +2171,9 @@ def mes_cp_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig()):
             input_adequacy = _cp_input_adequacy(
                 cp, label, monee_net, input_adequacy_cache, cfg
             )
-            score = throughput * total_stress * topo_factor * input_adequacy
+            score = _apply_ablations(
+                cfg, throughput, total_stress, topo_factor, input_adequacy, is_cp=True
+            )
 
             rows.append(
                 _row_from_detail(
@@ -2224,7 +2279,9 @@ def mes_cp_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig()):
             input_adequacy = _cp_input_adequacy(
                 br, label, monee_net, input_adequacy_cache, cfg
             )
-            score = throughput * total_stress * topo_factor * input_adequacy
+            score = _apply_ablations(
+                cfg, throughput, total_stress, topo_factor, input_adequacy, is_cp=True
+            )
 
             rows.append(
                 _row_from_detail(
@@ -2389,7 +2446,9 @@ def mes_all_components_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig())
             monee_net, ctx, "power", br.from_node_id, br.to_node_id, cfg
         )
         total_stress = cfg.W_POWER * agg_s
-        score = throughput * total_stress * topo_factor
+        score = _apply_ablations(
+            cfg, throughput, total_stress, topo_factor, 1.0, is_cp=False
+        )
 
         row = dict(
             cp_id=str(branch_id),
@@ -2411,6 +2470,7 @@ def mes_all_components_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig())
             gas_stress_mean=0.0, gas_stress_max=0.0, gas_stress=0.0,
             heat_node_id=None, heat_reliable=None,
             heat_stress_mean=0.0, heat_stress_max=0.0, heat_stress=0.0,
+            input_adequacy=1.0,
         )
         rows_non_cp.append(row)
 
@@ -2438,7 +2498,9 @@ def mes_all_components_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig())
             monee_net, ctx, "gas", br.from_node_id, br.to_node_id, cfg
         )
         total_stress = cfg.W_GAS * agg_s
-        score = throughput * total_stress * topo_factor
+        score = _apply_ablations(
+            cfg, throughput, total_stress, topo_factor, 1.0, is_cp=False
+        )
 
         row = dict(
             cp_id=str(pipe_id),
@@ -2460,6 +2522,7 @@ def mes_all_components_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig())
             gas_stress=agg_s,
             heat_node_id=None, heat_reliable=None,
             heat_stress_mean=0.0, heat_stress_max=0.0, heat_stress=0.0,
+            input_adequacy=1.0,
         )
         rows_non_cp.append(row)
 
@@ -2496,7 +2559,9 @@ def mes_all_components_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig())
             + _heat_remoteness_factor(ctx, br.to_node_id, cfg)
         )
         total_stress = cfg.W_HEAT * agg_s * rem
-        score = throughput * total_stress * topo_factor
+        score = _apply_ablations(
+            cfg, throughput, total_stress, topo_factor, 1.0, is_cp=False
+        )
 
         row = dict(
             cp_id=str(pipe_id),
@@ -2518,6 +2583,7 @@ def mes_all_components_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig())
             heat_stress_mean=mean_s,
             heat_stress_max=max_s,
             heat_stress=agg_s * rem,
+            input_adequacy=1.0,
         )
         rows_non_cp.append(row)
 

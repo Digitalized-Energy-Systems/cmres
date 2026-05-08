@@ -300,6 +300,13 @@ def run_experiment(grid_name: str, shard: int = 0, n_shards: int = 1):
             n_runs=np.array([result.n_runs]),
             converged=np.array([result.converged]),
             per_run=result.per_run,
+            # E7: convergence checkpoints (n, mean[3], rhw[3], ess) per row.
+            # Empty array if MCEngine wasn't recording (very old code path).
+            convergence=(
+                result.convergence
+                if result.convergence is not None
+                else np.empty((0, 8))
+            ),
         )
         (out_dir / "mc_summary.txt").write_text(
             f"grid={grid_name}\n"

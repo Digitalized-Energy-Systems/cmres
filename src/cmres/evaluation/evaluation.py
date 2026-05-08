@@ -1,3 +1,5 @@
+import re
+import unicodedata
 from pathlib import Path
 
 import pandas
@@ -72,13 +74,97 @@ def get_title(fig, index, titles):
     return titles[index]
 
 
-def slugify(str: str):
-    return str.replace("/", "").replace("<", "").replace(">", "")
+# Title fragments after the first long-dash (em-dash, en-dash, " — ", " - ")
+# are typically run-time-computed annotation strings (Spearman ρ, p-values,
+# bootstrap CIs). Keeping them in filenames makes the same figure produce a
+# *different* filename on every run, which in turn breaks reproducibility for
+# the paper draft. Strip them before slugifying.
+_STATS_SUFFIX_RE = re.compile(r"\s+[—–-]\s+.*$")
+# Anything that's not a–z, 0–9, "_" or "-" gets replaced with "_". Greek/math
+# characters end up stripped — by design, slug filenames stay ASCII.
+_NON_SLUG_CHAR_RE = re.compile(r"[^a-z0-9_-]+")
+_MULTI_USCORE_RE = re.compile(r"_+")
+_MULTI_DASH_RE = re.compile(r"-+")
+_MAX_SLUG_LEN = 60
+
+
+def slugify(s: str) -> str:
+    """Aggressive ASCII-only slug for use in filenames.
+
+    Preserves the legacy behaviour of stripping ``/<>`` so any code that
+    still calls slugify directly does not silently regress; everything else
+    is normalised to ``[a-z0-9_-]``.
+    """
+    if s is None:
+        return ""
+    # NFKD decomposes accented characters into ASCII + combining marks; the
+    # subsequent encode("ascii", "ignore") drops the non-ASCII parts.
+    s = unicodedata.normalize("NFKD", str(s))
+    s = s.encode("ascii", "ignore").decode("ascii")
+    s = s.lower()
+    s = _NON_SLUG_CHAR_RE.sub("_", s)
+    s = _MULTI_USCORE_RE.sub("_", s)
+    s = _MULTI_DASH_RE.sub("-", s)
+    return s.strip("_-")
+
+
+def _figure_slug(fig, index: int, titles, slugs):
+    """Pick a short, filesystem-safe identifier for one figure.
+
+    Resolution order:
+      1. ``slugs[index]`` if the caller supplied a slugs list with this entry
+         set to a non-empty string — used as-is after a defensive slugify.
+      2. The figure's layout title or ``titles[index]``, with the run-time
+         stats-line suffix (after " — ", " – ", or " - ") stripped, then
+         aggressively slugified and truncated to ``_MAX_SLUG_LEN`` chars.
+      3. ``"figure"`` as the last-resort default.
+
+    The numeric index prefix is added by the caller so collisions across
+    differently-titled figures in the same HTML are impossible.
+    """
+    if slugs is not None and index < len(slugs) and slugs[index]:
+        explicit = slugify(slugs[index])
+        if explicit:
+            return explicit[:_MAX_SLUG_LEN]
+
+    raw_title = None
+    if fig is not None and hasattr(fig, "layout") and getattr(fig.layout, "title", None):
+        raw_title = getattr(fig.layout.title, "text", None)
+    if not raw_title and titles is not None and index < len(titles):
+        raw_title = titles[index]
+    if not raw_title:
+        return "figure"
+    cleaned = _STATS_SUFFIX_RE.sub("", str(raw_title))
+    slug = slugify(cleaned)
+    if not slug:
+        return "figure"
+    # Cut at a word boundary if possible so we don't end mid-token.
+    if len(slug) > _MAX_SLUG_LEN:
+        slug = slug[:_MAX_SLUG_LEN]
+        last_us = slug.rfind("_")
+        if last_us > _MAX_SLUG_LEN // 2:
+            slug = slug[:last_us]
+    return slug or "figure"
 
 
 def write_all_in_one(
-    figures, scenario_name, out_path, out_filename, write_single_files=True, titles=None
+    figures,
+    scenario_name,
+    out_path,
+    out_filename,
+    write_single_files=True,
+    titles=None,
+    slugs=None,
 ):
+    """Write a combined HTML and (optionally) one PDF per figure.
+
+    Single-file PDFs are named ``{NN}_{slug}.pdf`` where ``NN`` is the
+    figure's zero-padded index in ``figures`` and ``slug`` is derived from
+    ``slugs[i]`` (if provided) or the figure title with the run-time
+    stats-line suffix stripped. The index prefix preserves the document
+    order and guarantees uniqueness, so the previous ``-{xaxis}-{yaxis}``
+    disambiguator is no longer needed.
+    """
     out_path.mkdir(parents=True, exist_ok=True)
     (out_path / out_filename).parent.mkdir(parents=True, exist_ok=True)
 
@@ -97,18 +183,13 @@ def write_all_in_one(
     if write_single_files:
         path_single_files = (out_path / out_filename).parent / "single"
         path_single_files.mkdir(parents=True, exist_ok=True)
+        # Width of the index prefix scales with figure count so order is
+        # preserved by lexicographic sort even for 100+-figure outputs.
+        idx_width = max(2, len(str(max(0, len(figures) - 1))))
         for i, fig in enumerate(figures):
-            fig.write_image(
-                path_single_files
-                / (
-                    get_title(fig, i, titles)
-                    + "-"
-                    + slugify(fig.layout.xaxis.title.text)
-                    + "-"
-                    + slugify(fig.layout.yaxis.title.text)
-                    + ".pdf"
-                )
-            )
+            slug = _figure_slug(fig, i, titles, slugs)
+            filename = f"{i:0{idx_width}d}_{slug}.pdf"
+            fig.write_image(path_single_files / filename)
 
 
 def create_group_histogram(

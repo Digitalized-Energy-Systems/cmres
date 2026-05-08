@@ -482,6 +482,13 @@ class MCResult:
     # Seeds used (legacy mode only; None in RQMC mode)
     seeds: Optional[List[int]] = None
 
+    # E7: convergence trace. Each entry is a snapshot at a checkpoint:
+    # (n_runs, mean[3], rel_half_width[3], ess). Populated per
+    # CHECKPOINT_EVERY runs by ``MCEngine._run_rqmc`` / ``_run_legacy`` so
+    # downstream eval can plot RHW(n) and Var-Reduction-Factor without
+    # re-running the simulation.
+    convergence: Optional[np.ndarray] = None  # shape (n_checkpoints, 1+3+3+1)
+
     CARRIER_NAMES: List[str] = field(
         default_factory=lambda: ["power", "heat", "gas"], repr=False
     )
@@ -583,6 +590,11 @@ class MCEngine:
 
     # ── RQMC loop ─────────────────────────────────────────────────────────────
 
+    # E7: how often to snapshot mean/RHW for the convergence trace stored
+    # in MCResult.convergence. 100 keeps the trace small (~160 rows for
+    # max_runs=2¹⁴) while still producing usable RHW(n) curves.
+    CHECKPOINT_EVERY: ClassVar[int] = 100
+
     def _run_rqmc(self, run_func: Callable) -> MCResult:
         stopping = CIStoppingCriterion(
             rel_tol=self.rel_tol,
@@ -590,8 +602,15 @@ class MCEngine:
             n_carriers=self.n_carriers,
         )
         per_run: List[np.ndarray] = []
+        # E7: convergence trace — recorded every CHECKPOINT_EVERY iterations
+        # so the eval can plot RHW(n) without re-running the MC.
+        trace: List[np.ndarray] = []
         converged = False
         i = 0
+        # Pre-seed diagnostics so the post-loop warning has a valid `diag`
+        # even when the loop never executes (max_runs=0, or sampler exhausted
+        # on the first call).
+        _, diag = stopping.should_stop()
 
         while i < self.max_runs:
             try:
@@ -621,7 +640,19 @@ class MCEngine:
             # ── Convergence check ───────────────────────────────────────────
             converged, diag = stopping.should_stop()
 
-            if i % 100 == 0:
+            # E7 checkpoint: row layout is
+            # [n, mean[0..2], rhw[0..2], ess]  (length = 1 + 3 + 3 + 1 = 8).
+            if i % self.CHECKPOINT_EVERY == 0:
+                trace.append(
+                    np.concatenate(
+                        [
+                            np.array([float(i)]),
+                            np.asarray(diag["mean"], dtype=float),
+                            np.asarray(diag["rel_half_width"], dtype=float),
+                            np.array([float(diag.get("ess", float(i)))]),
+                        ]
+                    )
+                )
                 rhw_str = " ".join(f"{v:.3f}" for v in diag["rel_half_width"])
                 mean_str = " ".join(f"{v:.3f}" for v in diag["mean"])
                 ess = diag.get("ess", float(i))
@@ -641,6 +672,18 @@ class MCEngine:
             )
 
         _, final_diag = stopping.should_stop()
+        # Always record the final state as the last checkpoint so the trace
+        # is well-defined even if the loop converged between checkpoints.
+        trace.append(
+            np.concatenate(
+                [
+                    np.array([float(i)]),
+                    np.asarray(final_diag["mean"], dtype=float),
+                    np.asarray(final_diag["rel_half_width"], dtype=float),
+                    np.array([float(final_diag.get("ess", float(i)))]),
+                ]
+            )
+        )
         return MCResult(
             n_runs=i,
             converged=converged,
@@ -652,6 +695,7 @@ class MCEngine:
             ess=final_diag.get("ess", float(i)),
             per_run=np.array(per_run),
             seeds=None,
+            convergence=np.asarray(trace) if trace else None,
         )
 
     # ── Legacy seed-based loop (backward compatible) ──────────────────────────
@@ -665,8 +709,13 @@ class MCEngine:
         )
         per_run: List[np.ndarray] = []
         seeds_used: List[int] = []
+        # E7: convergence trace.
+        trace: List[np.ndarray] = []
         converged = False
         i = 0
+        # See _run_rqmc — pre-seed `diag` so the post-loop warning is safe
+        # under empty / zero-iteration runs.
+        _, diag = stopping.should_stop()
 
         while i < self.max_runs:
             seed = seeds[i]
@@ -697,7 +746,17 @@ class MCEngine:
             # ── Convergence check ───────────────────────────────────────────
             converged, diag = stopping.should_stop()
 
-            if i % 100 == 0:
+            if i % self.CHECKPOINT_EVERY == 0:
+                trace.append(
+                    np.concatenate(
+                        [
+                            np.array([float(i)]),
+                            np.asarray(diag["mean"], dtype=float),
+                            np.asarray(diag["rel_half_width"], dtype=float),
+                            np.array([float(diag.get("ess", float(i)))]),
+                        ]
+                    )
+                )
                 rhw_str = " ".join(f"{v:.3f}" for v in diag["rel_half_width"])
                 mean_str = " ".join(f"{v:.3f}" for v in diag["mean"])
                 log.info("n=%5d  mean=[%s]  RHW=[%s]", i, mean_str, rhw_str)
@@ -714,6 +773,16 @@ class MCEngine:
             )
 
         _, final_diag = stopping.should_stop()
+        trace.append(
+            np.concatenate(
+                [
+                    np.array([float(i)]),
+                    np.asarray(final_diag["mean"], dtype=float),
+                    np.asarray(final_diag["rel_half_width"], dtype=float),
+                    np.array([float(final_diag.get("ess", float(i)))]),
+                ]
+            )
+        )
         return MCResult(
             n_runs=i,
             converged=converged,
@@ -725,6 +794,7 @@ class MCEngine:
             ess=final_diag.get("ess", float(i)),
             per_run=np.array(per_run),
             seeds=seeds_used,
+            convergence=np.asarray(trace) if trace else None,
         )
 
 
