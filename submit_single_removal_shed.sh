@@ -58,6 +58,7 @@ if [[ "$SUBMIT_MERGE" == "1" ]]; then
     echo "Submitting MERGE: $N_GRIDS grids (afterok:$RUN_JID)"
     MERGE_JID=$(
         sbatch \
+        -p rosa.p \
             --parsable \
             --dependency=afterok:$RUN_JID \
             --array=0-$((N_GRIDS - 1)) \
