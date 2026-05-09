@@ -66,7 +66,7 @@ python -u -c "
 import sys
 sys.path.insert(0, 'experiments/re')
 from cp_cn_evaluation import evaluate, INPUT
-evaluate(INPUT)
+evaluate("/user/towo7024/cmres_new/cmres/data/res")
 "
 EXIT_CODE=$?
 

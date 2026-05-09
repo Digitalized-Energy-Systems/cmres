@@ -1,1 +1,1 @@
-sbatch -p rosa.p slurm_evaluation.sh --input-dir /user/towo7024/cmres_new/cmres/data/res
+sbatch -p rosa.p slurm_evaluation.sh
