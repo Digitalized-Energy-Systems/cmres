@@ -20,7 +20,7 @@
 # Usage notes
 # -----------
 # - INPUT_DIR    where MoneeResilienceExperiment-<grid>/network.p lives
-#                (default: /home/rschrage/experiments/0508/res)
+#                (default: /user/towo7024/cmres_new/cmres/data/res)
 # - OUTPUT_DIR   per-shard CSV destination
 #                (default: data/out/single_removal_shed)
 # - GRIDS list   defined inside slurm_single_removal_shed.sh; keep aligned
@@ -32,7 +32,7 @@ set -e
 N_GRIDS=${N_GRIDS:-6}
 N_SHARDS=${N_SHARDS:-8}
 SUBMIT_MERGE=${SUBMIT_MERGE:-1}
-INPUT_DIR=${INPUT_DIR:-/home/rschrage/experiments/0508/res}
+INPUT_DIR=${INPUT_DIR:-/user/towo7024/cmres_new/cmres/data/res}
 OUTPUT_DIR=${OUTPUT_DIR:-data/out/single_removal_shed}
 
 mkdir -p logs "$OUTPUT_DIR"

@@ -37,7 +37,7 @@ N_GRIDS=${N_GRIDS:-6}
 N_SHARDS=${N_SHARDS:-8}
 
 # SLURM array index → (grid_idx, shard_idx) — both 0-based.
-INPUT_DIR=${INPUT_DIR:-/home/rschrage/experiments/0508/res}
+INPUT_DIR=${INPUT_DIR:-/user/towo7024/cmres_new/cmres/data/res}
 OUTPUT_DIR=${OUTPUT_DIR:-data/out/single_removal_shed}
 
 # Grid catalogue MUST stay aligned with experiments/re/test_grids.py::ALL_GRIDS.
