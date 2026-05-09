@@ -91,7 +91,7 @@ class CPMetricConfig:
 
     # ── Ablation flags (E2) ──────────────────────────────────────────────
     # Each ABLATE_* fixes one factor of the composite score to 1.0 so the
-    # effect of removing it can be measured. The dissertation's E2 ablation
+    # effect of removing it can be measured. The CMRES E2 ablation
     # experiment runs `mes_cp_metric` once per ablation variant and compares
     # ρ vs the full score; effect size is then ρ(full) − ρ(ablated).
     ABLATE_THROUGHPUT: bool = False

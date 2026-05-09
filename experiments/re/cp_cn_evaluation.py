@@ -917,7 +917,7 @@ def impact_aggregated_component_carrier(impact_df: pandas.DataFrame, folder_id):
 
 
 # Backwards-compat re-exports. The canonical implementations now live in
-# ``eval_common`` so dissertation_eval and this module use the same logic.
+# ``eval_common`` so cmres_eval and this module use the same logic.
 _COMPOUND_CP_TYPES = _ec._COMPOUND_CP_TYPES
 _NON_CP_BRANCH_TYPES = _ec._NON_CP_BRANCH_TYPES
 _build_branch_lookup = _ec.build_branch_lookup
@@ -927,9 +927,9 @@ _match_impact_id = _ec.match_impact_id
 def cp_metric_vs_actual_impact(monee_net, impact_df_nt, network_type):
     """E1 / E5: per-network ρ + ranking battery.
 
-    Implements dissertation experiment **E1 (validation)** and feeds
+    Implements CMRES evaluation experiment **E1 (validation)** and feeds
     ``cp_only_metric_comparison`` (**E5**, per-CP-type breakdown). Returns
-    the unfiltered matched dataframe so dissertation_eval can reuse it for
+    the unfiltered matched dataframe so cmres_eval can reuse it for
     E2 ablations, E3 density, E4 distribution, etc., without re-running
     ``mes_all_components_metric``.
     """
@@ -2206,7 +2206,7 @@ def _scenario_density_distribution(network_type: str):
     """Map a simbench scenario name to (CP density, distribution label).
 
     Returns ``(None, None)`` for scenarios that don't follow the
-    ``simbench_lv[...]`` naming convention so the dissertation E3/E4
+    ``simbench_lv[...]`` naming convention so the CMRES E3/E4
     experiments can simply skip them.
     """
     name = str(network_type)
@@ -2228,13 +2228,13 @@ def _scenario_density_distribution(network_type: str):
     return None, distribution
 
 
-def _make_dissertation_artefact(
+def _make_cmres_artefact(
     label, df_eval, monee_net, mc_npz_path, density, distribution
 ):
     """Lazy-import wrapper so cp_cn_evaluation.py doesn't hard-depend on
-    dissertation_eval at module load (the dissertation experiments are
+    cmres_eval at module load (the CMRES evaluation experiments are
     optional)."""
-    from dissertation_eval import ScenarioArtefacts
+    from cmres_eval import ScenarioArtefacts
     return ScenarioArtefacts(
         label=label,
         df_eval=df_eval,
@@ -2253,10 +2253,10 @@ def evaluate(folder_id):
     impact_df = extend_impact_df(net_type_to_net, metrics_df, impact_df)
 
     per_network_dfs = []
-    # Bundle of per-scenario inputs the dissertation block consumes after
+    # Bundle of per-scenario inputs the CMRES eval block consumes after
     # the per-scenario loop completes. Local to evaluate() so re-runs don't
     # carry state.
-    dissertation_artefacts = []
+    cmres_artefacts = []
 
     for network_type, monee_net in net_type_to_net.items():
         print(network_type)
@@ -2325,13 +2325,13 @@ def evaluate(folder_id):
         if net_df is not None and len(net_df) > 0:
             cp_only_metric_comparison(net_df, network_type)
             per_network_dfs.append(net_df)
-            # Per-scenario artefact for the dissertation block. Density and
+            # Per-scenario artefact for the CMRES eval block. Density and
             # distribution map directly off the simbench scenario name; the
             # mc_result.npz path mirrors the layout used by run_simulation.
             density, distribution = _scenario_density_distribution(network_type)
             mc_npz = Path(folder_id) / f"MoneeResilienceExperiment-{network_type}" / "mc_result.npz"
-            dissertation_artefacts.append(
-                _make_dissertation_artefact(
+            cmres_artefacts.append(
+                _make_cmres_artefact(
                     label=network_type,
                     df_eval=net_df,
                     monee_net=monee_net,
@@ -2351,21 +2351,21 @@ def evaluate(folder_id):
         print("Only one network type found — skipping pooled metric analysis.")
         cp_only_pooled_metric_comparison(per_network_dfs[0], OUTPUT + "/pooled")
 
-    # ── Dissertation experiments (E2..E13) ─────────────────────────────
-    # Run the full dissertation battery on the per-scenario artefacts we
-    # collected during the loop. Each experiment writes its own CSV (and
-    # HTML where applicable) under data/out/dissertation/.
-    if dissertation_artefacts:
+    # ── CMRES evaluation experiments (E2..E16) ─────────────────────────
+    # Run the full CMRES evaluation battery on the per-scenario artefacts
+    # we collected during the loop. Each experiment writes its own CSV (and
+    # HTML where applicable) under data/out/cmres/.
+    if cmres_artefacts:
         try:
-            from dissertation_eval import run_dissertation_block
-            run_dissertation_block(
-                dissertation_artefacts,
+            from cmres_eval import run_cmres_block
+            run_cmres_block(
+                cmres_artefacts,
                 impact_df,
-                Path(OUTPUT) / "dissertation",
+                Path(OUTPUT) / "cmres",
             )
         except Exception as e:
             traceback.print_exc()
-            print(f"[dissertation] block failed: {type(e).__name__}: {e}")
+            print(f"[cmres-eval] block failed: {type(e).__name__}: {e}")
 
 
 def main():

@@ -1,14 +1,14 @@
-"""Dissertation-grade evaluation experiments.
+"""CMRES evaluation experiments.
 
-Each function below corresponds to one experiment in the dissertation plan.
-They all consume the same inputs as the existing ``cp_cn_evaluation.evaluate``
-pipeline (per-network dataframes plus a solved monee Network) so they can be
-called as one extra block at the end of ``evaluate()`` without touching the
-existing pipeline.
+Each function below corresponds to one experiment in the CMRES evaluation
+plan. They all consume the same inputs as the existing
+``cp_cn_evaluation.evaluate`` pipeline (per-network dataframes plus a solved
+monee Network) so they can be called as one extra block at the end of
+``evaluate()`` without touching the existing pipeline.
 
 Layout
 ------
-``run_dissertation_block(...)`` is the entry point — it collects per-scenario
+``run_cmres_block(...)`` is the entry point — it collects per-scenario
 artefacts and produces, for each experiment, one ``Path`` to the HTML output
 or the dataframe (so callers can decide what to emit further).
 
@@ -473,7 +473,7 @@ def experiment_e8_multilayer(
     matching (carrier, orig_id) for their primary carrier endpoint.
 
     Returns a tidy DataFrame ``(scenario, metric, rho, n)`` for the new
-    multilayer metrics so the dissertation can include them in the
+    multilayer metrics so the evaluation can include them in the
     main-results table.
     """
     out_dir = Path(output_dir)
@@ -993,13 +993,13 @@ def experiment_e16_single_removal_validation(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def run_dissertation_block(
+def run_cmres_block(
     artefacts: List[ScenarioArtefacts],
     impact_df: pd.DataFrame,
     output_dir: Path,
     enabled: Optional[List[str]] = None,
 ) -> Dict[str, pd.DataFrame]:
-    """Run the full dissertation experiment battery.
+    """Run the full CMRES evaluation battery.
 
     ``enabled`` selects a subset of experiment IDs (e.g. ``["E2", "E8", "E9"]``).
     Default = all of E2, E3, E4, E6, E7, E8, E9, E10, E11, E12, E13.

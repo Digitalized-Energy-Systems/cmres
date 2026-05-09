@@ -1,10 +1,11 @@
-"""Complex-network helpers for the dissertation's MES contribution.
+"""Complex-network helpers for the CMRES MES evaluation.
 
-Each section of this module corresponds to one experiment in the dissertation
-plan. The functions here are *pure* — they operate on a ``monee.Network`` (and
-optionally a precomputed multilayer ``nx.Graph``) and return numbers,
-DataFrames, or new graphs. Visualisation and orchestration live in
-``dissertation_eval.py``; per-component scoring stays in ``cp_metric.py``.
+Each section of this module corresponds to one experiment in the CMRES
+evaluation plan. The functions here are *pure* — they operate on a
+``monee.Network`` (and optionally a precomputed multilayer ``nx.Graph``)
+and return numbers, DataFrames, or new graphs. Visualisation and
+orchestration live in ``cmres_eval.py``; per-component scoring stays in
+``cp_metric.py``.
 
 Sections
 --------

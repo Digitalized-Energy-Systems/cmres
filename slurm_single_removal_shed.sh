@@ -63,6 +63,23 @@ if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
     exit 2
 fi
 
+echo "============================================================"
+echo "Job ID      : ${SLURM_JOB_ID}  array task: ${SLURM_ARRAY_TASK_ID}"
+echo "Host        : $(hostname)"
+echo "CPUs        : ${SLURM_CPUS_PER_TASK}"
+echo "Phase       : ${CMRES_MERGE_PHASE:+MERGE}${CMRES_MERGE_PHASE:-RUN}"
+echo "Started at  : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+echo "============================================================"
+
+# ── HPC environment activation (must match slurm_run_simulations.sh) ─────────
+# Without these, SLURM falls back to the system Python (≤ 3.6 on this
+# cluster), which can't parse ``from __future__ import annotations``,
+# triggering an immediate SyntaxError and a non-zero exit that breaks the
+# afterok dependency on the merge array.
+module load hpc-env/13.1
+module load Miniforge3/26.1.0-0
+conda activate cmres_env
+
 # ── Merge phase ───────────────────────────────────────────────────────────────
 # Each merge task handles exactly one grid (by SLURM_ARRAY_TASK_ID = grid_idx).
 if [[ "${CMRES_MERGE_PHASE:-0}" == "1" ]]; then
@@ -77,23 +94,31 @@ if [[ "${CMRES_MERGE_PHASE:-0}" == "1" ]]; then
         --output-dir "$OUTPUT_DIR" \
         --merge \
         --n-shards "$N_SHARDS"
-    exit $?
+    EXIT_CODE=$?
+else
+    # ── Run phase ─────────────────────────────────────────────────────────────
+    GRID_IDX=$(( SLURM_ARRAY_TASK_ID / N_SHARDS ))
+    SHARD_IDX=$(( SLURM_ARRAY_TASK_ID % N_SHARDS ))
+    SHARD=$(( SHARD_IDX + 1 ))     # single_removal_shed.py expects 1-based shards
+    GRID=${GRIDS[$GRID_IDX]}
+
+    if [[ -z "$GRID" ]]; then
+        echo "ERROR: no grid for index $GRID_IDX (array=$SLURM_ARRAY_TASK_ID, N_SHARDS=$N_SHARDS)" >&2
+        exit 2
+    fi
+
+    echo "[run] grid=$GRID shard=$SHARD/$N_SHARDS  array_id=$SLURM_ARRAY_TASK_ID"
+    python -u "$SCRIPT" "$GRID" \
+        --input-dir  "$INPUT_DIR" \
+        --output-dir "$OUTPUT_DIR" \
+        --shard      "$SHARD" \
+        --n-shards   "$N_SHARDS"
+    EXIT_CODE=$?
 fi
 
-# ── Run phase ─────────────────────────────────────────────────────────────────
-GRID_IDX=$(( SLURM_ARRAY_TASK_ID / N_SHARDS ))
-SHARD_IDX=$(( SLURM_ARRAY_TASK_ID % N_SHARDS ))
-SHARD=$(( SHARD_IDX + 1 ))     # single_removal_shed.py expects 1-based shards
-GRID=${GRIDS[$GRID_IDX]}
+echo "============================================================"
+echo "Finished at : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+echo "Exit code   : ${EXIT_CODE}"
+echo "============================================================"
 
-if [[ -z "$GRID" ]]; then
-    echo "ERROR: no grid for index $GRID_IDX (array=$SLURM_ARRAY_TASK_ID, N_SHARDS=$N_SHARDS)" >&2
-    exit 2
-fi
-
-echo "[run] grid=$GRID shard=$SHARD/$N_SHARDS  array_id=$SLURM_ARRAY_TASK_ID"
-python -u "$SCRIPT" "$GRID" \
-    --input-dir  "$INPUT_DIR" \
-    --output-dir "$OUTPUT_DIR" \
-    --shard      "$SHARD" \
-    --n-shards   "$N_SHARDS"
+exit ${EXIT_CODE}

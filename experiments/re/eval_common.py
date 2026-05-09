@@ -1,4 +1,4 @@
-"""Shared helpers for ``cp_cn_evaluation`` and ``dissertation_eval``.
+"""Shared helpers for ``cp_cn_evaluation`` and ``cmres_eval``.
 
 Holds the constants, statistical primitives, and the matched-df builder that
 both modules need so the same logic doesn't live in three places.
