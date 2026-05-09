@@ -1,0 +1,1 @@
+sbatch -p rosa.p slurm_evaluation.sh
