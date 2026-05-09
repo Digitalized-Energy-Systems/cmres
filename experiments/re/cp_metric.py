@@ -2299,9 +2299,23 @@ def mes_cp_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig()):
                 )
             )
 
-    df_scores = (
-        pd.DataFrame(rows).sort_values("score", ascending=False).reset_index(drop=True)
-    )
+    # When the grid has no CPs (e.g. simbench_lv_no, density=0), the rows
+    # list is empty. Constructing the DataFrame normally would yield an
+    # empty frame with no columns, and ``sort_values("score")`` would raise
+    # ``KeyError: 'score'``. Build the df with the canonical column schema
+    # so downstream code (``mes_all_components_metric``,
+    # ``cp_metric_vs_actual_impact``) sees a well-typed empty CP table.
+    if rows:
+        df_scores = (
+            pd.DataFrame(rows).sort_values("score", ascending=False).reset_index(drop=True)
+        )
+    else:
+        empty_row = _row_from_detail(
+            cp_id="", cp_type="", p_fail=0.0, throughput=0.0,
+            topo_bc=0.0, topo_factor=0.0, total_stress=0.0,
+            score=0.0, reliable=False, detail={}, input_adequacy=1.0,
+        )
+        df_scores = pd.DataFrame(columns=list(empty_row.keys()))
 
     if not cfg.RETURN_DEBUG:
         return df_scores
