@@ -36,7 +36,6 @@
 #SBATCH --error=logs/eval_%j.err
 #SBATCH --mail-type=FAIL
 #SBATCH --mail-user=rico.schrage@uni-oldenburg.de
-#SBATCH --nodelist=mpcs001,mpcb001
 #SBATCH -p rosa.p
 
 mkdir -p logs data/out
