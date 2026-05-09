@@ -218,34 +218,48 @@ def _shed_from_solved(net) -> Tuple[float, float, float, float]:
 
 
 def compute_single_removal_shed(
-    monee_net,
+    net_factory,
     targets: Optional[List[Tuple[str, str, object]]] = None,
     ext_grid_bounds: Optional[dict] = None,
 ) -> pd.DataFrame:
-    """Run deactivate-solve for each target on a *fresh copy* of the network.
+    """Run deactivate-solve for each target on a *factory-fresh* network.
 
-    Why a fresh copy per iteration (instead of deactivate-then-reactivate
-    in place): monee's Pyomo solver mutates Var state in place. After a
-    successful solve, the per-component Vars are replaced by their solved
-    float values. A subsequent ``optimization_problem._apply(network)``
-    then crashes with ::
+    Why a factory (callable) instead of a single Network object + ``.copy()``:
+    monee's Pyomo solver mutates the network's Var state in place. A single
+    successful solve replaces every per-component Var with its solved float
+    value, after which ``optimization_problem._apply(network)`` crashes
+    with ::
 
         AttributeError: 'float' object has no attribute 'max'
 
     because ``_apply`` expects each variable it sets bounds on to still be
-    a Pyomo Var. Copying the network per iteration isolates each solve's
-    state — the same pattern ``run_simulation.py`` uses for its MC scenarios.
+    a Pyomo Var. ``Network.copy()`` doesn't reliably reconstitute every
+    Var — under our pickled+formulated networks the copied Vars sometimes
+    survive as floats. Calling ``net_factory()`` (typically
+    ``pickle.loads(cached_bytes)``) returns a guaranteed-fresh formulated-
+    but-unsolved network for every iteration.
+
+    ``net_factory`` is also accepted as a Network instance for backwards
+    compat — that path uses ``net.copy()`` and inherits the brittleness
+    above.
 
     Returns a DataFrame with ``cp_id, kind, power_shed, heat_shed, gas_shed,
     total_shed, solve_status, elapsed_s``.
     """
-    targets = targets or _enumerate_targets(monee_net)
+    if not callable(net_factory):
+        # Backwards-compat: a Network was passed; wrap it in a copy factory.
+        _net_obj = net_factory
+        net_factory = _net_obj.copy
+
     bounds = ext_grid_bounds or {}
 
-    # Baseline shed (no faults). On a fresh copy so the original keeps its
-    # formulated-but-unsolved Vars for subsequent iterations.
+    # Use the first fresh net for target enumeration so component refs
+    # remain valid across iterations (deactivate only reads type+id).
+    targets = targets or _enumerate_targets(net_factory())
+
+    # Baseline shed (no faults).
     t0 = time.time()
-    base = _solve_load_shed(monee_net.copy(), **bounds)
+    base = _solve_load_shed(net_factory(), **bounds)
     base_p, base_h, base_g, base_t = (
         _shed_from_solved(base.network) if base is not None else (0.0, 0.0, 0.0, 0.0)
     )
@@ -269,10 +283,11 @@ def compute_single_removal_shed(
 
     for cp_id, kind, comp in targets:
         t1 = time.time()
-        # Fresh copy per iteration. ``deactivate`` only uses ``type(comp)``
-        # and ``comp.id``, both preserved across ``net.copy()``, so we can
-        # pass the original ``comp`` reference to the copied network.
-        net_iter = monee_net.copy()
+        # Fresh state per iteration. deactivate only reads type(comp) and
+        # comp.id, both preserved across pickle round-trips; the
+        # ``comp`` reference can be reused even though the new network
+        # is a different Python object.
+        net_iter = net_factory()
         try:
             net_iter.deactivate(comp)
         except Exception:
@@ -383,8 +398,21 @@ def main():
 
     # Single-shard or unsharded run.
     network_pkl = args.input_dir / f"MoneeResilienceExperiment-{args.grid}" / "network.p"
+    # Read the pickle bytes ONCE; deserialise per iteration to get a
+    # guaranteed-fresh formulated network. ``Network.copy()`` does NOT
+    # restore Pyomo Var state cleanly under our pickled+formulated setup —
+    # the copied network's Vars come back as floats, and
+    # ``optimization_problem._apply`` crashes on the first
+    # ``var.max = max_value`` call. Re-pickling per iteration mirrors what
+    # cp_cn_evaluation does (``pickle.load(network.p)`` → load-shed solve
+    # works), so it sidesteps the broken-copy problem entirely.
     with open(network_pkl, "rb") as f:
-        net = pickle.load(f)
+        net_bytes = f.read()
+
+    def net_factory():
+        return pickle.loads(net_bytes)
+
+    net = net_factory()
     log.info("loaded %s (%s)", network_pkl, net.statistics())
 
     targets = _enumerate_targets(net)
@@ -395,7 +423,7 @@ def main():
     )
 
     sliced = _slice_targets(targets, args.shard, args.n_shards) if args.n_shards > 1 else targets
-    df = compute_single_removal_shed(net, targets=sliced)
+    df = compute_single_removal_shed(net_factory, targets=sliced)
     if args.shard and args.n_shards > 1:
         path = args.output_dir / f"single_removal_shed_{args.grid}_shard_{args.shard}_of_{args.n_shards}.csv"
     else:
