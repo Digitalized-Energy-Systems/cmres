@@ -340,7 +340,7 @@ def main():
     )
     parser.add_argument(
         "--input-dir", type=Path,
-        default=Path("/home/rschrage/experiments/0508/res"),
+        default=Path("/user/towo7024/cmres_new/cmres/data/res"),
         help="Directory containing MoneeResilienceExperiment-<grid>/network.p",
     )
     parser.add_argument(
