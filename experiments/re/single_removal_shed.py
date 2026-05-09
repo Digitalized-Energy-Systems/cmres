@@ -49,7 +49,7 @@ import pandas as pd
 
 import monee.model as mm
 import monee.problem as mp
-from monee import PyomoSolver, run_energy_flow, run_energy_flow_optimization
+from monee import PyomoSolver, run_energy_flow_optimization
 
 log = logging.getLogger(__name__)
 
@@ -222,18 +222,30 @@ def compute_single_removal_shed(
     targets: Optional[List[Tuple[str, str, object]]] = None,
     ext_grid_bounds: Optional[dict] = None,
 ) -> pd.DataFrame:
-    """Run deactivate-solve-reactivate for each target. The network is
-    mutated in place during the loop and restored after each iteration.
+    """Run deactivate-solve for each target on a *fresh copy* of the network.
 
-    Returns a DataFrame ``cp_id, kind, power_shed, heat_shed, gas_shed,
+    Why a fresh copy per iteration (instead of deactivate-then-reactivate
+    in place): monee's Pyomo solver mutates Var state in place. After a
+    successful solve, the per-component Vars are replaced by their solved
+    float values. A subsequent ``optimization_problem._apply(network)``
+    then crashes with ::
+
+        AttributeError: 'float' object has no attribute 'max'
+
+    because ``_apply`` expects each variable it sets bounds on to still be
+    a Pyomo Var. Copying the network per iteration isolates each solve's
+    state — the same pattern ``run_simulation.py`` uses for its MC scenarios.
+
+    Returns a DataFrame with ``cp_id, kind, power_shed, heat_shed, gas_shed,
     total_shed, solve_status, elapsed_s``.
     """
     targets = targets or _enumerate_targets(monee_net)
     bounds = ext_grid_bounds or {}
 
-    # Baseline shed (no faults). Reported in the result for normalisation.
+    # Baseline shed (no faults). On a fresh copy so the original keeps its
+    # formulated-but-unsolved Vars for subsequent iterations.
     t0 = time.time()
-    base = _solve_load_shed(monee_net, **bounds)
+    base = _solve_load_shed(monee_net.copy(), **bounds)
     base_p, base_h, base_g, base_t = (
         _shed_from_solved(base.network) if base is not None else (0.0, 0.0, 0.0, 0.0)
     )
@@ -257,9 +269,12 @@ def compute_single_removal_shed(
 
     for cp_id, kind, comp in targets:
         t1 = time.time()
-        was_active = getattr(comp, "active", True)
+        # Fresh copy per iteration. ``deactivate`` only uses ``type(comp)``
+        # and ``comp.id``, both preserved across ``net.copy()``, so we can
+        # pass the original ``comp`` reference to the copied network.
+        net_iter = monee_net.copy()
         try:
-            monee_net.deactivate(comp)
+            net_iter.deactivate(comp)
         except Exception:
             log.exception("deactivate failed for %s", cp_id)
             rows.append({
@@ -271,7 +286,7 @@ def compute_single_removal_shed(
             })
             continue
         try:
-            res = _solve_load_shed(monee_net, **bounds)
+            res = _solve_load_shed(net_iter, **bounds)
             if res is None:
                 p, h, g, tot = float("nan"), float("nan"), float("nan"), float("nan")
                 status = "solve_fail"
@@ -282,12 +297,6 @@ def compute_single_removal_shed(
             log.exception("shed solve failed for %s", cp_id)
             p, h, g, tot = float("nan"), float("nan"), float("nan"), float("nan")
             status = "solve_exception"
-        finally:
-            try:
-                if was_active:
-                    monee_net.activate(comp)
-            except Exception:
-                log.exception("reactivate failed for %s", cp_id)
         rows.append({
             "cp_id": cp_id, "kind": kind,
             "power_shed": p, "heat_shed": h, "gas_shed": g, "total_shed": tot,
@@ -320,16 +329,12 @@ def _slice_targets(
     return [t for i, t in enumerate(targets) if (i % n_shards) == (shard - 1)]
 
 
-def _solve_for_eval(net):
-    """Solve the network so all subsequent deactivate-solve cycles start
-    from the same operating point. Mirrors what cp_cn_evaluation does.
-    """
-    try:
-        return run_energy_flow(net, solver=PyomoSolver(), solver_name="gurobi").network
-    except Exception:
-        log.warning("hard energy flow failed; using min-load-shed fallback")
-        res = _solve_load_shed(net)
-        return res.network if res is not None else net
+# NOTE: we intentionally do NOT pre-solve the network here. A successful
+# Pyomo solve replaces the network's per-component Vars with their solved
+# float values, after which the next ``optimization_problem._apply()``
+# crashes with ``AttributeError: 'float' object has no attribute 'max'``.
+# Each per-component iteration runs on a fresh ``net.copy()`` instead;
+# see ``compute_single_removal_shed``.
 
 
 def main():
@@ -382,7 +387,6 @@ def main():
         net = pickle.load(f)
     log.info("loaded %s (%s)", network_pkl, net.statistics())
 
-    net = _solve_for_eval(net)
     targets = _enumerate_targets(net)
     log.info(
         "targets: %d total; shard %d/%d → %d this run",
