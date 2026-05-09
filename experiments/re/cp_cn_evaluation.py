@@ -1,4 +1,5 @@
 from typing import Dict
+import argparse
 import os
 import sys
 import pickle
@@ -19,6 +20,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 from cp_metric import mes_all_components_metric, CPMetricConfig
 import eval_common as _ec
 
+# Default simulation-output directory used when no --input-dir is passed
+# on the CLI. The slurm worker submits without arguments and inherits this.
 INPUT = "/home/rschrage/experiments/0508/res"
 OUTPUT = "data/out"
 SMALL_NUMBER = 0.00000000001
@@ -2368,8 +2371,36 @@ def evaluate(folder_id):
             print(f"[cmres-eval] block failed: {type(e).__name__}: {e}")
 
 
-def main():
-    evaluate(INPUT)
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description=(
+            "Run the full CMRES evaluation pipeline (per-scenario eval, pooled "
+            "views, CMRES experiment battery E2..E16) on a directory of "
+            "simulation outputs."
+        ),
+    )
+    parser.add_argument(
+        "input_dir",
+        nargs="?",
+        default=INPUT,
+        help=(
+            "Path to the directory containing "
+            "MoneeResilienceExperiment-<grid>/ subfolders produced by "
+            "experiments/re/run_simulation.py. Defaults to the module-level "
+            f"INPUT constant ({INPUT!r}). Accepts both positional and "
+            "--input-dir forms."
+        ),
+    )
+    parser.add_argument(
+        "--input-dir",
+        dest="input_dir_flag",
+        default=None,
+        help="Alias for the positional argument; --input-dir wins when both are given.",
+    )
+    args = parser.parse_args(argv)
+    folder_id = args.input_dir_flag or args.input_dir
+    print(f"[cp_cn_evaluation] input_dir = {folder_id}")
+    evaluate(folder_id)
 
 
 if __name__ == "__main__":
