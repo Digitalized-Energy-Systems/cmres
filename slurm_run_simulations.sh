@@ -26,7 +26,7 @@
 #SBATCH --nodelist=mpcs001,mpcb001
 
 # Tunable knobs (must match the launcher's defaults).
-N_GRIDS=${N_GRIDS:-6}
+N_GRIDS=${N_GRIDS:-9}
 N_SHARDS=${N_SHARDS:-6}
 
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-1}
