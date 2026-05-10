@@ -946,6 +946,13 @@ def cp_metric_vs_actual_impact(monee_net, impact_df_nt, network_type):
     if df_all.empty:
         print(f"No metric/impact matches found for {network_type}")
         return
+    # Tag with the scenario name BEFORE the filtered slice is taken, so the
+    # ``network_type`` column survives both into the local filtered ``df``
+    # AND into the ``df_all`` we return. ``pooled_metric_comparison`` later
+    # concatenates these returned dataframes and groups on ``network_type``;
+    # without this assignment it crashes with KeyError: 'network_type'.
+    df_all = df_all.copy()
+    df_all["network_type"] = network_type
     # Primary view: only components the MC failure model actually sampled (and
     # therefore can produce a non-trivial actual_total). Components with zero
     # impact are unrankable and inflate NDCG / suppress P@k toward random; see
@@ -1132,8 +1139,11 @@ def cp_metric_vs_actual_impact(monee_net, impact_df_nt, network_type):
         ("vitality_score",   "Closeness vitality"),        # W(G) - W(G\v), phys. weights
         ("actual_total",     "Actual (MC)"),               # ground truth
     ]
+    # network_type is already set on df_all (and inherited by this filtered
+    # df) right after build_matched_df. ``df.copy()`` here keeps the original
+    # safe from the inplace ``df[metric_cols] = df[metric_cols].replace(...)``
+    # that follows.
     df = df.copy()
-    df["network_type"] = network_type
 
     # Replace any ±inf with NaN so dropna catches them too — without this they
     # would survive the dropna, then crash plotly / Spearman.
