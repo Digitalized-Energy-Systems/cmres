@@ -23,7 +23,7 @@
 #SBATCH --error=logs/slurm_%A_%a.err
 #SBATCH --mail-type=FAIL
 #SBATCH --mail-user=rico.schrage@uni-oldenburg.de
-#SBATCH --nodelist=mpcs051,mpcs049
+#SBATCH --nodelist=mpcs016,mpcs028
 
 # Tunable knobs (must match the launcher's defaults).
 N_GRIDS=${N_GRIDS:-9}
