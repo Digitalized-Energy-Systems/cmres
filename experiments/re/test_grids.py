@@ -153,7 +153,7 @@ def make_regional_mes_timeseries(
 # Convenience registry
 # =============================================================================
 
-def create_large_lv_simbench(density, central=False):
+def create_large_lv_simbench(density, central=False, cp_capacity_invariant=False):
     def create():
         net = simbench.get_simbench_net("1-LV-rural3--1-no_sw")
         mn = from_pandapower_net(net)
@@ -162,7 +162,10 @@ def create_large_lv_simbench(density, central=False):
             coupling_density=density,
             centralized=central,
             couplings=("chp", "p2g", "p2h"),
-            coupling_kwargs={"seed": 1, "use_hg_variants": True},
+            coupling_kwargs={"seed": 1, 
+                             "use_hg_variants": True, 
+                             "cp_size_multiplier": 2, 
+                             "replace_primary_generation": cp_capacity_invariant},
             heat_kwargs={"node_based_heat_loads": True},
         )
         mes.apply_formulation(MISOCP_NETWORK_FORMULATION)
@@ -185,9 +188,15 @@ ALL_GRIDS = {
     "simbench_lv_no": (create_large_lv_simbench(0), create_large_lv_simbench_ts),
     "simbench_lv_low": (create_large_lv_simbench(0.25), create_large_lv_simbench_ts),
     "simbench_lv": (create_large_lv_simbench(0.5), create_large_lv_simbench_ts),
-    "simbench_lv_centralized": (create_large_lv_simbench(0.5, central=True), create_large_lv_simbench_ts),
     "simbench_lv_high": (create_large_lv_simbench(0.75), create_large_lv_simbench_ts),
-    "simbench_lv_max": (create_large_lv_simbench(1), create_large_lv_simbench_ts),
+    
+    "simbench_lv_centralized": (create_large_lv_simbench(0.5, central=True), create_large_lv_simbench_ts),
+    "simbench_lv_centralized_same_cap": (create_large_lv_simbench(0.5, central=True, cp_capacity_invariant=True), create_large_lv_simbench_ts),
+
+    "simbench_lv_low_same_cap": (create_large_lv_simbench(0.25, cp_capacity_invariant=True), create_large_lv_simbench_ts),
+    "simbench_lv_same_cap": (create_large_lv_simbench(0.5, cp_capacity_invariant=True), create_large_lv_simbench_ts),
+    "simbench_lv_high_same_cap": (create_large_lv_simbench(0.75, cp_capacity_invariant=True), create_large_lv_simbench_ts),
+    # "simbench_lv_max": (create_large_lv_simbench(1), create_large_lv_simbench_ts),
     # "large_urban_balanced": (create_resilient_urban_mes_net, create_balanced_urban_mes_timeseries),
     # "urban_district": (create_urban_district_net, make_urban_district_timeseries),
     # "industrial_hub": (create_industrial_hub_net, make_industrial_hub_timeseries),

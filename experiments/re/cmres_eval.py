@@ -1111,4 +1111,10 @@ def run_cmres_block(
         except Exception as e:
             print(f"[E16] FAILED: {type(e).__name__}: {e}")
 
+    try:
+        import cmres_eval_plots
+        cmres_eval_plots.plot_all(output_dir, output_dir, experiments=enabled)
+    except Exception as e:
+        print(f"[plots] FAILED: {type(e).__name__}: {e}")
+
     return results
