@@ -38,26 +38,24 @@ except Exception:  # pragma: no cover — script may be imported standalone
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Shared style
+# Shared style — re-export the unified cmres palette/template from
+# ``cmres.evaluation.evaluation`` so every figure here matches the rest of the
+# eval pipeline. Keep the legacy module-level names (``TEMPLATE``, ``QUAL``,
+# ``DIVERGING``, ``SEQUENTIAL``, ``CARRIER_COLORS``) as thin aliases so code
+# inside this module reads naturally.
 # ─────────────────────────────────────────────────────────────────────────────
 
-TEMPLATE = "plotly_white+publish3"
-CARRIER_COLORS = {"power": "#ffa000", "electricity": "#ffa000",
-                  "heat": "#d32f2f", "gas": "#388e3c"}
-DIVERGING = px.colors.diverging.RdBu
-SEQUENTIAL = px.colors.sequential.Plasma_r
-QUAL = px.colors.qualitative.Plotly + px.colors.qualitative.D3
-
-_BASE_LAYOUT = dict(
-    template=TEMPLATE,
-    margin=dict(l=70, r=30, t=70, b=70),
-    legend=dict(bgcolor="rgba(255,255,255,0.6)", bordercolor="#bbb", borderwidth=1),
-    hoverlabel=dict(font_size=12, bgcolor="white", bordercolor="#444"),
-)
+TEMPLATE = eval.CMRES_TEMPLATE
+CARRIER_COLORS = eval.NETWORK_COLOR_MAP | {"power": eval.NETWORK_COLOR_MAP["electricity"]}
+DIVERGING = eval.PALETTE_DIVERGING
+SEQUENTIAL = eval.PALETTE_SEQUENTIAL
+# Extend the 10-colour qualitative palette with Plotly's D3 set for plots that
+# need >10 distinct categories.
+QUAL = eval.PALETTE_QUAL + px.colors.qualitative.D3
 
 
 def _layout(**overrides) -> dict:
-    out = dict(_BASE_LAYOUT)
+    out = dict(template=TEMPLATE)
     out.update(overrides)
     return out
 

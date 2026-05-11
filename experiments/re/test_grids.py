@@ -196,11 +196,6 @@ ALL_GRIDS = {
     "simbench_lv_low_same_cap": (create_large_lv_simbench(0.25, cp_capacity_invariant=True), create_large_lv_simbench_ts),
     "simbench_lv_same_cap": (create_large_lv_simbench(0.5, cp_capacity_invariant=True), create_large_lv_simbench_ts),
     "simbench_lv_high_same_cap": (create_large_lv_simbench(0.75, cp_capacity_invariant=True), create_large_lv_simbench_ts),
-    # "simbench_lv_max": (create_large_lv_simbench(1), create_large_lv_simbench_ts),
-    # "large_urban_balanced": (create_resilient_urban_mes_net, create_balanced_urban_mes_timeseries),
-    # "urban_district": (create_urban_district_net, make_urban_district_timeseries),
-    # "industrial_hub": (create_industrial_hub_net, make_industrial_hub_timeseries),
-    # "regional_mes": (create_regional_mes_net, make_regional_mes_timeseries),
 }
 
 def print_demands(net: mm.Network) -> None:

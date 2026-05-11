@@ -80,6 +80,11 @@ class CentralFaultyMoneeWorld:
         self.run_loop()
 
     def prepare(self):
+        # Drop any FaultInjector left over from a previous prepare() call so
+        # repeated invocations on the same world don't accumulate fault hooks.
+        self._step_hooks = [
+            h for h in self._step_hooks if not isinstance(h, FaultInjector)
+        ]
         if self._fault_generator is not None:
             self.faults = self._fault_generator.generate(self.__net)
             self._step_hooks.append(FaultInjector(self.faults))

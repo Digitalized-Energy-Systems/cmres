@@ -99,13 +99,18 @@ def _enumerate_targets(monee_net) -> List[Tuple[str, str, object]]:
 
 def _solve_load_shed(
     monee_net,
-    ext_grid_el_bounds: Tuple[float, float] = (-0.25, 0.25),
-    ext_grid_gas_bounds: Tuple[float, float] = (-1.5, 1.5),
-    ext_grid_heat_bounds: Tuple[float, float] = (-100, 100),
+    ext_grid_el_bounds: Tuple[float, float],
+    ext_grid_gas_bounds: Tuple[float, float],
+    ext_grid_heat_bounds: Tuple[float, float],
 ):
     """Run the same min-load-shedding problem the resilience model uses
     when the hard solve goes infeasible. Returns the result object on
     success, ``None`` on failure.
+
+    The three ext-grid bound tuples MUST match what the resilience model
+    used during the MC simulation (see ``MESContainer`` in test_grids.py),
+    otherwise the analytical shed and the MC actuals will use different
+    external slack capacities and the comparison is biased.
     """
     opt = mp.create_min_load_shedding_problem(
         bounds_el=(0.9, 1.1),
@@ -219,8 +224,8 @@ def _shed_from_solved(net) -> Tuple[float, float, float, float]:
 
 def compute_single_removal_shed(
     net_factory,
+    ext_grid_bounds: dict,
     targets: Optional[List[Tuple[str, str, object]]] = None,
-    ext_grid_bounds: Optional[dict] = None,
 ) -> pd.DataFrame:
     """Run deactivate-solve for each target on a *factory-fresh* network.
 
@@ -251,7 +256,7 @@ def compute_single_removal_shed(
         _net_obj = net_factory
         net_factory = _net_obj.copy
 
-    bounds = ext_grid_bounds or {}
+    bounds = ext_grid_bounds
 
     # Use the first fresh net for target enumeration so component refs
     # remain valid across iterations (deactivate only reads type+id).
@@ -352,6 +357,30 @@ def _slice_targets(
 # see ``compute_single_removal_shed``.
 
 
+def _resolve_ext_grid_bounds(grid_name: str) -> dict:
+    """Return the ext-grid bound dict the resilience MC used for *grid_name*.
+
+    Reads ``MESContainer.ext_grid_*_bounds`` from ``test_grids.ALL_GRIDS``
+    so the analytical shed solve has the same external slack as the MC
+    simulation it is being validated against. Builds the network once,
+    which is moderately expensive, but only happens at startup.
+    """
+    from test_grids import ALL_GRIDS  # local import keeps CLI startup cheap
+
+    if grid_name not in ALL_GRIDS:
+        raise KeyError(
+            f"Grid {grid_name!r} not in test_grids.ALL_GRIDS "
+            f"({sorted(ALL_GRIDS)})."
+        )
+    create_fn, _ = ALL_GRIDS[grid_name]
+    container = create_fn()
+    return {
+        "ext_grid_el_bounds": container.ext_grid_el_bounds,
+        "ext_grid_gas_bounds": container.ext_grid_gas_bounds,
+        "ext_grid_heat_bounds": container.ext_grid_heat_bounds,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument(
@@ -423,7 +452,9 @@ def main():
     )
 
     sliced = _slice_targets(targets, args.shard, args.n_shards) if args.n_shards > 1 else targets
-    df = compute_single_removal_shed(net_factory, targets=sliced)
+    ext_bounds = _resolve_ext_grid_bounds(args.grid)
+    log.info("ext-grid bounds for %s: %s", args.grid, ext_bounds)
+    df = compute_single_removal_shed(net_factory, ext_bounds, targets=sliced)
     if args.shard and args.n_shards > 1:
         path = args.output_dir / f"single_removal_shed_{args.grid}_shard_{args.shard}_of_{args.n_shards}.csv"
     else:

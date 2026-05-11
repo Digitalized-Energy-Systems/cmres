@@ -189,43 +189,46 @@ def start_resilience_simulation(
     )
     sim.add_step_hook(cascading_model.step)
     try:
-        sim.prepare()
-        cascading_model._faults = sim.faults
-        log.debug("Starting simulation  faults=%s", [str(f) for f in sim.faults])
-        sim.run()
+        try:
+            sim.prepare()
+            cascading_model._faults = sim.faults
+            log.debug("Starting simulation  faults=%s", [str(f) for f in sim.faults])
+            sim.run()
+        finally:
+            # Capture incidents BEFORE flush_observed_data, since that path is
+            # CSV-friendly but discards rich per-incident structure (active fault
+            # list, solver report).  flush still runs afterwards so the CSV
+            # ``infeasibility.csv`` artefact is preserved alongside the dump.
+            incidents = list(observer.data().get("infeasibility", []))
+            if incidents:
+                try:
+                    _dump_infeasibility_incident(
+                        out_name=out_name,
+                        run_id=id,
+                        name=name,
+                        scenario=scenario,
+                        faults=getattr(sim, "faults", None),
+                        incidents=incidents,
+                    )
+                except Exception:
+                    log.exception(
+                        "Failed to dump infeasibility incident packet for run id=%s",
+                        id,
+                    )
+            log.debug("Flushing observer data  id=%s", id)
+            flush_observed_data(out_name, id)
+
+        # Per-carrier performance sums: index 0=power, 1=heat, 2=gas.
+        # Each entry in observer.data()["performance"] is a 3-tuple (or scalar).
+        raw_perfs = observer.data().get("performance", [])
+        per_carrier = pandas.DataFrame(
+            [t if isinstance(t, (list, tuple)) else [t, 0.0, 0.0] for t in raw_perfs],
+            columns=["power", "heat", "gas"],
+        )
+        carrier_sums = per_carrier.sum().to_numpy()  # shape (3,): [power, heat, gas]
+        performance_sum = float(carrier_sums.sum())  # scalar total
+        return performance_sum, carrier_sums
     finally:
-        # Capture incidents BEFORE flush_observed_data, since that path is
-        # CSV-friendly but discards rich per-incident structure (active fault
-        # list, solver report).  flush still runs afterwards so the CSV
-        # ``infeasibility.csv`` artefact is preserved alongside the dump.
-        incidents = list(observer.data().get("infeasibility", []))
-        if incidents:
-            try:
-                _dump_infeasibility_incident(
-                    out_name=out_name,
-                    run_id=id,
-                    name=name,
-                    scenario=scenario,
-                    faults=getattr(sim, "faults", None),
-                    incidents=incidents,
-                )
-            except Exception:
-                log.exception(
-                    "Failed to dump infeasibility incident packet for run id=%s",
-                    id,
-                )
-        log.debug("Flushing observer data  id=%s", id)
-        flush_observed_data(out_name, id)
-
-    # Per-carrier performance sums: index 0=power, 1=heat, 2=gas.
-    # Each entry in observer.data()["performance"] is a 3-tuple (or scalar).
-    raw_perfs = observer.data().get("performance", [])
-    per_carrier = pandas.DataFrame(
-        [t if isinstance(t, (list, tuple)) else [t, 0.0, 0.0] for t in raw_perfs],
-        columns=["power", "heat", "gas"],
-    )
-    carrier_sums = per_carrier.sum().to_numpy()  # shape (3,): [power, heat, gas]
-    performance_sum = float(carrier_sums.sum())  # scalar total (backwards-compat)
-
-    observer.clear()
-    return performance_sum, carrier_sums
+        # Always clear the global observer state, even if post-processing
+        # raised — otherwise stale per-run data leaks into the next call.
+        observer.clear()

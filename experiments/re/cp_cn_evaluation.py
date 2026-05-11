@@ -241,20 +241,8 @@ def create_or_load_impact_df(fail_df, perf_df, metrics_df, folder_id):
 
 
 def create_metrics_df(monee_net: Network, network_type: str):
-    try:
-        result = run_energy_flow(monee_net, solver=PyomoSolver(), solver_name="gurobi")
-        monee_net = result.network
-        for edge in monee_net._network_internal.edges:
-            branch_model = monee_net.branch_by_id(edge).model
-            monee_net._network_internal.edges[edge]["weight"] = branch_model.loss_percent()
-    except Exception as e:
-        traceback.print_exc()
-
-        print(f"Warning: energy flow failed for {network_type}, using uniform weights: {e}")
-        for edge in monee_net._network_internal.edges:
-            monee_net._network_internal.edges[edge]["weight"] = 1.0
-
-    # id, type, metric... (betweenness_centrality)
+    for edge in monee_net._network_internal.edges:
+        monee_net._network_internal.edges[edge]["weight"] = 1.0
 
     node_to_bc = nx.betweenness_centrality(monee_net._network_internal, weight="weight")
     edge_to_bc = nx.edge_betweenness_centrality(
@@ -499,7 +487,7 @@ def resilience_per_scenario(perf_df: pandas.DataFrame, folder_id):
         color_discrete_map=eval.NETWORK_COLOR_MAP,
         pattern_shape_map=eval.NETWORK_PATTERN_MAP,
         legend_text="carrier",
-        template="plotly_white+publish3",
+        template=eval.CMRES_TEMPLATE,
         yaxis_title="mean performance loss in MW",
         xaxis_title="scenario",
         title="Performance drop by scenario, by carrier",
@@ -636,7 +624,7 @@ def impact_over_metrics(
                     metric_impact_df_carrier_net_type,
                     color_name="impact",
                     color_legend_text=f"{carrier_name}-impact",
-                    template="plotly_white+publish",
+                    template=eval.CMRES_TEMPLATE,
                 )
             )
             titles.append(f"graph of the components' {carrier_name}-impact ({net_type})")
@@ -646,7 +634,7 @@ def impact_over_metrics(
                     metric_impact_df_carrier_net_type,
                     color_name="impact",
                     color_legend_text=f"{carrier_name}-impact",
-                    template="plotly_white+publish",
+                    template=eval.CMRES_TEMPLATE,
                     without_nodes=True,
                 )
             )
@@ -688,7 +676,7 @@ def impact_over_metrics(
                     legend_text="type",
                 )
             )
-            titles.append(f"{metric} to the {key}' {carrier_name}-impact")
+            titles.append(f"{metric} to the {key}' impact (all carriers)")
 
     for net_type, monee_net in net_type_to_net.items():
         metric_impact_df_carrier_net_type = metric_impact_df_all_carrier[
@@ -700,7 +688,7 @@ def impact_over_metrics(
                 metric_impact_df_carrier_net_type,
                 color_name="impact",
                 color_legend_text="impact",
-                template="plotly_white+publish",
+                template=eval.CMRES_TEMPLATE,
             )
         )
         titles.append(f"graph of the components' impact ({net_type})")
@@ -710,7 +698,7 @@ def impact_over_metrics(
                 metric_impact_df_carrier_net_type,
                 color_name="impact",
                 color_legend_text="impact",
-                template="plotly_white+publish",
+                template=eval.CMRES_TEMPLATE,
                 without_nodes=True,
             )
         )
@@ -761,7 +749,7 @@ def impact_aggregated_component_carrier(impact_df: pandas.DataFrame, folder_id):
             color="carrier",
             color_discrete_map=eval.NETWORK_COLOR_MAP,
             legend_text="by carrier",
-            template="plotly_white+publish3",
+            template=eval.CMRES_TEMPLATE,
             yaxis_title="impact",
             xaxis_title="type",
             showlegend=False,
@@ -776,7 +764,7 @@ def impact_aggregated_component_carrier(impact_df: pandas.DataFrame, folder_id):
             color="carrier",
             color_discrete_map=eval.NETWORK_COLOR_MAP,
             legend_text="by carrier",
-            template="plotly_white+publish3",
+            template=eval.CMRES_TEMPLATE,
             yaxis_title="impact",
             xaxis_title="type",
             showlegend=False,
@@ -792,7 +780,7 @@ def impact_aggregated_component_carrier(impact_df: pandas.DataFrame, folder_id):
             color="carrier",
             color_discrete_map=eval.NETWORK_COLOR_MAP,
             legend_text="by carrier",
-            template="plotly_white+publish3",
+            template=eval.CMRES_TEMPLATE,
             yaxis_title="impact",
             xaxis_title="carrier",
             showlegend=False,
@@ -807,7 +795,7 @@ def impact_aggregated_component_carrier(impact_df: pandas.DataFrame, folder_id):
             color="carrier",
             color_discrete_map=eval.NETWORK_COLOR_MAP,
             legend_text="by carrier",
-            template="plotly_white+publish3",
+            template=eval.CMRES_TEMPLATE,
             yaxis_title="impact",
             xaxis_title="carrier",
             showlegend=False,
@@ -843,7 +831,7 @@ def impact_aggregated_component_carrier(impact_df: pandas.DataFrame, folder_id):
             color="carrier",
             color_discrete_map=eval.NETWORK_COLOR_MAP,
             legend_text="by carrier",
-            template="plotly_white+publish3",
+            template=eval.CMRES_TEMPLATE,
             yaxis_title="impact",
             xaxis_title="carrier-density",
             showlegend=False,
@@ -858,7 +846,7 @@ def impact_aggregated_component_carrier(impact_df: pandas.DataFrame, folder_id):
             color="carrier",
             color_discrete_map=eval.NETWORK_COLOR_MAP,
             legend_text="by carrier",
-            template="plotly_white+publish3",
+            template=eval.CMRES_TEMPLATE,
             yaxis_title="impact",
             xaxis_title="carrier-density",
             showlegend=False,
@@ -887,7 +875,7 @@ def impact_aggregated_component_carrier(impact_df: pandas.DataFrame, folder_id):
             color="carrier",
             color_discrete_map=eval.NETWORK_COLOR_MAP,
             legend_text="by carrier",
-            template="plotly_white+publish3",
+            template=eval.CMRES_TEMPLATE,
             yaxis_title="impact",
             xaxis_title="density",
             showlegend=False,
@@ -902,7 +890,7 @@ def impact_aggregated_component_carrier(impact_df: pandas.DataFrame, folder_id):
             color="carrier",
             color_discrete_map=eval.NETWORK_COLOR_MAP,
             legend_text="by carrier",
-            template="plotly_white+publish3",
+            template=eval.CMRES_TEMPLATE,
             yaxis_title="impact",
             xaxis_title="density",
             showlegend=False,
@@ -1032,7 +1020,6 @@ def cp_metric_vs_actual_impact(monee_net, impact_df_nt, network_type):
 
     # Topology benefit: compare score with vs without topo factor
     import plotly.graph_objects as go
-    import plotly.express as px
     from plotly.subplots import make_subplots
 
     # "score_no_topo" = pure PTDF stress (carrier-weighted total_stress) with
@@ -1059,7 +1046,7 @@ def cp_metric_vs_actual_impact(monee_net, impact_df_nt, network_type):
         rho_vitality,   pval_vitality,   ci_lo_vitality,   ci_hi_vitality   = _sr("vitality_score")
 
         cp_types = rows_with_data["cp_type"].unique().tolist()
-        colors = px.colors.qualitative.Plotly
+        colors = eval.PALETTE_QUAL
         type_color = {t: colors[i % len(colors)] for i, t in enumerate(cp_types)}
 
         panels = [
@@ -1110,7 +1097,7 @@ def cp_metric_vs_actual_impact(monee_net, impact_df_nt, network_type):
         topo_fig.update_yaxes(title_text="Actual Total Impact (MC)", row=1, col=1)
         topo_fig.update_layout(
             height=420, width=1600,
-            template="plotly_white",
+            template=eval.CMRES_TEMPLATE,
             margin={"l": 50, "b": 50, "r": 20, "t": 60},
             legend={"title": "Component Type"},
         )
@@ -1208,11 +1195,11 @@ def cp_metric_vs_actual_impact(monee_net, impact_df_nt, network_type):
                   rho_df["Spearman ρ"], rho_df["p-value"],
                   rho_df["ci_lo"], rho_df["ci_hi"])],
         textposition="outside",
-        marker_color=px.colors.qualitative.Plotly[:len(rho_df)],
+        marker_color=eval.PALETTE_QUAL[:len(rho_df)],
     ))
     rho_bar.update_layout(
         height=450, width=800,
-        template="plotly_white",
+        template=eval.CMRES_TEMPLATE,
         yaxis=dict(title="Spearman ρ vs Actual (95% CI)", range=[-1.15, 1.15],
                    zeroline=True, zerolinecolor="black", zerolinewidth=1),
         xaxis_title="Metric",
@@ -1242,7 +1229,7 @@ def cp_metric_vs_actual_impact(monee_net, impact_df_nt, network_type):
     ))
     heatmap_fig.update_layout(
         height=480, width=620,
-        template="plotly_white",
+        template=eval.CMRES_TEMPLATE,
         margin={"l": 120, "b": 120, "r": 20, "t": 40},
         xaxis=dict(title="Metric"),
         yaxis=dict(title="Metric"),
@@ -1253,7 +1240,7 @@ def cp_metric_vs_actual_impact(monee_net, impact_df_nt, network_type):
     # 3. Bump chart – rank of each component across all metrics
     metric_names = [label for _, label in METRICS]
     rank_cols    = [f"rank_{col}" for col, _ in METRICS]
-    cp_colors    = px.colors.qualitative.Plotly
+    cp_colors    = eval.PALETTE_QUAL
     cp_type_color = {t: cp_colors[i % len(cp_colors)]
                      for i, t in enumerate(valid["cp_type"].unique())}
 
@@ -1281,7 +1268,7 @@ def cp_metric_vs_actual_impact(monee_net, impact_df_nt, network_type):
     bump_fig.update_layout(
         height=max(400, 20 * len(valid)),
         width=900,
-        template="plotly_white",
+        template=eval.CMRES_TEMPLATE,
         yaxis=dict(title="Rank (1 = highest impact)", autorange="reversed",
                    dtick=1, gridcolor="lightgrey"),
         xaxis=dict(title="Metric"),
@@ -1323,7 +1310,7 @@ def cp_metric_vs_actual_impact(monee_net, impact_df_nt, network_type):
     acc_df = pandas.DataFrame(acc_rows).sort_values("NDCG", ascending=True)
 
     acc_fig = make_subplots(rows=1, cols=2, subplot_titles=["Kendall τ (95% CI)", "NDCG (95% CI)"])
-    metric_colors = {row["Metric"]: px.colors.qualitative.Plotly[i % 10]
+    metric_colors = {row["Metric"]: eval.PALETTE_QUAL[i % 10]
                      for i, row in acc_df.iterrows()}
 
     for col_idx, (measure, lo_col, hi_col) in enumerate(
@@ -1352,7 +1339,7 @@ def cp_metric_vs_actual_impact(monee_net, impact_df_nt, network_type):
 
     acc_fig.update_layout(
         height=80 + 40 * len(acc_df), width=1000,
-        template="plotly_white",
+        template=eval.CMRES_TEMPLATE,
         margin={"l": 160, "b": 50, "r": 120, "t": 50},
     )
     figures.append(acc_fig)
@@ -1380,7 +1367,7 @@ def cp_metric_vs_actual_impact(monee_net, impact_df_nt, network_type):
     ))
     prec_fig.update_layout(
         height=450, width=750,
-        template="plotly_white",
+        template=eval.CMRES_TEMPLATE,
         xaxis=dict(title="k (number of top components considered)", dtick=1),
         yaxis=dict(title="Precision@k", range=[-0.05, 1.05],
                    zeroline=True, zerolinecolor="lightgrey"),
@@ -1451,12 +1438,12 @@ def cp_metric_vs_actual_impact(monee_net, impact_df_nt, network_type):
                 array=(cmp_df["ci_hi_mc"] - cmp_df["rho_mc"]).tolist(),
                 arrayminus=(cmp_df["rho_mc"] - cmp_df["ci_lo_mc"]).tolist(),
             ),
-            marker_color=px.colors.qualitative.Plotly[0],
+            marker_color=eval.PALETTE_QUAL[0],
         ))
         cmp_fig.update_layout(
             barmode="group",
             height=500, width=900,
-            template="plotly_white",
+            template=eval.CMRES_TEMPLATE,
             yaxis=dict(title="Spearman ρ vs Actual (95% CI)", range=[-1.15, 1.15],
                        zeroline=True, zerolinecolor="black"),
             xaxis=dict(title="Metric"),
@@ -1510,7 +1497,6 @@ def _cp_only_metric_comparison_core(
     """
     import numpy as _np
     import plotly.graph_objects as go
-    import plotly.express as px
     from plotly.subplots import make_subplots
 
     METRICS = [
@@ -1586,7 +1572,7 @@ def _cp_only_metric_comparison_core(
     actual_vals = primary["actual_total"].values
 
     cp_color_map = {
-        t: px.colors.qualitative.Plotly[i % 10]
+        t: eval.PALETTE_QUAL[i % 10]
         for i, t in enumerate(cp_types_present)
     }
 
@@ -1602,7 +1588,7 @@ def _cp_only_metric_comparison_core(
             hovertext=sub["cp_id"].astype(str),
         ))
     scatter_fig.update_layout(
-        height=500, width=900, template="plotly_white",
+        height=500, width=900, template=eval.CMRES_TEMPLATE,
         xaxis=dict(title="Predicted CP Score"),
         yaxis=dict(title="Actual Total Impact (MC)"),
         legend=dict(title="CP Type"),
@@ -1648,7 +1634,7 @@ def _cp_only_metric_comparison_core(
     heatmap_fig.update_layout(
         height=80 + 60 * len(cp_types_present),
         width=200 + 110 * len(pred_metrics),
-        template="plotly_white",
+        template=eval.CMRES_TEMPLATE,
         margin={"l": 140, "b": 140, "r": 60, "t": 50},
         xaxis=dict(title="Metric", tickangle=-30),
         yaxis=dict(title="CP type"),
@@ -1678,11 +1664,11 @@ def _cp_only_metric_comparison_core(
               for r, lo, hi, p in zip(
                   rho_df["rho"], rho_df["lo"], rho_df["hi"], rho_df["p"])],
         textposition="outside",
-        marker_color=px.colors.qualitative.Plotly[0],
+        marker_color=eval.PALETTE_QUAL[0],
     ))
     rho_fig.update_layout(
         height=80 + 40 * len(rho_df), width=900,
-        template="plotly_white",
+        template=eval.CMRES_TEMPLATE,
         xaxis=dict(title="Spearman ρ vs Actual (95% CI)", range=[-1.05, 1.05],
                    zeroline=True, zerolinecolor="black"),
         yaxis=dict(title="Metric"),
@@ -1745,7 +1731,7 @@ def _cp_only_metric_comparison_core(
             )
         acc_fig.update_layout(
             height=80 + 40 * len(acc_df), width=1100,
-            template="plotly_white",
+            template=eval.CMRES_TEMPLATE,
             margin={"l": 200, "b": 50, "r": 120, "t": 50},
         )
         figures.append(acc_fig)
@@ -1769,7 +1755,7 @@ def _cp_only_metric_comparison_core(
             line=dict(dash="dash", color="grey", width=1),
         ))
         prec_fig.update_layout(
-            height=450, width=850, template="plotly_white",
+            height=450, width=850, template=eval.CMRES_TEMPLATE,
             xaxis=dict(title="k (number of top components considered)",
                        dtick=max(1, n_comp // 20)),
             yaxis=dict(title="Precision@k", range=[-0.05, 1.05]),
@@ -1850,7 +1836,7 @@ def pooled_resilience_per_scenario(perf_df: pandas.DataFrame, output_dir: str):
         color_discrete_map=eval.NETWORK_COLOR_MAP,
         pattern_shape_map=eval.NETWORK_PATTERN_MAP,
         legend_text="carrier",
-        template="plotly_white+publish3",
+        template=eval.CMRES_TEMPLATE,
         yaxis_title="mean performance loss in MW",
         xaxis_title="scenario",
         title="Pooled performance drop by scenario, by carrier",
@@ -1886,7 +1872,6 @@ def pooled_metric_comparison(pooled_df, output_dir):
     """
     import numpy as _np
     import plotly.graph_objects as go
-    import plotly.express as px
     from plotly.subplots import make_subplots
 
     METRICS = [
@@ -1948,7 +1933,7 @@ def pooled_metric_comparison(pooled_df, output_dir):
     titles  = []
     actual_vals = valid["actual_total"].values
     pred_metrics = [(col, label) for col, label in METRICS if col != "actual_total"]
-    net_colors = {nt: px.colors.qualitative.Plotly[i % 10]
+    net_colors = {nt: eval.PALETTE_QUAL[i % 10]
                   for i, nt in enumerate(net_types)}
 
     # ── 1. Scatter panels (one per metric, colored by network type) ────────
@@ -1984,7 +1969,7 @@ def pooled_metric_comparison(pooled_df, output_dir):
         scatter_fig.update_yaxes(title_text="Actual Impact (MW)", row=r + 1, col=c + 1)
     scatter_fig.update_layout(
         height=700, width=1800,
-        template="plotly_white",
+        template=eval.CMRES_TEMPLATE,
         margin={"l": 60, "b": 60, "r": 20, "t": 80},
         legend={"title": "Network type"},
     )
@@ -2016,7 +2001,7 @@ def pooled_metric_comparison(pooled_df, output_dir):
     ))
     rho_bar.update_layout(
         height=80 + 40 * len(rho_df), width=750,
-        template="plotly_white",
+        template=eval.CMRES_TEMPLATE,
         xaxis=dict(title="Spearman ρ", range=[-1.05, 1.05],
                    zeroline=True, zerolinecolor="black"),
         yaxis=dict(title="Metric"),
@@ -2051,7 +2036,7 @@ def pooled_metric_comparison(pooled_df, output_dir):
         nt_rho_fig.update_layout(
             barmode="group",
             height=450, width=200 + 160 * len(net_types),
-            template="plotly_white",
+            template=eval.CMRES_TEMPLATE,
             xaxis=dict(title="Network type"),
             yaxis=dict(title="Spearman ρ", range=[-1.05, 1.05],
                        zeroline=True, zerolinecolor="black"),
@@ -2080,7 +2065,7 @@ def pooled_metric_comparison(pooled_df, output_dir):
             "NDCG":      ndcg, "ndcg_lo": ndcg_lo, "ndcg_hi": ndcg_hi,
         })
     acc_df = pandas.DataFrame(acc_rows).sort_values("NDCG", ascending=True)
-    metric_colors = {row["Metric"]: px.colors.qualitative.Plotly[i % 10]
+    metric_colors = {row["Metric"]: eval.PALETTE_QUAL[i % 10]
                      for i, row in acc_df.iterrows()}
 
     acc_fig = make_subplots(rows=1, cols=2,
@@ -2107,7 +2092,7 @@ def pooled_metric_comparison(pooled_df, output_dir):
         acc_fig.update_yaxes(title_text="Metric", row=1, col=col_idx)
     acc_fig.update_layout(
         height=80 + 40 * len(acc_df), width=1000,
-        template="plotly_white",
+        template=eval.CMRES_TEMPLATE,
         margin={"l": 160, "b": 50, "r": 120, "t": 50},
     )
     figures.append(acc_fig)
@@ -2134,7 +2119,7 @@ def pooled_metric_comparison(pooled_df, output_dir):
         line=dict(dash="dash", color="grey", width=1),
     ))
     prec_fig.update_layout(
-        height=450, width=750, template="plotly_white",
+        height=450, width=750, template=eval.CMRES_TEMPLATE,
         xaxis=dict(title="k (number of top components considered)", dtick=max(1, n_comp // 20)),
         yaxis=dict(title="Precision@k", range=[-0.05, 1.05]),
         legend=dict(title="Metric", x=1.01, xanchor="left"),
@@ -2185,12 +2170,12 @@ def pooled_metric_comparison(pooled_df, output_dir):
                 array=(cmp_df["ci_hi_mc"] - cmp_df["rho_mc"]).tolist(),
                 arrayminus=(cmp_df["rho_mc"] - cmp_df["ci_lo_mc"]).tolist(),
             ),
-            marker_color=px.colors.qualitative.Plotly[0],
+            marker_color=eval.PALETTE_QUAL[0],
         ))
         cmp_fig.update_layout(
             barmode="group",
             height=500, width=1000,
-            template="plotly_white",
+            template=eval.CMRES_TEMPLATE,
             yaxis=dict(title="Spearman ρ vs Actual (95% CI)", range=[-1.15, 1.15],
                        zeroline=True, zerolinecolor="black"),
             xaxis=dict(title="Metric"),

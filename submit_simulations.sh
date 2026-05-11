@@ -57,7 +57,7 @@ if [[ "${SUBMIT_MERGE}" != "1" ]]; then
     echo "MERGE phase skipped (SUBMIT_MERGE=0)."
     echo "Run manually after the RUN array finishes:"
     for i in $(seq 1 ${N_GRIDS}); do
-        echo "  python ./cmres/experiments/re/run_simulation.py ${i} --merge"
+        echo "  python ./experiments/re/run_simulation.py ${i} --merge"
     done
     exit 0
 fi
@@ -72,7 +72,7 @@ if [[ -z "${MERGE_JOBID}" ]]; then
     echo "ERROR: MERGE-phase sbatch failed.  RUN job ${RUN_JOBID} continues." >&2
     echo "       Run merge manually after RUN finishes:" >&2
     for i in $(seq 1 ${N_GRIDS}); do
-        echo "         python ./cmres/experiments/re/run_simulation.py ${i} --merge" >&2
+        echo "         python ./experiments/re/run_simulation.py ${i} --merge" >&2
     done
     exit 1
 fi

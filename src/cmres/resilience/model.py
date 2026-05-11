@@ -13,23 +13,12 @@ from cmres.resilience.core import (
     ResilienceModel,
     StepModel,
 )
-from cmres.resilience.fault import name_of
 from cmres.resilience.metric import (
     CascadingResilienceMetric,
     GeneralResiliencePerformanceMetric,
 )
 
 log = logging.getLogger(__name__)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Antithetic-variate fallbacks (used in legacy / no-scenario mode only)
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-# Antithetic counterpart of the default normal-draw failure model.
-# For X ~ N(μ, σ):  antithetic = 2μ − X  (reflects about the mean).
-def ANTITHETIC_FAILURE_PROBABILITY_MODEL(base_prob):
-    return base_prob * (2.0 - np.random.normal(1, scale=0.1))
 
 
 FAIL_BASE_PROBABILITY_MAP = {
@@ -98,48 +87,18 @@ class SimpleResilienceModel(ResilienceModel):
         time_model=FAILURE_TIME_MODEL,
         spatial_model=FAILURE_SPATIAL_MODEL,
         base_fail=0.3,
-        antithetic: bool = False,
     ) -> None:
         self._base_fail = base_fail
         self._incident_shift = incident_shift
         self._incident_timesteps = incident_timesteps
         self._base_fail_probability_map = base_fail_probability_map
-        self._antithetic = antithetic
-        # Antithetic mode: replace the default normal-draw model with its
-        # reflection (2μ − X) so that paired runs are negatively correlated.
-        if antithetic and fail_probability_model is FAILURE_PROBABILITY_MODEL:
-            self._fail_probability_model = ANTITHETIC_FAILURE_PROBABILITY_MODEL
-        else:
-            self._fail_probability_model = fail_probability_model
+        self._fail_probability_model = fail_probability_model
         self._time_model = lambda time: time_model(
             self._incident_timesteps + incident_shift, time
         )
         self._spatial_model = lambda coords: (
             spatial_model(coords) if coords is not None else 1
         )
-
-    def calc_fail(self, network: Network, component, time):
-        model_type = type(component.model)
-        if model_type not in self._base_fail_probability_map:
-            return 0
-        base_failure_probability = self._base_fail_probability_map[model_type]
-        return (
-            self._fail_probability_model(base_failure_probability)
-            * self._time_model(time)
-            * self._base_fail
-        )
-
-    def _bernoulli(self, p: float) -> bool:
-        """Bernoulli trial respecting the antithetic-variates flag.
-
-        Normal run:     fail if U  < p   (U ~ Uniform(0,1))
-        Antithetic run: fail if 1−U < p, i.e. U > 1−p
-
-        Uses numpy's RNG throughout so that antithetic pairing (via np.random.seed)
-        is consistent with the normal-draw probability multiplier in the same stream.
-        """
-        u = np.random.random()
-        return (1.0 - u) < p if self._antithetic else u < p
 
     # ── Scenario-aware failure generation ─────────────────────────────────────
 
@@ -162,15 +121,23 @@ class SimpleResilienceModel(ResilienceModel):
 
         base_prob = self._base_fail_probability_map[model_type]
         cidx = registry.index_of(comp)
-        if cidx is None or cidx >= scenario.uniforms.shape[0]:
-            # Component not in registry — fall back to legacy RNG
-            fp = self.calc_fail(None, comp, time)
-            return fp, self._bernoulli(fp)
-
+        if cidx is None:
+            raise ValueError(
+                f"Component {comp!r} (kind={type(comp).__name__}, id={comp.id}) "
+                "not found in ComponentRegistry — registry is out of sync with "
+                "the network."
+            )
+        if cidx >= scenario.uniforms.shape[0]:
+            raise ValueError(
+                f"Registry index {cidx} exceeds scenario.uniforms component "
+                f"axis ({scenario.uniforms.shape[0]}). Scenario was built for "
+                "a smaller registry."
+            )
         if t_idx < 0 or t_idx >= scenario.uniforms.shape[1]:
-            # Timestep out of scenario range — fall back to legacy RNG
-            fp = self.calc_fail(None, comp, time)
-            return fp, self._bernoulli(fp)
+            raise ValueError(
+                f"t_idx={t_idx} out of scenario timestep range "
+                f"[0, {scenario.uniforms.shape[1]})"
+            )
 
         u = scenario.uniforms[cidx, t_idx]  # shape (N_DIM,)
 
@@ -189,14 +156,12 @@ class SimpleResilienceModel(ResilienceModel):
         Parameters
         ----------
         net : Network
-        registry : ComponentRegistry | None
-            Canonical component ordering built from the same *net*.  Required
-            when *scenario* is provided.
-        scenario : FailureScenario | None
-            Pre-sampled uniform inputs.  When provided (alongside *registry*),
-            all random draws come from the scenario's Sobol-stratified uniforms
-            rather than the global RNG — enabling true RQMC variance reduction.
-            When ``None``, falls back to the legacy global-RNG path.
+        registry : ComponentRegistry
+            Canonical component ordering built from the same *net*. Required.
+        scenario : FailureScenario
+            Pre-sampled uniform inputs from an RQMC sampler. Required. All
+            stochastic failure decisions come from the scenario's Sobol-
+            stratified uniforms.
 
         Notes
         -----
@@ -213,7 +178,11 @@ class SimpleResilienceModel(ResilienceModel):
         Remove the guaranteed-failure branch below to recover an unbiased
         estimator of the unconditional mean.
         """
-        use_scenario = registry is not None and scenario is not None
+        if registry is None or scenario is None:
+            raise ValueError(
+                "generate_failures requires both registry and scenario "
+                "(legacy global-RNG mode has been removed)."
+            )
         failures = []
         # Track components that already have an unresolved failure so that a
         # single component is not faulted twice before its repair time is set.
@@ -233,13 +202,9 @@ class SimpleResilienceModel(ResilienceModel):
                 key = ("node", node.id)
                 if not node.independent or key in already_failed:
                     continue
-                if use_scenario:
-                    fail_prob, triggered = self._eval_failure_scenario(
-                        node, i, time, registry, scenario
-                    )
-                else:
-                    fail_prob = self.calc_fail(net, node, time)
-                    triggered = self._bernoulli(fail_prob)
+                fail_prob, triggered = self._eval_failure_scenario(
+                    node, i, time, registry, scenario
+                )
                 if triggered:
                     failures.append(Failure(time, node, fail_prob, Effect.DEAD))
                     already_failed.add(key)
@@ -252,13 +217,9 @@ class SimpleResilienceModel(ResilienceModel):
                 key = ("branch", branch.id)
                 if not branch.independent or key in already_failed:
                     continue
-                if use_scenario:
-                    fail_prob, triggered = self._eval_failure_scenario(
-                        branch, i, time, registry, scenario
-                    )
-                else:
-                    fail_prob = self.calc_fail(net, branch, time)
-                    triggered = self._bernoulli(fail_prob)
+                fail_prob, triggered = self._eval_failure_scenario(
+                    branch, i, time, registry, scenario
+                )
                 if triggered:
                     failures.append(Failure(time, branch, fail_prob, Effect.DEAD))
                     already_failed.add(key)
@@ -271,13 +232,9 @@ class SimpleResilienceModel(ResilienceModel):
                 key = ("child", child.id)
                 if not child.independent or key in already_failed:
                     continue
-                if use_scenario:
-                    fail_prob, triggered = self._eval_failure_scenario(
-                        child, i, time, registry, scenario
-                    )
-                else:
-                    fail_prob = self.calc_fail(net, child, time)
-                    triggered = self._bernoulli(fail_prob)
+                fail_prob, triggered = self._eval_failure_scenario(
+                    child, i, time, registry, scenario
+                )
                 if triggered:
                     failures.append(Failure(time, child, fail_prob, Effect.DEAD))
                     already_failed.add(key)
@@ -290,13 +247,9 @@ class SimpleResilienceModel(ResilienceModel):
                 key = ("compound", compound.id)
                 if not compound.independent or key in already_failed:
                     continue
-                if use_scenario:
-                    fail_prob, triggered = self._eval_failure_scenario(
-                        compound, i, time, registry, scenario
-                    )
-                else:
-                    fail_prob = self.calc_fail(net, compound, time)
-                    triggered = self._bernoulli(fail_prob)
+                fail_prob, triggered = self._eval_failure_scenario(
+                    compound, i, time, registry, scenario
+                )
                 if triggered:
                     failures.append(Failure(time, compound, fail_prob, Effect.DEAD))
                     already_failed.add(key)
@@ -319,34 +272,16 @@ class SimpleResilienceModel(ResilienceModel):
         return failures
 
 
-def to_failure_probability(relative_violation, ramp=0, steepness=1, exponent=1.5):
-    return steepness * ((relative_violation - ramp) * 100) ** exponent / 100
-
-
-def deactivate_node(network: Network, node):
-    for child_id in node.child_ids:
-        child = network.child_by_id(child_id)
-        network.deactivate(child)
-
-
-def activate_node(network: Network, node):
-    for child_id in node.child_ids:
-        child = network.child_by_id(child_id)
-        network.activate(child)
-
-
-def calc_relative_violation(component, attribute, target, rel_allowed_diff):
-    return max(
-        (
-            abs((mm.value(getattr(component.model, attribute)) - target))
-            - rel_allowed_diff * target
-        )
-        / (target * rel_allowed_diff),
-        0,
-    )
-
-
 class CascadingModel(StepModel):
+    """Per-step performance evaluator with infeasibility-fallback shedding.
+
+    Despite the name, no cascading repair/failure logic is currently active —
+    the prior ``process_network_state`` machinery has been removed. The
+    model still exposes ``performance`` per step via the observer; the
+    ``performance_after_cascade`` channel is no longer emitted because it
+    used to be a copy of ``performance``.
+    """
+
     def __init__(
         self,
         performance_accuracy=100,
@@ -356,7 +291,6 @@ class CascadingModel(StepModel):
     ) -> None:
         self._cascading_metric = CascadingResilienceMetric()
         self._performance_metric = GeneralResiliencePerformanceMetric()
-        self._current_failures = []
         self._iteration_number_omef = performance_accuracy
         self._faults = None
         self._last_performance = None
@@ -366,7 +300,6 @@ class CascadingModel(StepModel):
 
     def calc_performance(self, network: Network, without_load=False):
         log.info("Solving network for performance calculation")
-        # print(network)
         result = ms.solve(
             network,
             ext_grid_el_bounds=self._ext_grid_el_bounds,
@@ -375,72 +308,6 @@ class CascadingModel(StepModel):
         )
         log.info("Network solve complete")
         return self._performance_metric.calc(result.network), result
-
-    def check_repairs(self, network, bound_tuple, step, network_name):
-        attribute, target, allowed_diff = bound_tuple
-        for i in range(len(self._current_failures) - 1, -1, -1):
-            node, failure = self._current_failures[i]
-            if node.grid.name != network_name or attribute not in node.values_as_dict():
-                continue
-            if step >= failure["step"] + failure["min_duration"]:
-                relative_violation = to_failure_probability(
-                    calc_relative_violation(node, attribute, target, allowed_diff)
-                )
-                if relative_violation < np.random.random():
-                    activate_node(network, node)
-                    del self._current_failures[i]
-                    observer.gather(
-                        "cascading repair",
-                        {
-                            "step": step,
-                            "node": name_of(node),
-                            "probability": relative_violation,
-                            "min_duration": -1,
-                            "type": "repair",
-                        },
-                    )
-
-    def process_node(self, network: Network, node, bound_tuple, step):
-        attribute, target, allowed_diff = bound_tuple
-        relative_violation = to_failure_probability(
-            calc_relative_violation(node, attribute, target, allowed_diff)
-        )
-        if relative_violation > np.random.random():
-            min_duration = int(relative_violation * np.random.random() * 10)
-            deactivate_node(network, node)
-            failure_description = {
-                "step": step,
-                "node": name_of(node),
-                "probability": relative_violation,
-                "min_duration": min_duration,
-                "type": "failure",
-            }
-            self._current_failures.append((node, failure_description))
-
-            observer.gather(
-                "cascading failure",
-                failure_description,
-            )
-
-    def process_network_state(self, network: Network, step):
-        self.check_repairs(network, ms.BOUND_GAS, step, "gas")
-        self.check_repairs(network, ms.BOUND_HEAT, step, "heat")
-        self.check_repairs(network, ms.BOUND_EL, step, "power")
-
-        for node in network.nodes:
-            if not node.independent:
-                continue
-            if node.grid.name == "gas":
-                self.process_node(network, node, ms.BOUND_GAS, step)
-            if node.grid.name == "heat":
-                self.process_node(network, node, ms.BOUND_HEAT, step)
-            if node.grid.name == "power":
-                self.process_node(network, node, ms.BOUND_EL, step)
-
-        for branch in network.branches_by_type(mm.GenericPowerBranch):
-            if not branch.independent:
-                continue
-            self.process_node(network, branch, ms.BOUND_LP, step)
 
     def fault_delta_exists(self, step):
         for fault in self._faults:
@@ -558,20 +425,7 @@ class CascadingModel(StepModel):
 
         observer.gather("performance", performance)
 
-        """
-        self.process_network_state(net, step)
-
-        # calc performance and base performance
-        performance_after_cascade, _ = self.calc_performance(net)
-        """
-        observer.gather("performance_after_cascade", performance)
-
-        self._cascading_metric.gather(
-            net,
-            step,
-            performance=performance,
-            performance_after_cascade=performance,
-        )
+        self._cascading_metric.gather(net, step, performance=performance)
 
     def calc_metric(self):
         return self._cascading_metric.calc()

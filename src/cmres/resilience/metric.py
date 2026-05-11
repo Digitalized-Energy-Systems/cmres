@@ -41,11 +41,9 @@ class GeneralResiliencePerformanceMetric(PerformanceMetric):
 class CascadingResilienceMetric(ResilienceMetric):
     def __init__(self) -> None:
         self._performances = rlist(0)
-        self._performances_after_cascade = rlist(0)
 
     def gather(self, _, step, **kwargs):
         self._performances[step] = kwargs["performance"]
-        self._performances_after_cascade = kwargs["performance_after_cascade"]
 
     def calc(self):
         pass

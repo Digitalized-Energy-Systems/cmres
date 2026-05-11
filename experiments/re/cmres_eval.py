@@ -236,9 +236,8 @@ def experiment_e3_density(
     # distribution. Bootstrap CI as error bars.
     if not out_df.empty:
         import plotly.graph_objects as go
-        import plotly.express as px
         fig = go.Figure()
-        cmap = {m: c for m, c in zip(metrics, px.colors.qualitative.Plotly)}
+        cmap = {m: c for m, c in zip(metrics, eval.PALETTE_QUAL)}
         for m in metrics:
             sub = out_df[out_df["metric"] == m].sort_values("density")
             if sub.empty:
@@ -254,14 +253,13 @@ def experiment_e3_density(
                 hovertext=sub["scenario"],
             ))
         fig.update_layout(
-            template="plotly_white",
+            template=eval.CMRES_TEMPLATE,
             height=520, width=900,
             xaxis=dict(title="CP density"),
-            yaxis=dict(title="Spearman ρ vs MC actual_total", range=[-1.05, 1.05],
-                       zeroline=True, zerolinecolor="black"),
+            yaxis=dict(title="Spearman ρ vs MC actual_total", range=[-1.05, 1.05]),
             legend=dict(title="Metric"),
-            margin={"l": 60, "b": 60, "r": 20, "t": 40},
         )
+        fig.update_layout(**eval.LEGEND_RIGHT)
         eval.write_all_in_one(
             [fig], "Figure", Path("."),
             str(output_dir / "E3_rho_vs_density.html"),
@@ -409,9 +407,11 @@ def experiment_e7_mc_validity(
         if art.mc_npz_path is None or not art.mc_npz_path.exists():
             continue
         with np.load(art.mc_npz_path) as data:
-            conv = data.get("convergence", np.empty((0, 8)))
-            per_run = data.get("per_run", np.empty((0, 3)))
-            n_runs = int(data.get("n_runs", np.array([0]))[0])
+            keys = set(data.files)
+            conv = data["convergence"] if "convergence" in keys else np.empty((0, 8))
+            per_run = data["per_run"] if "per_run" in keys else np.empty((0, 3))
+            n_runs_arr = data["n_runs"] if "n_runs" in keys else np.array([0])
+            n_runs = int(np.asarray(n_runs_arr).reshape(-1)[0])
         # RHW vs n.
         if conv.size:
             for row in conv:
@@ -514,26 +514,6 @@ def experiment_e8_multilayer(
     out_df = pd.DataFrame(rows)
     out_df.to_csv(out_dir / "E8_multilayer_rho.csv", index=False)
     return out_df
-
-
-def _extract_orig_id(cp_id: str):
-    """Pull the integer 'orig_id' out of a cp_id string. ``"compound:5"`` →
-    5, ``"branch:(5, 134, 0)"`` → 5, ``"5→134"`` → 5. Returns None on
-    failure.
-    """
-    s = str(cp_id)
-    try:
-        if s.startswith("compound:"):
-            return int(s[len("compound:"):])
-        if s.startswith("branch:"):
-            inner = s[len("branch:"):].strip("()")
-            return int(inner.split(",")[0].strip())
-        if "→" in s:
-            return int(s.split("→")[0].strip())
-        # Fallback: pure int
-        return int(s)
-    except Exception:
-        return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────

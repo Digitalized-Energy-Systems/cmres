@@ -61,12 +61,13 @@ cd "${SLURM_SUBMIT_DIR:-$PWD}"
 
 # Run the full evaluation. ``INPUT`` and ``OUTPUT`` are module-level
 # constants in cp_cn_evaluation.py; edit there to point at a different
-# simulation output / output directory.
+# simulation output / output directory. CMRES_INPUT (env) overrides
+# the module default for one-off runs without editing the .py.
 python -u -c "
-import sys
+import os, sys
 sys.path.insert(0, 'experiments/re')
 from cp_cn_evaluation import evaluate, INPUT
-evaluate('/user/towo7024/cmres_new/cmres/data/res')
+evaluate(os.environ.get('CMRES_INPUT') or INPUT)
 "
 EXIT_CODE=$?
 

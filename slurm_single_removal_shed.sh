@@ -40,14 +40,20 @@ N_SHARDS=${N_SHARDS:-8}
 INPUT_DIR=${INPUT_DIR:-/user/towo7024/cmres_new/cmres/data/res}
 OUTPUT_DIR=${OUTPUT_DIR:-data/out/single_removal_shed}
 
-# Grid catalogue MUST stay aligned with experiments/re/test_grids.py::ALL_GRIDS.
+# Grid catalogue MUST stay aligned with experiments/re/test_grids.py::ALL_GRIDS
+# (insertion order matters: must match the keys of ALL_GRIDS so a given
+# SLURM_ARRAY_TASK_ID/N_SHARDS index resolves to the same grid as in
+# run_simulation.py).
 GRIDS=(
     "simbench_lv_no"
     "simbench_lv_low"
     "simbench_lv"
-    "simbench_lv_centralized"
     "simbench_lv_high"
-    "simbench_lv_max"
+    "simbench_lv_centralized"
+    "simbench_lv_centralized_same_cap"
+    "simbench_lv_low_same_cap"
+    "simbench_lv_same_cap"
+    "simbench_lv_high_same_cap"
 )
 
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-1}

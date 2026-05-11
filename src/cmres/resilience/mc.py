@@ -1,42 +1,24 @@
-"""State-of-the-art Monte Carlo engine for MES resilience simulation.
+"""RQMC Monte Carlo engine for MES resilience simulation.
 
 Variance-reduction stack
 ------------------------
 1. Randomised Quasi-Monte Carlo (RQMC)
-   Owen-scrambled Sobol sequences replace pseudo-random seeds.  Rates
-   (RMS error) per Owen (1997):
-     • smooth integrands (bounded mixed partials):
-           O(n⁻³ᐟ² (log n)^{(d−1)/2})
-     • Hardy–Krause bounded-variation integrands:
-           O(n⁻¹   (log n)^{(d−1)/2})
-     • plain pseudo-random MC:
-           O(n⁻¹ᐟ²)
-   The MES performance map is piecewise smooth (analytic inside the
-   Bernoulli cells, discontinuous across them), so the observed rate sits
-   between the two RQMC bounds.  All random inputs for one simulation run
-   are pre-generated as a single Sobol point, reshaped to
-   (n_components, T_incident, N_DIM).  The Sobol engine is pre-generated
-   once before the loop.
+   Owen-scrambled Sobol sequences. All random inputs for one simulation
+   run are pre-generated as a single Sobol point, reshaped to
+   (n_components, T_incident, N_DIM) with N_DIM=2:
+     dim 0 → N(1, 0.1) probability multiplier (via norm.ppf)
+     dim 1 → Bernoulli trigger (direct uniform comparison)
 
 2. Antithetic Variates (AV)
-   Every Sobol point u is paired with its antithetic twin (1 − u).  Because
-   the FailureScenario carries the raw uniform[0,1] inputs, the antithetic is
-   exact for every input type:
-     • Bernoulli(p)   : normal fails if u < p;  antithetic fails if (1−u) < p
-     • Normal X~N(μ,σ): normal uses norm.ppf(u); antithetic uses norm.ppf(1−u) = 2μ−X
-   Variance-reduction factor depends on the integrand:
-     • For a single Bernoulli(p) trigger, the paired-estimator variance
-       ratio is (1−2p)/(1−p) — only ~11 % reduction at p = 0.1.
-     • For a linear function of the Gaussian multipliers the reflection
-       is exact (reduction → 100 %).
-   The MES performance loss is a nonlinear function of both, so the
-   empirical reduction sits between these bounds and is integrand-specific;
-   it should be reported per-experiment rather than claimed ex ante.
+   Every Sobol point u is paired with its antithetic twin (1 − u). The
+   FailureScenario carries the raw uniform[0,1] inputs, so the reflection
+   is exact for both the Gaussian multiplier and the Bernoulli trigger.
 
 3. Self-Normalised Importance Sampling (SNIS)
-   The WeightedAccumulator implements the SNIS estimator.  For plain RQMC/MC
-   (all log_weight = 0) it reduces to unweighted Welford.  IS log-weights are
-   stored in FailureScenario and accumulated for downstream IS extensions.
+   The WeightedAccumulator implements the SNIS estimator. For plain RQMC
+   (all log_weight = 0) it reduces to unweighted Welford. IS log-weights
+   are stored in FailureScenario and accumulated for downstream IS
+   extensions.
 
 Stopping criterion — sequential relative CI
    The simulation stops when the 95 % CI relative half-width for each
@@ -45,35 +27,23 @@ Stopping criterion — sequential relative CI
        (CI half-width) / max(|mean|, eps)  ≤  rel_tol
 
    for all three carriers simultaneously, after at least ``min_runs`` samples.
-   The effective sample size (Kish 1965) drives CI width when IS weights
-   differ from unity.
+   The CI is computed by Welford over the union of normal + antithetic
+   samples; with negative AV correlation this estimator is conservative
+   for the AV-paired estimator's true variance, so convergence is slightly
+   slower than the AV reduction would allow.
 
 References
 ----------
-Sobol' (1967) "On the distribution of points in a cube and the approximate
-    evaluation of integrals"
-Owen (1995) "Randomly permuted (t,m,s)-nets and (t,s)-sequences"
-Owen (1997) "Scrambled net variance for integrals of smooth functions"
-    Annals of Statistics 25(4), pp. 1541–1562.
-Owen (2013) "Monte Carlo theory, methods and examples"
-    https://artowen.su.domains/mc/
-Joe & Kuo (2008) "Constructing Sobol sequences with better two-dimensional
-    projections"
-Hammersley & Morton (1956) "A new Monte Carlo technique: antithetic variates"
-Chan, Golub & LeVeque (1983) "Algorithms for computing the sample variance"
-    The American Statistician 37(3), pp. 242–247.
-Kish (1965) "Survey Sampling"
-Welford (1962) "Note on a method for calculating corrected sums of squares"
-    Technometrics 4(3), pp. 419–420.
-McKay, Beckman & Conover (1979) "A comparison of three methods for selecting
-    values of input variables …"  (LHS fallback when d > 21 201.)
+Sobol' (1967); Owen (1995, 1997, 2013); Joe & Kuo (2008);
+Hammersley & Morton (1956); Chan, Golub & LeVeque (1983);
+Kish (1965); Welford (1962); McKay, Beckman & Conover (1979) (LHS
+fallback when d > 21 201).
 """
 
 from __future__ import annotations
 
 import logging
 import math
-import random as _random
 from dataclasses import dataclass, field
 from typing import Callable, ClassVar, List, Optional, Tuple
 
@@ -217,10 +187,11 @@ class FailureScenario:
 class RQMCSampler:
     """Generate FailureScenarios from an Owen-scrambled Sobol sequence.
 
-    For a network with *n_c* components, *T* incident timesteps, and 4 random
-    inputs per (component, timestep), the Sobol engine operates in
-    d = n_c × T × 4 dimensions.  All scenarios are pre-generated in one batch
-    (Sobol sequences should be consumed as a block for best uniformity).
+    For a network with *n_c* components, *T* incident timesteps, and
+    ``FailureScenario.N_DIM`` (=2) random inputs per (component, timestep),
+    the Sobol engine operates in d = n_c × T × N_DIM dimensions. All
+    scenarios are pre-generated in one batch (Sobol sequences should be
+    consumed as a block for best uniformity).
 
     If d > 21 201 (scipy Sobol limit), the sampler falls back to a randomised
     Latin Hypercube design, which still provides better marginal coverage than
@@ -479,14 +450,10 @@ class MCResult:
     # Per-run raw carrier vectors, shape (n_runs, 3)
     per_run: np.ndarray
 
-    # Seeds used (legacy mode only; None in RQMC mode)
-    seeds: Optional[List[int]] = None
-
     # E7: convergence trace. Each entry is a snapshot at a checkpoint:
     # (n_runs, mean[3], rel_half_width[3], ess). Populated per
-    # CHECKPOINT_EVERY runs by ``MCEngine._run_rqmc`` / ``_run_legacy`` so
-    # downstream eval can plot RHW(n) and Var-Reduction-Factor without
-    # re-running the simulation.
+    # CHECKPOINT_EVERY runs by the engine so downstream eval can plot
+    # RHW(n) and Var-Reduction-Factor without re-running the simulation.
     convergence: Optional[np.ndarray] = None  # shape (n_checkpoints, 1+3+3+1)
 
     CARRIER_NAMES: List[str] = field(
@@ -515,24 +482,16 @@ class MCResult:
 
 
 class MCEngine:
-    """Monte Carlo engine for MES resilience simulation.
+    """RQMC Monte Carlo engine for MES resilience simulation.
 
-    RQMC mode (recommended)
-    -----------------------
-    Pass a pre-built ``RQMCSampler`` via the ``sampler`` parameter.
-    ``run_func`` must accept a single ``FailureScenario`` argument and return
-    an array-like of length ``n_carriers``::
+    Always RQMC: pass a pre-built ``RQMCSampler`` via the ``sampler``
+    parameter. ``run_func`` must accept a single ``FailureScenario`` and
+    return an array-like of length ``n_carriers``::
 
         run_func(scenario: FailureScenario) -> array-like
 
     The engine generates Sobol scenarios, optionally pairs each with its
     antithetic twin (1 − u), and evaluates both.
-
-    Legacy mode (plain MC / seed-based)
-    ------------------------------------
-    Pass ``sampler=None``.  ``run_func`` must accept ``(seed, antithetic)``::
-
-        run_func(seed: int, antithetic: bool) -> array-like
 
     Parameters
     ----------
@@ -544,11 +503,8 @@ class MCEngine:
         Minimum runs before convergence is checked (default 200).
     antithetic_variates : bool
         Pair each Sobol point with its reflected antithetic twin.
-        Cuts variance by ~56 % for p_fail ≈ 0.1 failure models.
-    sampler : RQMCSampler | None
-        Pre-configured RQMC sampler.  None → legacy seed-based mode.
-    base_seed : int | None
-        Used only in legacy mode.  None → non-reproducible.
+    sampler : RQMCSampler
+        Pre-configured RQMC sampler. Required.
     n_carriers : int
         Number of energy carriers (default 3: power, heat, gas).
     """
@@ -560,42 +516,23 @@ class MCEngine:
         min_runs: int = 200,
         antithetic_variates: bool = True,
         sampler: Optional["RQMCSampler"] = None,
-        base_seed: Optional[int] = None,
         n_carriers: int = 3,
     ):
+        if sampler is None:
+            raise ValueError("MCEngine requires an RQMCSampler.")
         self.rel_tol = rel_tol
         self.max_runs = max_runs
         self.min_runs = min_runs
         self.antithetic_variates = antithetic_variates
         self._sampler = sampler
-        self._base_seed = base_seed
         self.n_carriers = n_carriers
-
-    def run(self, run_func: Callable) -> MCResult:
-        """Execute the Monte Carlo loop.
-
-        Parameters
-        ----------
-        run_func : callable
-            RQMC mode: ``run_func(scenario: FailureScenario) → ndarray``
-            Legacy mode: ``run_func(seed: int, antithetic: bool) → ndarray``
-
-        Returns
-        -------
-        MCResult
-        """
-        if self._sampler is not None:
-            return self._run_rqmc(run_func)
-        return self._run_legacy(run_func)
-
-    # ── RQMC loop ─────────────────────────────────────────────────────────────
 
     # E7: how often to snapshot mean/RHW for the convergence trace stored
     # in MCResult.convergence. 100 keeps the trace small (~160 rows for
     # max_runs=2¹⁴) while still producing usable RHW(n) curves.
     CHECKPOINT_EVERY: ClassVar[int] = 100
 
-    def _run_rqmc(self, run_func: Callable) -> MCResult:
+    def run(self, run_func: Callable) -> MCResult:
         stopping = CIStoppingCriterion(
             rel_tol=self.rel_tol,
             min_runs=self.min_runs,
@@ -694,125 +631,5 @@ class MCEngine:
             rel_half_width=final_diag["rel_half_width"],
             ess=final_diag.get("ess", float(i)),
             per_run=np.array(per_run),
-            seeds=None,
             convergence=np.asarray(trace) if trace else None,
         )
-
-    # ── Legacy seed-based loop (backward compatible) ──────────────────────────
-
-    def _run_legacy(self, run_func: Callable) -> MCResult:
-        seeds = make_run_seeds(self.max_runs, self._base_seed)
-        stopping = CIStoppingCriterion(
-            rel_tol=self.rel_tol,
-            min_runs=self.min_runs,
-            n_carriers=self.n_carriers,
-        )
-        per_run: List[np.ndarray] = []
-        seeds_used: List[int] = []
-        # E7: convergence trace.
-        trace: List[np.ndarray] = []
-        converged = False
-        i = 0
-        # See _run_rqmc — pre-seed `diag` so the post-loop warning is safe
-        # under empty / zero-iteration runs.
-        _, diag = stopping.should_stop()
-
-        while i < self.max_runs:
-            seed = seeds[i]
-
-            # ── Normal run ──────────────────────────────────────────────────
-            np.random.seed(seed)
-            _random.seed(seed)
-            carrier_perf = np.asarray(
-                run_func(seed=seed, antithetic=False), dtype=float
-            )
-            stopping.update(carrier_perf)
-            per_run.append(carrier_perf)
-            seeds_used.append(seed)
-            i += 1
-
-            # ── Antithetic run (paired, same seed) ──────────────────────────
-            if self.antithetic_variates and i < self.max_runs:
-                np.random.seed(seed)
-                _random.seed(seed)
-                carrier_perf_av = np.asarray(
-                    run_func(seed=seed, antithetic=True), dtype=float
-                )
-                stopping.update(carrier_perf_av)
-                per_run.append(carrier_perf_av)
-                seeds_used.append(seed)
-                i += 1
-
-            # ── Convergence check ───────────────────────────────────────────
-            converged, diag = stopping.should_stop()
-
-            if i % self.CHECKPOINT_EVERY == 0:
-                trace.append(
-                    np.concatenate(
-                        [
-                            np.array([float(i)]),
-                            np.asarray(diag["mean"], dtype=float),
-                            np.asarray(diag["rel_half_width"], dtype=float),
-                            np.array([float(diag.get("ess", float(i)))]),
-                        ]
-                    )
-                )
-                rhw_str = " ".join(f"{v:.3f}" for v in diag["rel_half_width"])
-                mean_str = " ".join(f"{v:.3f}" for v in diag["mean"])
-                log.info("n=%5d  mean=[%s]  RHW=[%s]", i, mean_str, rhw_str)
-
-            if converged:
-                log.info("Converged after %d runs (RHW ≤ %s)", i, self.rel_tol)
-                break
-
-        if not converged:
-            log.warning(
-                "Reached max_runs=%d without convergence.  RHW=%s",
-                self.max_runs,
-                diag["rel_half_width"],
-            )
-
-        _, final_diag = stopping.should_stop()
-        trace.append(
-            np.concatenate(
-                [
-                    np.array([float(i)]),
-                    np.asarray(final_diag["mean"], dtype=float),
-                    np.asarray(final_diag["rel_half_width"], dtype=float),
-                    np.array([float(final_diag.get("ess", float(i)))]),
-                ]
-            )
-        )
-        return MCResult(
-            n_runs=i,
-            converged=converged,
-            mean=final_diag["mean"],
-            std=final_diag["std"],
-            ci_lower=final_diag["ci_lower"],
-            ci_upper=final_diag["ci_upper"],
-            rel_half_width=final_diag["rel_half_width"],
-            ess=final_diag.get("ess", float(i)),
-            per_run=np.array(per_run),
-            seeds=seeds_used,
-            convergence=np.asarray(trace) if trace else None,
-        )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Legacy seed helpers (used by the legacy MCEngine loop)
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def make_run_seeds(n_runs: int, base_seed: Optional[int] = None) -> List[int]:
-    """Generate n_runs independent, reproducible seeds via LHS permutation.
-
-    Uses ``numpy.random.SeedSequence`` (statistically independent streams) and
-    permutes the draw order with a 1-D Latin Hypercube so the full seed space
-    is covered from the first batch.
-    """
-    seq = np.random.SeedSequence(base_seed)
-    raw_seeds = [int(s.generate_state(1)[0]) for s in seq.spawn(n_runs)]
-    sampler = qmc.LatinHypercube(d=1, seed=seq.generate_state(1)[0])
-    lhs_vals = sampler.random(n=n_runs).flatten()
-    order = np.argsort(lhs_vals)
-    return [raw_seeds[i] for i in order]

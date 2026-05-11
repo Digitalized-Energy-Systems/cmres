@@ -14,30 +14,170 @@ import numpy as np
 
 pio.kaleido.scope.mathjax = None
 
-pio.templates["publish"] = go.layout.Template(
+# ─────────────────────────────────────────────────────────────────────────────
+# CMRES unified plot style
+#
+# One canonical Plotly template plus shared palettes. Every eval/figure
+# script in this repo should pull style from here so the HTML/PDF
+# outputs look like they belong to the same paper:
+#
+#     fig.update_layout(template="cmres")           # base template
+#     marker_color=PALETTE_QUAL[i % len(PALETTE_QUAL)]
+#     colorscale=PALETTE_SEQUENTIAL                  # heatmaps
+#     colorscale=PALETTE_DIVERGING                   # signed deltas
+#     fig.update_layout(**LEGEND_RIGHT)              # outside-right legend
+#
+# Carrier-coloured plots keep using ``NETWORK_COLOR_MAP``.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_FONT_FAMILY = "Inter, Helvetica Neue, Helvetica, Arial, sans-serif"
+_FONT_COLOR = "#1f2933"
+_AXIS_LINE = "#cbd2d7"
+_AXIS_GRID = "#e6e8eb"
+_LEGEND_BG = "rgba(255,255,255,0.85)"
+_LEGEND_BORDER = "#cbd2d7"
+
+# Qualitative palette — Tableau-10 inspired, ColorBrewer-vetted hues. Anchored
+# so the first three colours match common carrier conventions (blue ~ data,
+# orange ~ electricity, green ~ gas); for actual carrier plots use
+# ``NETWORK_COLOR_MAP`` directly.
+PALETTE_QUAL = [
+    "#4c78a8",  # blue
+    "#f58518",  # orange
+    "#54a24b",  # green
+    "#e45756",  # red
+    "#72b7b2",  # teal
+    "#eeca3b",  # yellow
+    "#b279a2",  # purple
+    "#ff9da6",  # pink
+    "#9d755d",  # brown
+    "#bab0ac",  # gray
+]
+PALETTE_SEQUENTIAL = px.colors.sequential.Viridis
+PALETTE_DIVERGING = px.colors.diverging.RdBu
+
+_CMRES_AXIS = dict(
+    linecolor=_AXIS_LINE,
+    linewidth=1,
+    gridcolor=_AXIS_GRID,
+    gridwidth=1,
+    zerolinecolor=_AXIS_GRID,
+    zerolinewidth=1,
+    ticks="outside",
+    tickcolor=_AXIS_LINE,
+    ticklen=4,
+    tickfont=dict(size=12, family=_FONT_FAMILY, color=_FONT_COLOR),
+    title=dict(font=dict(size=13, family=_FONT_FAMILY, color=_FONT_COLOR)),
+    mirror=False,
+    automargin=True,
+)
+
+pio.templates["cmres"] = go.layout.Template(
     layout=go.Layout(
-        font=dict(family="sans-serif", size=19),
-        title=dict(font=dict(family="sans-serif", size=19)),
+        font=dict(family=_FONT_FAMILY, size=14, color=_FONT_COLOR),
+        title=dict(
+            font=dict(family=_FONT_FAMILY, size=16, color=_FONT_COLOR),
+            x=0.5,
+            xanchor="center",
+        ),
+        colorway=PALETTE_QUAL,
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        margin=dict(l=72, r=32, t=70, b=64),
+        xaxis=_CMRES_AXIS,
+        yaxis=_CMRES_AXIS,
+        legend=dict(
+            bgcolor=_LEGEND_BG,
+            bordercolor=_LEGEND_BORDER,
+            borderwidth=1,
+            font=dict(size=12, family=_FONT_FAMILY, color=_FONT_COLOR),
+            title=dict(font=dict(size=12, family=_FONT_FAMILY, color=_FONT_COLOR)),
+        ),
+        hoverlabel=dict(
+            font=dict(family=_FONT_FAMILY, size=12),
+            bgcolor="white",
+            bordercolor=_AXIS_LINE,
+        ),
+        colorscale=dict(
+            sequential=PALETTE_SEQUENTIAL,
+            sequentialminus=list(reversed(PALETTE_SEQUENTIAL)),
+            diverging=PALETTE_DIVERGING,
+        ),
     )
 )
-pio.templates["publish3"] = go.layout.Template(
-    layout=go.Layout(
-        font=dict(family="sans-serif", size=19),
-        title=dict(font=dict(family="sans-serif", size=19)),
-    )
+
+# Backwards-compatible aliases so any unsuspecting "publish*" reference
+# still resolves to the unified style instead of overriding font size.
+pio.templates["publish"] = pio.templates["cmres"]
+pio.templates["publish1"] = pio.templates["cmres"]
+pio.templates["publish2"] = pio.templates["cmres"]
+pio.templates["publish3"] = pio.templates["cmres"]
+
+#: Default Plotly template name for every cmres figure.
+CMRES_TEMPLATE = "cmres"
+
+#: Drop-in ``fig.update_layout(**LEGEND_RIGHT)`` to anchor legends consistently
+#: outside-right with a transparent background — preferred for medium/wide
+#: panels.
+LEGEND_RIGHT = dict(
+    legend=dict(
+        x=1.02,
+        xanchor="left",
+        y=1.0,
+        yanchor="top",
+        bgcolor=_LEGEND_BG,
+        bordercolor=_LEGEND_BORDER,
+        borderwidth=1,
+        font=dict(size=12, family=_FONT_FAMILY, color=_FONT_COLOR),
+        title=dict(font=dict(size=12, family=_FONT_FAMILY, color=_FONT_COLOR)),
+    ),
 )
-pio.templates["publish2"] = go.layout.Template(
-    layout=go.Layout(
-        font=dict(family="sans-serif", size=13),
-        title=dict(font=dict(family="sans-serif", size=13)),
-    )
+
+#: Use for grouped categories where horizontal placement reads better than
+#: a stacked column legend. Mirrors LEGEND_RIGHT typography.
+LEGEND_BOTTOM = dict(
+    legend=dict(
+        orientation="h",
+        x=0.5,
+        xanchor="center",
+        y=-0.20,
+        yanchor="top",
+        bgcolor=_LEGEND_BG,
+        bordercolor=_LEGEND_BORDER,
+        borderwidth=1,
+        font=dict(size=12, family=_FONT_FAMILY, color=_FONT_COLOR),
+        title=dict(font=dict(size=12, family=_FONT_FAMILY, color=_FONT_COLOR)),
+    ),
 )
-pio.templates["publish1"] = go.layout.Template(
-    layout=go.Layout(
-        font=dict(family="sans-serif", size=9),
-        title=dict(font=dict(family="sans-serif", size=9)),
-    )
-)
+
+
+def apply_cmres_style(
+    fig: "go.Figure",
+    legend: str = "right",
+    **overrides,
+) -> "go.Figure":
+    """Apply the canonical cmres template + legend placement to *fig*.
+
+    Args:
+        fig: Plotly figure to restyle in place.
+        legend: ``"right"`` (default), ``"bottom"`` or ``"none"`` (hide).
+        **overrides: forwarded straight to ``fig.update_layout`` so callers can
+            tweak titles/axes without re-specifying the template.
+
+    Returns:
+        The same figure (so calls can be chained).
+    """
+    fig.update_layout(template=CMRES_TEMPLATE)
+    if legend == "right":
+        fig.update_layout(**LEGEND_RIGHT)
+    elif legend == "bottom":
+        fig.update_layout(**LEGEND_BOTTOM)
+    elif legend == "none":
+        fig.update_layout(showlegend=False)
+    if overrides:
+        fig.update_layout(**overrides)
+    return fig
+
 
 YlGnBuDark = [
     "rgb(199,233,180)",
@@ -199,7 +339,7 @@ def create_group_histogram(
     color,
     height=400,
     width=600,
-    template="plotly_white",
+    template=CMRES_TEMPLATE,
     range_x=None,
     range_y=None,
     title=None,
@@ -240,7 +380,7 @@ def create_bar(
     legend_text=None,
     height=400,
     width=600,
-    template="plotly_white",
+    template=CMRES_TEMPLATE,
     title=None,
     xaxis_title=None,
     yaxis_title=None,
@@ -283,7 +423,7 @@ def create_multi_bar(
     x=None,
     height=400,
     width=600,
-    template="plotly_white",
+    template=CMRES_TEMPLATE,
     title=None,
     legend_text=None,
     xaxis_title=None,
@@ -312,7 +452,7 @@ def create_time_series(
     title=None,
     height=400,
     width=600,
-    template="plotly_white",
+    template=CMRES_TEMPLATE,
     legend_text=None,
     xaxis_title=None,
     yaxis_title=None,
@@ -373,7 +513,7 @@ def create_line_with_df(
     title=None,
     height=400,
     width=600,
-    template="plotly_white+publish",
+    template=CMRES_TEMPLATE,
     legend_text=None,
     xaxis_title=None,
     yaxis_title=None,
@@ -414,7 +554,7 @@ def create_scatter_with_df(
     title=None,
     height=400,
     width=600,
-    template="plotly_white+publish",
+    template=CMRES_TEMPLATE,
     legend_text=None,
     xaxis_title=None,
     yaxis_title=None,
@@ -494,7 +634,7 @@ def create_networkx_plot(
     color_name,
     color_legend_text=None,
     title=None,
-    template="plotly_white+publish2",
+    template=CMRES_TEMPLATE,
     without_nodes=False,
 ):
     graph: nx.Graph = network._network_internal
@@ -820,7 +960,7 @@ def create_multilevel_grouped_bar_chart(
     fig.update_layout(
         barmode="stack",
         showlegend=True,
-        template="plotly_white",
+        template=CMRES_TEMPLATE,
         height=800,
         width=1600,
         legend=dict(
