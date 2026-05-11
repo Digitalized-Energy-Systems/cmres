@@ -1058,9 +1058,154 @@ def plot_e15_structural(input_dir: Path, output_dir: Path) -> Optional[Path]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+_E16_SECTORS = (
+    ("total_shed", "Total"),
+    ("power_shed", "Electricity"),
+    ("heat_shed",  "Heat"),
+    ("gas_shed",   "Gas"),
+)
+
+
+def _e16_scatter(merged: pd.DataFrame, metric: str, scenario: str) -> go.Figure:
+    """One figure per metric: a 2×2 panel of (metric vs sector_shed) for
+    {total, electricity, heat, gas}, with markers coloured by ``cp_type``
+    (legend shows which branch / compound family each point belongs to).
+
+    Each panel filters to ``sector_shed > 0`` so the log-y axis is
+    well-defined, then annotates with Spearman ρ. Skips entirely if the
+    x-axis is constant (e.g. ``input_adequacy`` on a CP-free grid would
+    crash Kaleido with "axis scaling")."""
+    from plotly.subplots import make_subplots
+    from scipy.stats import spearmanr
+
+    if metric not in merged.columns or merged[metric].nunique() < 2:
+        return go.Figure()
+
+    cp_types = sorted(merged.get("cp_type", pd.Series(dtype=str)).dropna().unique())
+    color_map = {t: QUAL[i % len(QUAL)] for i, t in enumerate(cp_types)}
+
+    fig = make_subplots(
+        rows=2, cols=2,
+        subplot_titles=[label for _, label in _E16_SECTORS],
+        shared_xaxes=False, shared_yaxes=False,
+        horizontal_spacing=0.10, vertical_spacing=0.16,
+    )
+
+    legend_seen: set = set()
+    any_data = False
+    for idx, (sector_col, sector_label) in enumerate(_E16_SECTORS):
+        row, col = idx // 2 + 1, idx % 2 + 1
+        # Plotly's first axis is "x"/"y" (no "1"); only later subplots get
+        # numeric suffixes. Use that convention for `xref` / `yref` strings.
+        ax_suffix = "" if idx == 0 else str(idx + 1)
+        if sector_col not in merged.columns:
+            continue
+        df = merged[merged[metric].notna() & (merged[sector_col] > 0)].copy()
+        if df.empty:
+            fig.add_annotation(
+                xref=f"x{ax_suffix} domain", yref=f"y{ax_suffix} domain",
+                x=0.5, y=0.5, showarrow=False,
+                text=f"no rows with {sector_col} > 0",
+                font=dict(color="#888"),
+                row=row, col=col,
+            )
+            continue
+        any_data = True
+        # One trace per cp_type so the legend lists branch families.
+        for cp_type in cp_types:
+            sub = df[df["cp_type"] == cp_type] if "cp_type" in df.columns else df
+            if sub.empty:
+                continue
+            show_in_legend = cp_type not in legend_seen
+            legend_seen.add(cp_type)
+            fig.add_trace(
+                go.Scatter(
+                    x=sub[metric], y=sub[sector_col],
+                    mode="markers", name=cp_type,
+                    legendgroup=cp_type, showlegend=show_in_legend,
+                    marker=dict(
+                        color=color_map.get(cp_type, "#888"),
+                        size=7, opacity=0.85,
+                        line=dict(color="#222", width=0.4),
+                    ),
+                    hovertemplate=(
+                        f"<b>{cp_type}</b><br>"
+                        + (("cp_id=%{customdata[0]}<br>") if "cp_id" in sub.columns else "")
+                        + f"{metric}=%{{x:.4g}}<br>{sector_col}=%{{y:.4g}}<extra></extra>"
+                    ),
+                    customdata=sub[["cp_id"]].values if "cp_id" in sub.columns else None,
+                ),
+                row=row, col=col,
+            )
+        # ρ annotation in the panel.
+        if len(df) >= 3 and df[metric].nunique() >= 2 and df[sector_col].nunique() >= 2:
+            rho, p = spearmanr(df[metric], df[sector_col])
+            fig.add_annotation(
+                xref=f"x{ax_suffix} domain", yref=f"y{ax_suffix} domain",
+                x=0.02, y=0.98, xanchor="left", yanchor="top",
+                showarrow=False, align="left",
+                text=f"ρ = {rho:+.3f}<br>p = {p:.2e}<br>n = {len(df)}",
+                bgcolor="rgba(255,255,255,0.88)",
+                bordercolor="#888", borderwidth=1,
+                font=dict(size=10),
+                row=row, col=col,
+            )
+        fig.update_yaxes(type="log", row=row, col=col, title_text=f"{sector_col} (MW, log)")
+        fig.update_xaxes(row=row, col=col, title_text=metric if row == 2 else "")
+
+    if not any_data:
+        return go.Figure()
+
+    fig.update_layout(**_layout(
+        title=f"E16 — {pretty_scenario(scenario)}: {metric} vs analytical shed (per sector)",
+        height=720, width=1080,
+        legend=dict(title="cp_type"),
+    ))
+    return fig
+
+
+def _e16_top_overlap(merged: pd.DataFrame, scenario: str,
+                     metrics: List[str], ks: Sequence[int] = (5, 10, 20, 50)) -> go.Figure:
+    """Top-K overlap (metric-rank ∩ shed-rank) / K versus K, one line per metric.
+    Captures how well each metric reproduces the analytical top-K critical set."""
+    rows: List[dict] = []
+    shed_rank = merged.sort_values("total_shed", ascending=False)
+    join_col = "_join_cp_id" if "_join_cp_id" in merged.columns else "cp_id"
+    for m in metrics:
+        if m not in merged.columns or merged[m].notna().sum() == 0:
+            continue
+        metric_rank = merged.sort_values(m, ascending=False)
+        for k in ks:
+            if k > len(merged):
+                continue
+            top_metric = set(metric_rank.head(k)[join_col])
+            top_shed = set(shed_rank.head(k)[join_col])
+            rows.append({"metric": m, "k": k,
+                         "overlap": len(top_metric & top_shed) / k})
+    if not rows:
+        return go.Figure()
+    df = pd.DataFrame(rows)
+    fig = px.line(
+        df, x="k", y="overlap", color="metric", markers=True,
+        color_discrete_sequence=QUAL,
+    )
+    fig.update_layout(**_layout(
+        title=f"E16 — {pretty_scenario(scenario)}: top-K overlap (metric vs analytical shed)",
+        xaxis_title="K", yaxis_title="|top_K(metric) ∩ top_K(shed)| / K",
+        yaxis=dict(range=[0, 1.05], tickformat=".0%"),
+        height=420, width=860, legend=dict(title="Metric"),
+    ))
+    return fig
+
+
 def plot_e16_single_removal(input_dir: Path, output_dir: Path) -> Optional[Path]:
     """Per-metric ρ vs analytical shed AND vs MC, with the ceiling
-    (ρ_shed_vs_mc) drawn as a hatched reference for each scenario."""
+    (ρ_shed_vs_mc) drawn as a hatched reference for each scenario.
+
+    When per-scenario ``E16_<scenario>_merged.csv`` files are present
+    (emitted by the refactored ``experiment_e16_single_removal_validation``),
+    appends per-metric scatter panels and a top-K overlap curve per scenario.
+    """
     input_dir, output_dir = Path(input_dir), Path(output_dir)
     metric_path = input_dir / "E16_metric_vs_shed.csv"
     ceil_path = input_dir / "E16_shed_vs_mc_ceiling.csv"
@@ -1075,32 +1220,99 @@ def plot_e16_single_removal(input_dir: Path, output_dir: Path) -> Optional[Path]
     titles: List[str] = []
     slugs: List[str] = []
 
-    # Heatmap ρ vs analytical shed (the structural quality measure).
+    # ρ vs analytical shed — heatmap when multiple scenarios are present,
+    # horizontal bar when there is only one (a 1×N heatmap crashes Kaleido
+    # with "axis scaling" because the y-axis is degenerate). Also drop
+    # columns / rows that are entirely NaN — Kaleido fails the same way when
+    # an axis has no finite range to scale.
     pivot_shed = df.pivot_table(index="scenario", columns="metric", values="rho_vs_shed")
     pivot_shed = pivot_shed.reindex(index=_scenario_order(pivot_shed.index))
+    pivot_shed = pivot_shed.dropna(axis=1, how="all").dropna(axis=0, how="all")
     z = pivot_shed.values
     if z.size:
-        text = np.where(np.isfinite(z),
-                        np.array([f"{v:.2f}" for v in z.ravel()],
-                                 dtype=object).reshape(z.shape), "")
-        heat = go.Figure(go.Heatmap(
-            z=z, x=list(pivot_shed.columns),
-            y=[pretty_scenario(s) for s in pivot_shed.index],
-            colorscale="RdBu", zmid=0, zmin=-1, zmax=1,
-            colorbar=dict(title=dict(text="ρ vs shed", side="right"),
-                          thickness=14, len=0.9),
-            text=text, texttemplate="%{text}",
-            hovertemplate="<b>%{y}</b><br>%{x}: ρ = %{z:.3f}<extra></extra>",
-        ))
-        heat.update_layout(**_layout(
-            title="E16 — Spearman ρ between metric and analytical single-removal shed",
-            xaxis=dict(title="Metric", tickangle=30), yaxis=dict(title=""),
-            height=80 + 36 * len(pivot_shed.index),
-            width=120 + 90 * len(pivot_shed.columns),
-        ))
-        figs.append(heat)
-        titles.append("E16 ρ vs analytical shed")
-        slugs.append("e16_rho_vs_shed_heatmap")
+        if pivot_shed.shape[0] >= 2:
+            text = np.where(np.isfinite(z),
+                            np.array([f"{v:.2f}" for v in z.ravel()],
+                                     dtype=object).reshape(z.shape), "")
+            heat = go.Figure(go.Heatmap(
+                z=z, x=list(pivot_shed.columns),
+                y=[pretty_scenario(s) for s in pivot_shed.index],
+                colorscale="RdBu", zmid=0, zmin=-1, zmax=1,
+                colorbar=dict(title=dict(text="ρ vs shed", side="right"),
+                              thickness=14, len=0.9),
+                text=text, texttemplate="%{text}",
+                hovertemplate="<b>%{y}</b><br>%{x}: ρ = %{z:.3f}<extra></extra>",
+            ))
+            heat.update_layout(**_layout(
+                title="E16 — Spearman ρ between metric and analytical single-removal shed",
+                xaxis=dict(title="Metric", tickangle=30), yaxis=dict(title=""),
+                height=80 + 36 * len(pivot_shed.index),
+                width=120 + 90 * len(pivot_shed.columns),
+            ))
+            figs.append(heat)
+            titles.append("E16 ρ vs analytical shed")
+            slugs.append("e16_rho_vs_shed_heatmap")
+        else:
+            scenario = pivot_shed.index[0]
+            sub = df[df["scenario"] == scenario]
+            # Order metrics by ρ_vs_total so the chart reads left→right by
+            # overall agreement with shed; sectors get their own colour.
+            order = sub.sort_values("rho_vs_total_shed",
+                                    na_position="last")["metric"].tolist()
+            sector_color = {
+                "total": "#444444",
+                "power": eval.NETWORK_COLOR_MAP["electricity"],
+                "heat":  eval.NETWORK_COLOR_MAP["heat"],
+                "gas":   eval.NETWORK_COLOR_MAP["gas"],
+            }
+            sector_pretty = {
+                "total": "Total", "power": "Electricity",
+                "heat": "Heat", "gas": "Gas",
+            }
+            bar = go.Figure()
+            for tag in ("total", "power", "heat", "gas"):
+                rho_col = f"rho_vs_{tag}_shed"
+                hi_col = f"ci_hi_{tag}_shed"
+                lo_col = f"ci_lo_{tag}_shed"
+                n_col = f"n_{tag}" if tag != "total" else "n"
+                if rho_col not in sub.columns:
+                    continue
+                sub_t = sub.set_index("metric").reindex(order).reset_index()
+                rho = sub_t[rho_col].astype(float)
+                hi = sub_t.get(hi_col, pd.Series(dtype=float))
+                lo = sub_t.get(lo_col, pd.Series(dtype=float))
+                err_hi = (hi - rho).clip(lower=0) if not hi.empty else None
+                err_lo = (rho - lo).clip(lower=0) if not lo.empty else None
+                n_arr = sub_t[n_col] if n_col in sub_t.columns else sub_t.get("n")
+                bar.add_trace(go.Bar(
+                    name=sector_pretty[tag],
+                    x=sub_t["metric"], y=rho,
+                    marker=dict(color=sector_color[tag],
+                                line=dict(color="#222", width=0.4)),
+                    error_y=dict(
+                        type="data", symmetric=False,
+                        array=err_hi, arrayminus=err_lo,
+                        thickness=1.2, width=3,
+                    ) if err_hi is not None else None,
+                    customdata=np.c_[n_arr.values] if n_arr is not None else None,
+                    hovertemplate=(
+                        f"<b>{sector_pretty[tag]}</b><br>"
+                        "metric = %{x}<br>ρ = %{y:+.3f}<br>n = %{customdata[0]}<extra></extra>"
+                    ),
+                ))
+            bar.add_hline(y=0, line=dict(color="#444", width=1, dash="dot"))
+            bar.update_layout(**_layout(
+                title=f"E16 — {pretty_scenario(scenario)}: Spearman ρ vs analytical shed, per sector",
+                barmode="group",
+                xaxis=dict(title="Metric", tickangle=-25),
+                yaxis=dict(title="Spearman ρ", range=[-1.10, 1.10],
+                           gridcolor="#e5e5e5"),
+                height=460, width=120 + 110 * max(len(order), 1),
+                legend=dict(title="Sector"),
+            ))
+            figs.append(bar)
+            titles.append("E16 ρ vs analytical shed — per sector")
+            slugs.append("e16_rho_vs_shed_bar_per_sector")
 
     # ρ vs shed vs ρ vs MC scatter — does shed-quality predict MC-quality?
     fig = go.Figure()
@@ -1165,6 +1377,32 @@ def plot_e16_single_removal(input_dir: Path, output_dir: Path) -> Optional[Path]
         figs.append(fig2)
         titles.append("E16 ceiling ρ")
         slugs.append("e16_ceiling_rho")
+
+    # ── Per-scenario raw scatter + top-K overlap (only if the
+    #    refactored experiment emitted merged CSVs) ────────────────────────
+    merged_files = sorted(input_dir.glob("E16_*_merged.csv"))
+    available_metrics = [m for m in df["metric"].drop_duplicates() if m]
+    for mf in merged_files:
+        scenario = mf.stem.removeprefix("E16_").removesuffix("_merged")
+        try:
+            merged = pd.read_csv(mf)
+        except Exception as e:
+            print(f"[E16] failed to read {mf.name}: {e}")
+            continue
+        if merged.empty:
+            continue
+        present_metrics = [m for m in available_metrics if m in merged.columns]
+        for m in present_metrics:
+            sc_fig = _e16_scatter(merged, m, scenario)
+            if sc_fig.data:
+                figs.append(sc_fig)
+                titles.append(f"E16 {scenario} — {m} vs total_shed")
+                slugs.append(f"e16_{scenario}_scatter_{m}")
+        ov_fig = _e16_top_overlap(merged, scenario, present_metrics)
+        if ov_fig.data:
+            figs.append(ov_fig)
+            titles.append(f"E16 {scenario} — top-K overlap")
+            slugs.append(f"e16_{scenario}_top_k_overlap")
 
     return _emit(figs, titles, slugs, output_dir / "E16_single_removal.html",
                  "E16 — Single-removal-shed validation")

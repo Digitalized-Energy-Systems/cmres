@@ -200,23 +200,30 @@ def _shed_from_solved(net) -> Tuple[float, float, float, float]:
     gas = 0.0
     for c in net.childs:
         m = c.model
-        if isinstance(m, mm.Sink) and getattr(c, "grid", None) is not None:
-            grid = c.grid
-            hhv = float(getattr(grid, "higher_heating_value", 15.3))
-            if c.ignored or not c.active:
-                try:
-                    gas += float(mm.upper(m.mass_flow) or 0.0) * 3.6 * hhv
-                except Exception:
-                    pass
-                continue
+        if not isinstance(m, mm.Sink):
+            continue
+        grid = getattr(c, "grid", None)
+        # Only gas-grid Sinks contribute to gas shedding. Water Sinks live on
+        # WaterGrid which has no ``higher_heating_value`` — defaulting to a
+        # gas HHV here would conjure huge fake gas energy from water mass
+        # flows (mirrors model.py::_max_load_shedding).
+        if grid is None or not hasattr(grid, "higher_heating_value"):
+            continue
+        hhv = float(grid.higher_heating_value)
+        if c.ignored or not c.active:
             try:
-                gas += (
-                    float(mm.upper(m.mass_flow) or 0.0)
-                    - float(mm.value(m.mass_flow) or 0.0)
-                    * float(mm.value(m.regulation) or 1.0)
-                ) * 3.6 * hhv
+                gas += float(mm.upper(m.mass_flow) or 0.0) * 3.6 * hhv
             except Exception:
                 pass
+            continue
+        try:
+            gas += (
+                float(mm.upper(m.mass_flow) or 0.0)
+                - float(mm.value(m.mass_flow) or 0.0)
+                * float(mm.value(m.regulation) or 1.0)
+            ) * 3.6 * hhv
+        except Exception:
+            pass
 
     total = power + heat + gas
     return float(power), float(heat), float(gas), float(total)

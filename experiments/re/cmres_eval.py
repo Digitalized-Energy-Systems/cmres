@@ -871,6 +871,40 @@ def experiment_e15_structural(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+# Compound CP types whose row in df_eval carries a bare integer id
+# (because ``mes_cp_metric`` stores ``cp_id=cp.id`` for compounds and
+# ``build_matched_df`` keeps it as ``str(int)``).  The shed CSV uses
+# ``"compound:{int}"`` (``_enumerate_targets`` in single_removal_shed.py),
+# so without prefixing here every compound CP silently drops out of the
+# join.
+_E16_COMPOUND_TYPES = ("CHP", "CHPHG", "PowerToHeat")
+
+
+def _e16_join_id(cp_id, cp_type) -> str:
+    """Normalise a df_eval cp_id to the shed CSV's cp_id format."""
+    cp_id_str = str(cp_id)
+    if cp_type in _E16_COMPOUND_TYPES and not cp_id_str.startswith("compound:"):
+        # ``str(int)`` for compound rows → "5"; shed uses "compound:5".
+        return f"compound:{cp_id_str}"
+    return cp_id_str
+
+
+def _e16_merge_one(art: "ScenarioArtefacts", shed_csv: Path) -> pd.DataFrame:
+    """Return the per-scenario merged dataframe (or empty if nothing joins)."""
+    shed = pd.read_csv(shed_csv)
+    shed = shed[shed["cp_id"] != "_baseline_"].copy()
+    df = art.df_eval.copy()
+    df["_join_cp_id"] = df.apply(
+        lambda r: _e16_join_id(r["cp_id"], r.get("cp_type", "")), axis=1
+    )
+    shed["cp_id"] = shed["cp_id"].astype(str)
+    keep = ["cp_id", "kind", "total_shed", "power_shed", "heat_shed", "gas_shed"]
+    return df.merge(
+        shed[keep], left_on="_join_cp_id", right_on="cp_id", how="inner",
+        suffixes=("", "_shed"),
+    )
+
+
 def experiment_e16_single_removal_validation(
     artefacts: List[ScenarioArtefacts],
     output_dir: Path,
@@ -891,8 +925,16 @@ def experiment_e16_single_removal_validation(
         shed_dir/single_removal_shed_<scenario>.csv
 
     Each row has ``cp_id, kind, total_shed`` (and per-carrier shed). The
-    join is on cp_id (str). Components for which a row is missing are
-    dropped from the analytical comparison.
+    join normalises the metric-side cp_id for compound CPs (``"5"`` →
+    ``"compound:5"``) so compounds aren't silently dropped.
+
+    Outputs (in ``output_dir``):
+      - ``E16_metric_vs_shed.csv``      : ρ per (scenario, metric)
+      - ``E16_shed_vs_mc_ceiling.csv``  : ρ shed vs MC actual_total
+      - ``E16_<scenario>_merged.csv``   : raw joined dataframe per scenario
+
+    Plotting is handled by ``cmres_eval_plots.plot_e16_single_removal``,
+    which consumes these CSVs.
     """
     out_dir = Path(output_dir)
     out_dir.mkdir(exist_ok=True, parents=True)
@@ -914,17 +956,12 @@ def experiment_e16_single_removal_validation(
         if not shed_csv.exists():
             print(f"[E16:{art.label}] no shed CSV at {shed_csv}; skipping")
             continue
-        shed = pd.read_csv(shed_csv)
-        shed = shed[shed["cp_id"] != "_baseline_"]
-        df = art.df_eval.copy()
-        df["cp_id"] = df["cp_id"].astype(str)
-        shed["cp_id"] = shed["cp_id"].astype(str)
-        merged = df.merge(
-            shed[["cp_id", "total_shed", "power_shed", "heat_shed", "gas_shed"]],
-            on="cp_id", how="inner",
-        )
+        merged = _e16_merge_one(art, shed_csv)
         if merged.empty:
+            print(f"[E16:{art.label}] empty join; skipping")
             continue
+
+        merged.to_csv(out_dir / f"E16_{art.label}_merged.csv", index=False)
 
         # Ceiling: how well does the analytical ground truth itself match MC?
         if "actual_total" in merged.columns:
@@ -942,24 +979,65 @@ def experiment_e16_single_removal_validation(
                 })
 
         # Per-metric ρ vs analytical shed (the metric quality ceiling).
+        # We compute one ρ per carrier (power/heat/gas) in addition to the
+        # total so the plot side can break correlations and scatters out by
+        # sector. Each per-carrier ρ is conditioned on that carrier's shed
+        # being non-zero — otherwise a component that never affects (say)
+        # heat would drag every metric's heat-ρ toward zero.
+        carrier_targets = [
+            ("total", "total_shed"),
+            ("power", "power_shed"),
+            ("heat",  "heat_shed"),
+            ("gas",   "gas_shed"),
+        ]
         for m in metrics:
             if m not in merged.columns or merged[m].notna().sum() < 3:
                 continue
-            sub = merged[merged[m].notna() & merged["total_shed"].notna()]
-            if len(sub) < 3:
+            sub_base = merged[merged[m].notna()]
+            if len(sub_base) < 3:
                 continue
-            rho_shed, p_shed, lo_shed, hi_shed = _spearman_with_ci(sub[m], sub["total_shed"])
-            # Also compare to MC for cross-reference.
-            rho_mc, p_mc, lo_mc, hi_mc = _spearman_with_ci(sub[m], sub["actual_total"])
-            rows.append({
-                "scenario": art.label,
-                "metric": m,
-                "rho_vs_shed": rho_shed, "p_vs_shed": p_shed,
-                "ci_lo_shed": lo_shed, "ci_hi_shed": hi_shed,
-                "rho_vs_mc":   rho_mc,   "p_vs_mc":   p_mc,
-                "ci_lo_mc":   lo_mc,   "ci_hi_mc":   hi_mc,
-                "n": int(len(sub)),
-            })
+            row: dict = {"scenario": art.label, "metric": m, "n": int(len(sub_base))}
+            for tag, col in carrier_targets:
+                if col not in sub_base.columns:
+                    row[f"rho_vs_{tag}_shed"] = float("nan")
+                    row[f"p_vs_{tag}_shed"] = float("nan")
+                    row[f"ci_lo_{tag}_shed"] = float("nan")
+                    row[f"ci_hi_{tag}_shed"] = float("nan")
+                    row[f"n_{tag}"] = 0
+                    continue
+                sub = sub_base[sub_base[col].notna() & (sub_base[col] > 0)] \
+                    if tag != "total" else sub_base[sub_base[col].notna()]
+                if len(sub) < 3 or sub[m].nunique() < 2 or sub[col].nunique() < 2:
+                    row[f"rho_vs_{tag}_shed"] = float("nan")
+                    row[f"p_vs_{tag}_shed"] = float("nan")
+                    row[f"ci_lo_{tag}_shed"] = float("nan")
+                    row[f"ci_hi_{tag}_shed"] = float("nan")
+                    row[f"n_{tag}"] = int(len(sub))
+                    continue
+                rho, p, lo, hi = _spearman_with_ci(sub[m], sub[col])
+                row[f"rho_vs_{tag}_shed"] = rho
+                row[f"p_vs_{tag}_shed"] = p
+                row[f"ci_lo_{tag}_shed"] = lo
+                row[f"ci_hi_{tag}_shed"] = hi
+                row[f"n_{tag}"] = int(len(sub))
+            # Back-compat aliases so existing plot code keeps working.
+            row["rho_vs_shed"] = row["rho_vs_total_shed"]
+            row["p_vs_shed"] = row["p_vs_total_shed"]
+            row["ci_lo_shed"] = row["ci_lo_total_shed"]
+            row["ci_hi_shed"] = row["ci_hi_total_shed"]
+            # Also compare to MC for cross-reference. ``actual_total`` may not
+            # exist if df_eval came from a non-MC source — guard either way.
+            if "actual_total" in sub_base.columns:
+                rho_mc, p_mc, lo_mc, hi_mc = _spearman_with_ci(
+                    sub_base[m], sub_base["actual_total"]
+                )
+            else:
+                rho_mc = p_mc = lo_mc = hi_mc = float("nan")
+            row["rho_vs_mc"] = rho_mc
+            row["p_vs_mc"] = p_mc
+            row["ci_lo_mc"] = lo_mc
+            row["ci_hi_mc"] = hi_mc
+            rows.append(row)
     out_df = pd.DataFrame(rows)
     out_df.to_csv(out_dir / "E16_metric_vs_shed.csv", index=False)
     if ceiling_rows:
