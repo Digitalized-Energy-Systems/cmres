@@ -32,7 +32,7 @@ set -e
 N_GRIDS=${N_GRIDS:-9}
 N_SHARDS=${N_SHARDS:-8}
 SUBMIT_MERGE=${SUBMIT_MERGE:-1}
-INPUT_DIR=${INPUT_DIR:-/user/towo7024/cmres_new/cmres/data/res}
+INPUT_DIR=${INPUT_DIR:-/user/towo7024/cmres_new/cmres/data_0512/res}
 OUTPUT_DIR=${OUTPUT_DIR:-data/out/single_removal_shed}
 
 mkdir -p logs "$OUTPUT_DIR"
