@@ -112,7 +112,18 @@ def _solve_load_shed(
     otherwise the analytical shed and the MC actuals will use different
     external slack capacities and the comparison is biased.
     """
+    # Weight only demand shed, and scale it so it dwarfs the
+    # formulation-level tightening terms (MISOC ``current·br_r`` on
+    # power branches, NL ``1e-5·mass_flow²`` on pipes) that the
+    # solver-side formulations add to ``pm.obj``. Those terms total
+    # O(0.2) on simbench_lv; with the default weights the LP will
+    # happily shift O(0.4) of demand shed into formulation slack
+    # when a CP is removed, which breaks monotonicity for
+    # ``_shed_from_solved`` (it only sees the demand side).
     opt = mp.create_min_load_shedding_problem(
+        demand_weight=1e3,
+        generator_weight=0.1,
+        ext_grid_weight=0.1,
         bounds_el=(0.9, 1.1),
         bounds_gas=(0.9, 1.1),
         bounds_heat=(0.7, 1.3),

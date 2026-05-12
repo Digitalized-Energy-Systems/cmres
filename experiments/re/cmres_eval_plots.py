@@ -1164,6 +1164,89 @@ def _e16_scatter(merged: pd.DataFrame, metric: str, scenario: str) -> go.Figure:
     return fig
 
 
+def _e16_rho_per_sector_bar(df: pd.DataFrame, scenario: str) -> go.Figure:
+    """Grouped bar chart for one scenario: per metric, one bar per
+    *sector slice* (total / multi / electricity / heat / gas), with sector
+    legend and CI error bars.
+
+    The slices are partitioned by component kind so the per-carrier signal
+    isn't distorted by coupling-point rows:
+      total       — every matched row (the headline number).
+      multi       — CP rows only (compound + branch_cp), vs total_shed —
+                    how well the metric ranks coupling components.
+      power/heat/gas — non-CP rows only, vs same-sector shed — clean
+                    within-carrier ranking on plain branches/pipes.
+
+    This is the canonical per-scenario per-sector correlation view."""
+    sub = df[df["scenario"] == scenario]
+    if sub.empty:
+        return go.Figure()
+    order = sub.sort_values("rho_vs_total_shed",
+                            na_position="last")["metric"].tolist()
+    sector_color = {
+        "total": "#444444",
+        "multi": "#7e57c2",  # purple — distinct from any single-carrier hue
+        "power": eval.NETWORK_COLOR_MAP["electricity"],
+        "heat":  eval.NETWORK_COLOR_MAP["heat"],
+        "gas":   eval.NETWORK_COLOR_MAP["gas"],
+    }
+    sector_pretty = {
+        "total": "Total",
+        "multi": "Multi (CPs)",
+        "power": "Electricity (non-CP)",
+        "heat":  "Heat (non-CP)",
+        "gas":   "Gas (non-CP)",
+    }
+    bar = go.Figure()
+    any_trace = False
+    for tag in ("total", "multi", "power", "heat", "gas"):
+        rho_col = f"rho_vs_{tag}_shed"
+        hi_col = f"ci_hi_{tag}_shed"
+        lo_col = f"ci_lo_{tag}_shed"
+        n_col = f"n_{tag}" if tag != "total" else "n"
+        if rho_col not in sub.columns:
+            continue
+        sub_t = sub.set_index("metric").reindex(order).reset_index()
+        rho = sub_t[rho_col].astype(float)
+        if not rho.notna().any():
+            continue
+        any_trace = True
+        hi = sub_t.get(hi_col, pd.Series(dtype=float))
+        lo = sub_t.get(lo_col, pd.Series(dtype=float))
+        err_hi = (hi - rho).clip(lower=0) if not hi.empty else None
+        err_lo = (rho - lo).clip(lower=0) if not lo.empty else None
+        n_arr = sub_t[n_col] if n_col in sub_t.columns else sub_t.get("n")
+        bar.add_trace(go.Bar(
+            name=sector_pretty[tag],
+            x=sub_t["metric"], y=rho,
+            marker=dict(color=sector_color[tag],
+                        line=dict(color="#222", width=0.4)),
+            error_y=dict(
+                type="data", symmetric=False,
+                array=err_hi, arrayminus=err_lo,
+                thickness=1.2, width=3,
+            ) if err_hi is not None else None,
+            customdata=np.c_[n_arr.values] if n_arr is not None else None,
+            hovertemplate=(
+                f"<b>{sector_pretty[tag]}</b><br>"
+                "metric = %{x}<br>ρ = %{y:+.3f}<br>n = %{customdata[0]}<extra></extra>"
+            ),
+        ))
+    if not any_trace:
+        return go.Figure()
+    bar.add_hline(y=0, line=dict(color="#444", width=1, dash="dot"))
+    bar.update_layout(**_layout(
+        title=f"E16 — {pretty_scenario(scenario)}: Spearman ρ vs analytical shed, per sector",
+        barmode="group",
+        xaxis=dict(title="Metric", tickangle=-25),
+        yaxis=dict(title="Spearman ρ", range=[-1.10, 1.10],
+                   gridcolor="#e5e5e5"),
+        height=460, width=120 + 110 * max(len(order), 1),
+        legend=dict(title="Sector"),
+    ))
+    return bar
+
+
 def _e16_top_overlap(merged: pd.DataFrame, scenario: str,
                      metrics: List[str], ks: Sequence[int] = (5, 10, 20, 50)) -> go.Figure:
     """Top-K overlap (metric-rank ∩ shed-rank) / K versus K, one line per metric.
@@ -1243,76 +1326,26 @@ def plot_e16_single_removal(input_dir: Path, output_dir: Path) -> Optional[Path]
                 text=text, texttemplate="%{text}",
                 hovertemplate="<b>%{y}</b><br>%{x}: ρ = %{z:.3f}<extra></extra>",
             ))
+            # Kaleido fails with "axis scaling" on very short heatmaps;
+            # floor the height so even a 2-row heatmap gets enough space.
             heat.update_layout(**_layout(
                 title="E16 — Spearman ρ between metric and analytical single-removal shed",
                 xaxis=dict(title="Metric", tickangle=30), yaxis=dict(title=""),
-                height=80 + 36 * len(pivot_shed.index),
+                height=max(280, 80 + 56 * len(pivot_shed.index)),
                 width=120 + 90 * len(pivot_shed.columns),
             ))
             figs.append(heat)
             titles.append("E16 ρ vs analytical shed")
             slugs.append("e16_rho_vs_shed_heatmap")
-        else:
-            scenario = pivot_shed.index[0]
-            sub = df[df["scenario"] == scenario]
-            # Order metrics by ρ_vs_total so the chart reads left→right by
-            # overall agreement with shed; sectors get their own colour.
-            order = sub.sort_values("rho_vs_total_shed",
-                                    na_position="last")["metric"].tolist()
-            sector_color = {
-                "total": "#444444",
-                "power": eval.NETWORK_COLOR_MAP["electricity"],
-                "heat":  eval.NETWORK_COLOR_MAP["heat"],
-                "gas":   eval.NETWORK_COLOR_MAP["gas"],
-            }
-            sector_pretty = {
-                "total": "Total", "power": "Electricity",
-                "heat": "Heat", "gas": "Gas",
-            }
-            bar = go.Figure()
-            for tag in ("total", "power", "heat", "gas"):
-                rho_col = f"rho_vs_{tag}_shed"
-                hi_col = f"ci_hi_{tag}_shed"
-                lo_col = f"ci_lo_{tag}_shed"
-                n_col = f"n_{tag}" if tag != "total" else "n"
-                if rho_col not in sub.columns:
-                    continue
-                sub_t = sub.set_index("metric").reindex(order).reset_index()
-                rho = sub_t[rho_col].astype(float)
-                hi = sub_t.get(hi_col, pd.Series(dtype=float))
-                lo = sub_t.get(lo_col, pd.Series(dtype=float))
-                err_hi = (hi - rho).clip(lower=0) if not hi.empty else None
-                err_lo = (rho - lo).clip(lower=0) if not lo.empty else None
-                n_arr = sub_t[n_col] if n_col in sub_t.columns else sub_t.get("n")
-                bar.add_trace(go.Bar(
-                    name=sector_pretty[tag],
-                    x=sub_t["metric"], y=rho,
-                    marker=dict(color=sector_color[tag],
-                                line=dict(color="#222", width=0.4)),
-                    error_y=dict(
-                        type="data", symmetric=False,
-                        array=err_hi, arrayminus=err_lo,
-                        thickness=1.2, width=3,
-                    ) if err_hi is not None else None,
-                    customdata=np.c_[n_arr.values] if n_arr is not None else None,
-                    hovertemplate=(
-                        f"<b>{sector_pretty[tag]}</b><br>"
-                        "metric = %{x}<br>ρ = %{y:+.3f}<br>n = %{customdata[0]}<extra></extra>"
-                    ),
-                ))
-            bar.add_hline(y=0, line=dict(color="#444", width=1, dash="dot"))
-            bar.update_layout(**_layout(
-                title=f"E16 — {pretty_scenario(scenario)}: Spearman ρ vs analytical shed, per sector",
-                barmode="group",
-                xaxis=dict(title="Metric", tickangle=-25),
-                yaxis=dict(title="Spearman ρ", range=[-1.10, 1.10],
-                           gridcolor="#e5e5e5"),
-                height=460, width=120 + 110 * max(len(order), 1),
-                legend=dict(title="Sector"),
-            ))
+    # Per-scenario per-sector grouped bar — emitted for *every* scenario so
+    # the per-sector ρ view is always available, even when the cross-grid
+    # heatmap above is also drawn. Order matches ``_scenario_order``.
+    for scenario in (pivot_shed.index if z.size else df["scenario"].unique()):
+        bar = _e16_rho_per_sector_bar(df, scenario)
+        if bar.data:
             figs.append(bar)
-            titles.append("E16 ρ vs analytical shed — per sector")
-            slugs.append("e16_rho_vs_shed_bar_per_sector")
+            titles.append(f"E16 {scenario} — ρ vs shed, per sector")
+            slugs.append(f"e16_{scenario}_rho_vs_shed_per_sector")
 
     # ρ vs shed vs ρ vs MC scatter — does shed-quality predict MC-quality?
     fig = go.Figure()

@@ -26,31 +26,55 @@ import cmres.evaluation.evaluation as ev  # noqa: E402
 
 DEFAULT_DIR = Path("data/out/single_removal_shed")
 
+# Canonical kind→colour pinning so the legend stays consistent across grids:
+# a grid without CPs (no ``compound`` / ``branch_cp`` rows) must still leave
+# the ``branch`` colour unchanged, otherwise the visual reading flips
+# between scenarios. ``_enumerate_targets`` in single_removal_shed.py emits
+# exactly these three kinds; any extension MUST add an entry here.
+KIND_COLOR_MAP = {
+    "branch":    ev.PALETTE_QUAL[0],  # plain branches (PowerLine, GasPipe, …)
+    "branch_cp": ev.PALETTE_QUAL[1],  # branch-level CPs (PowerToGas, …)
+    "compound":  ev.PALETTE_QUAL[2],  # compound CPs (CHP, PowerToHeat, …)
+}
+# Stable category order so px doesn't re-order the legend by row count.
+KIND_ORDER = ["branch", "branch_cp", "compound"]
+
 
 def _load(csv_path: Path):
     df = pd.read_csv(csv_path)
-    baseline = df[df["cp_id"] == "_baseline_"].iloc[0] if (df["cp_id"] == "_baseline_").any() else None
-    sweep = df[df["cp_id"] != "_baseline_"].copy()
-    sweep["delta_total"] = sweep["total_shed"] - (float(baseline["total_shed"]) if baseline is not None else 0.0)
-    sweep["delta_power"] = sweep["power_shed"] - (float(baseline["power_shed"]) if baseline is not None else 0.0)
-    sweep["delta_heat"] = sweep["heat_shed"] - (float(baseline["heat_shed"]) if baseline is not None else 0.0)
-    sweep["delta_gas"] = sweep["gas_shed"] - (float(baseline["gas_shed"]) if baseline is not None else 0.0)
+    # Compare cp_id as string so a numeric pandas dtype doesn't degenerate to
+    # an all-False match (and a noisy FutureWarning) on grids whose CP ids
+    # happen to look numeric.
+    cp_id_str = df["cp_id"].astype(str)
+    mask = cp_id_str == "_baseline_"
+    baseline = df[mask].iloc[0] if mask.any() else None
+    sweep = df[~mask].copy()
     return sweep, baseline
 
 
 def _hist_total(sweep: pd.DataFrame, grid: str, baseline_total: float) -> go.Figure:
+    # Restrict the legend categories to whatever is actually present, but
+    # in the canonical order — so colours stay tied to ``kind`` even on
+    # grids that have only one or two of the three kinds.
+    kinds_present = (
+        set(sweep["kind"].dropna().unique()) if "kind" in sweep.columns else set()
+    )
+    kinds_here = [k for k in KIND_ORDER if k in kinds_present]
     fig = px.histogram(
         sweep,
         x="total_shed",
         color="kind",
         nbins=60,
-        color_discrete_sequence=ev.PALETTE_QUAL,
+        color_discrete_map=KIND_COLOR_MAP,
+        category_orders={"kind": kinds_here} if kinds_here else None,
         title=f"{grid}: distribution of total shed (MW) per single-component removal",
     )
+    # Use a colour outside KIND_COLOR_MAP for the baseline reference line so
+    # it's never confused with a category.
     fig.add_vline(
         x=baseline_total,
         line_dash="dash",
-        line_color=ev.PALETTE_QUAL[3],
+        line_color="#e45756",
         annotation_text=f"baseline = {baseline_total:.3g} MW",
         annotation_position="top right",
     )
@@ -133,6 +157,13 @@ def _carrier_breakdown(sweep: pd.DataFrame, grid: str) -> go.Figure:
 
 def _kind_summary(sweep: pd.DataFrame, grid: str) -> go.Figure:
     g = sweep.groupby("kind")["total_shed"].agg(["count", "mean", "max", "sum"]).reset_index()
+    # Stable kind order on the x-axis so reading left→right is consistent
+    # across grids (a grid without compounds still leaves the remaining
+    # kinds in their canonical slot rather than collapsing left).
+    kinds_present = set(g["kind"].dropna().unique())
+    kind_order = [k for k in KIND_ORDER if k in kinds_present]
+    g["_order"] = g["kind"].map({k: i for i, k in enumerate(kind_order)})
+    g = g.sort_values("_order").drop(columns="_order")
     fig = go.Figure(data=[
         go.Bar(name="mean total_shed", x=g["kind"], y=g["mean"], marker_color=ev.PALETTE_QUAL[0]),
         go.Bar(name="max total_shed",  x=g["kind"], y=g["max"],  marker_color=ev.PALETTE_QUAL[1]),
@@ -140,7 +171,7 @@ def _kind_summary(sweep: pd.DataFrame, grid: str) -> go.Figure:
     fig.update_layout(
         barmode="group",
         title=f"{grid}: total shed by component kind (mean vs max)",
-        xaxis_title="Component kind",
+        xaxis_title="Component kind", xaxis=dict(categoryorder="array", categoryarray=kind_order),
         yaxis_title="Total shed (MW)",
         height=400, width=750,
     )

@@ -89,6 +89,16 @@ class CPMetricConfig:
     HEAT_REMOTENESS_ALPHA: float = 1.0
     HEAT_PIPE_U_W_M2_K: float = 1.5        # external heat-transfer coeff for DH pipe
 
+    # ── Exergy-aware CP edge weights ─────────────────────────────────────
+    # Used by ``compute_physical_topology_metrics_exergy_aware``. Carrier
+    # quality factors q_k follow Szargut for chemical fuels and the Carnot
+    # factor 1 − T0/Ts for thermal carriers (see
+    # ``docs/new_edge_weight_theory.tex`` for the full derivation).
+    EXERGY_T_AMBIENT_K: float = 293.0
+    EXERGY_T_HEAT_SUPPLY_K: float = 363.0   # 90°C — typical district heat
+    EXERGY_Q_EL: float = 1.0                # electricity is pure exergy
+    EXERGY_Q_GAS: float = 1.0               # cap Szargut β at 1.0 for BC use
+
     # ── Ablation flags (E2) ──────────────────────────────────────────────
     # Each ABLATE_* fixes one factor of the composite score to 1.0 so the
     # effect of removing it can be measured. The CMRES E2 ablation
@@ -1141,58 +1151,561 @@ def _heat_pipe_limit_and_flow(monee_net, pipe_or_hx_id) -> Tuple[float, float]:
 
 
 def compute_physical_topology_metrics(monee_net):
-    """
-    Returns: (G, bc, deg, debug)
-    debug includes topo_mapped_ratio so you know if weights are real or all-ones.
+    """Build the physical-topology graph and its (weighted) betweenness.
+
+    Edge weights model "resistive cost of traversing this branch" so that
+    shortest-path BC reflects how hard it is to route through the grid:
+
+      * ``GenericPowerBranch``  → reactance ``|br_x|``
+      * ``GasPipe``             → Weymouth proxy ``L / d⁵``
+      * ``WaterPipe``           → Darcy resistance (see ``_darcy_resistance``)
+      * everything else (CPs, ``GenericTransferBranch``, unresolved edges)
+        gets a placeholder
+
+    Raw cross-carrier weights span ~7 orders of magnitude (power ≈ 5e-3,
+    heat ≈ 60, gas ≈ 2e4 on the simbench LV grid), which would make almost
+    every Dijkstra shortest path stay inside the cheapest carrier and
+    starve the other carriers of BC mass. To make the carriers comparable
+    we *per-carrier-median-normalise*: ``w' = w / median(w_carrier)`` so
+    every carrier's median edge has unit cost, and the relative within-
+    carrier ordering is preserved.
+
+    CP / transfer / missing-data edges land at ``w' = 1.0`` after
+    normalisation — the same scale as the median edge of every carrier —
+    i.e. they look like "an average resistive hop" rather than the
+    unit-1 placeholder they had before (which used to be ~200× cheaper
+    than a typical power line and ~2e4× cheaper than a typical gas pipe).
     """
     G0 = monee_net._network_internal
     G = nx.Graph(G0)  # copy
 
+    # Pass 1 — classify each edge and collect raw resistive weights.
+    # ``None`` for ``raw`` means "no physical weight available; fall back to
+    # the post-normalisation median (1.0)".
+    #
+    # The monee MultiGraph stores the actual branch object on each edge as
+    # ``internal_branch``; the old code's ``branch_by_id((u, v))`` lookup
+    # silently failed for every edge on simbench grids (the lookup wants
+    # ``(u, v, key)``), which collapsed every weight to ``w = 1.0`` and
+    # negated the per-carrier resistance differentiation entirely.
+    edge_class: dict = {}  # (u, v) -> (carrier_tag, raw_weight_or_None)
     mapped = 0
     total = 0
-
     for u, v, data in G.edges(data=True):
         total += 1
-        w = 1.0
-        br = None
+        br = data.get("internal_branch", None)
 
-        # Attempt mapping in plausible ways
-        # (a) edge data might store branch_id
-        bid = data.get("branch_id", None)
-        if bid is not None:
-            try:
-                br = monee_net.branch_by_id(bid)
-            except Exception:
-                br = None
-
-        # (b) some monee graphs use the edge key itself as a branch id (original approach)
+        # Fallbacks — keep the old lookup paths as a safety net for
+        # custom Network builders that don't attach ``internal_branch``.
         if br is None:
-            try:
-                br = monee_net.branch_by_id((u, v))
-            except Exception:
-                br = None
+            bid = data.get("branch_id", None)
+            if bid is not None:
+                try:
+                    br = monee_net.branch_by_id(bid)
+                except Exception:
+                    br = None
+        if br is None:
+            for cand in ((u, v, 0), (v, u, 0), (u, v), (v, u)):
+                try:
+                    br = monee_net.branch_by_id(cand)
+                    break
+                except Exception:
+                    continue
 
+        carrier = "cp"  # CPs / GenericTransferBranch / unresolved → placeholder
+        raw: Optional[float] = None
         if br is not None:
             mapped += 1
             bm = br.model
             if isinstance(bm, mm.GenericPowerBranch):
+                carrier = "power"
                 x = abs(_val(getattr(bm, "br_x", 0.0), 0.0))
-                w = x if x > 0 else 1.0
+                raw = x if x > 0 else None
             elif isinstance(bm, mm.GasPipe):
+                carrier = "gas"
                 d = _val(getattr(bm, "diameter_m", 0.0), 0.0)
                 L = _val(getattr(bm, "length_m", 1.0), 1.0)
-                w = (L / (d**5)) if d > 0 else 1.0
+                raw = (L / (d**5)) if d > 0 else None
             elif isinstance(bm, mm.WaterPipe):
+                carrier = "heat"
                 Rm = _darcy_resistance(bm)
-                w = Rm if (Rm is not None and Rm > 0) else 1.0
+                raw = Rm if (Rm is not None and Rm > 0) else None
+            # else: classifies as ``cp`` (CPs, transfer branches, heat exchangers)
+        edge_class[(u, v)] = (carrier, raw)
 
-        G.edges[u, v]["weight"] = float(w)
+    # Pass 2 — per-carrier medians of finite raw weights. We deliberately
+    # use the median (robust to a few extreme pipe lengths) rather than the
+    # mean (which a single 5 km gas trunk pipe could blow up).
+    carrier_medians: dict = {}
+    for carrier in ("power", "gas", "heat"):
+        vals = [w for (c, w) in edge_class.values()
+                if c == carrier and w is not None and np.isfinite(w)]
+        carrier_medians[carrier] = float(np.median(vals)) if vals else 1.0
+
+    # Pass 3 — assign normalised weights.
+    #   carrier-internal edge with a finite raw weight:
+    #       w' = raw / median(carrier)
+    #   carrier-internal edge whose raw weight was missing (br_x=0, etc.):
+    #       w' = 1.0  (the post-normalisation median of every carrier)
+    #   CP / transfer / unresolved edge:
+    #       w' = 1.0  (equivalent to the resistive median; sits on the
+    #                  same scale as the surrounding carrier edges)
+    for (u, v), (carrier, raw) in edge_class.items():
+        if carrier == "cp" or raw is None:
+            w_norm = 1.0
+        else:
+            denom = carrier_medians.get(carrier, 1.0) or 1.0
+            w_norm = raw / denom
+        G.edges[u, v]["weight"] = float(w_norm)
 
     bc = nx.betweenness_centrality(G, weight="weight")
     deg = dict(G.degree())
     debug = {
         "topo_edge_count": total,
         "topo_mapped_ratio": (mapped / total) if total else 0.0,
+        "topo_carrier_medians": carrier_medians,
+    }
+    return G, bc, deg, debug
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CP-aware physical-topology metrics
+#
+# Companion to ``compute_physical_topology_metrics`` that replaces the
+# placeholder ``w_cp = 1.0`` on every coupling-point edge with the
+# dimensionally-coherent
+#
+#     w_cp_raw = (2 − η) / Φ_rated      [MW⁻¹]
+#
+# where ``η`` is the conversion efficiency and ``Φ_rated`` is the rated
+# *input* throughput in MW.  The "(2 − η)" form combines the inverse-
+# capacity cost (``1/Φ_rated``) and the exergy-loss equivalent resistance
+# ((1 − η)/Φ_rated); see the standalone derivation in
+# ``docs/cp_edge_weight_theory.tex`` for the full argument.
+#
+# The function adds ``"cp"`` as a fourth normalisation class alongside
+# ``power``, ``gas``, ``heat`` (the existing patch-C split), so CP edges
+# end up on a defensible *within-CP* ordering: a big efficient CP is
+# cheaper than a small lossy one, and the median CP sits at unit cost on
+# the BC graph.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+_CP_BRANCH_LABEL = {
+    mm.PowerToGas:    "PowerToGas",
+    mm.GasToPower:    "GasToPower",
+    mm.PowerToHeatHG: "PowerToHeatHG",
+    mm.GasToHeatHG:   "GasToHeatHG",
+}
+
+_CP_COMPOUND_LABEL = {
+    mm.CHP:         "CHP",
+    mm.CHPHG:       "CHPHG",
+    mm.PowerToHeat: "PowerToHeat",
+}
+
+
+def _cp_efficiency(model, label: str) -> float:
+    """Total conversion efficiency η ∈ (0, 1].
+
+    Cogeneration CPs (CHP, CHPHG) return the *sum* of electric + heat
+    efficiencies — the "useful output / input" ratio across all output
+    ports. Single-output CPs return their lone ``efficiency`` attribute.
+    Falls back to 0.9 for missing fields (a generous default that errs on
+    the side of treating the CP as if it were nearly lossless).
+    """
+    try:
+        if label in ("CHP", "CHPHG"):
+            ep = float(getattr(model, "efficiency_power", 0.35))
+            eh = float(getattr(model, "efficiency_heat", 0.50))
+            eta = ep + eh
+            return float(np.clip(eta, 1e-3, 1.0))
+        if label in ("PowerToHeat", "PowerToHeatHG", "GasToHeatHG",
+                     "PowerToGas", "GasToPower"):
+            eta = float(getattr(model, "efficiency", 0.9))
+            return float(np.clip(eta, 1e-3, 1.0))
+    except Exception:
+        pass
+    return 0.9
+
+
+def _cp_rated_capacity_mw(comp, label: str, monee_net) -> float:
+    """Rated input throughput in MW. Re-uses ``_cp_throughput_proxy`` (which
+    returns the *output* in pu of system base) and back-transforms to
+    *input* MW by dividing by efficiency and multiplying by sn_mva.
+    """
+    sn_mva = _system_sn_mva(monee_net) if monee_net is not None else 100.0
+    output_pu = _cp_throughput_proxy(comp, label, monee_net)  # output / sn_mva
+    eta = _cp_efficiency(comp.model, label)
+    output_mw = float(output_pu) * float(sn_mva)
+    if eta <= 0.0:
+        return max(output_mw, 1e-6)
+    return max(output_mw / eta, 1e-6)
+
+
+def _build_cp_param_map(monee_net) -> Dict[Tuple, Tuple[float, float, str]]:
+    """Pre-compute ``(η, Φ_rated, label)`` for every edge that belongs to a
+    coupling point — both branch CPs (direct edges) and the internal
+    GenericTransferBranch edges of compound CPs (CHP, CHPHG, PowerToHeat).
+
+    Returned dict is keyed by the *unordered* edge pair ``frozenset({u, v})``
+    so we don't have to care about the edge orientation in nx.Graph.
+    """
+    param_map: Dict[Tuple, Tuple[float, float, str]] = {}
+
+    # Branch CPs — direct edges, one entry each.
+    for cls, label in _CP_BRANCH_LABEL.items():
+        for br in monee_net.branches_by_type(cls):
+            try:
+                eta = _cp_efficiency(br.model, label)
+                cap = _cp_rated_capacity_mw(br, label, monee_net)
+                key = frozenset({br.from_node_id, br.to_node_id})
+                param_map[key] = (eta, cap, label)
+            except Exception:
+                continue
+
+    # Compound CPs — every internal branch (typically GenericTransferBranch
+    # connecting the control node to external nodes) inherits the compound's
+    # (η, Φ_rated). The compound's `connected_to` dict gives the external
+    # node ids per port; combined with its internal nodes this covers all
+    # internal edges in the physical graph.
+    for cls, label in _CP_COMPOUND_LABEL.items():
+        for cp in monee_net.compounds_by_type(cls):
+            try:
+                eta = _cp_efficiency(cp.model, label)
+                cap = _cp_rated_capacity_mw(cp, label, monee_net)
+            except Exception:
+                continue
+            internal_node_ids = {n.id for n in cp.component_of_type(MNode)}
+            external_ids = list((cp.connected_to or {}).values())
+            # Edge: every (internal, external) pair plus internal cliques.
+            for ext in external_ids:
+                for intn in internal_node_ids:
+                    param_map[frozenset({intn, ext})] = (eta, cap, label)
+            for a in internal_node_ids:
+                for b in internal_node_ids:
+                    if a == b:
+                        continue
+                    param_map[frozenset({a, b})] = (eta, cap, label)
+    return param_map
+
+
+def compute_physical_topology_metrics_cp_aware(monee_net):
+    """Patch-C topology + CP-aware edge weights.
+
+    Like :func:`compute_physical_topology_metrics`, but coupling-point edges
+    (branch CPs and compound-internal transfer branches) get a physically
+    grounded raw weight ``w_cp = (2 − η)/Φ_rated`` instead of the placeholder
+    ``w = 1.0``.
+
+    A new ``cp`` class joins ``power/gas/heat`` in the median-normalisation
+    step. The median CP edge ends up at unit cost just like the median of
+    every other class, but **within** the CP class big-efficient CPs are
+    cheaper to traverse than small-lossy ones, finally giving the BC the
+    capacity-sensitivity it was missing.
+    """
+    G0 = monee_net._network_internal
+    G = nx.Graph(G0)
+    cp_params = _build_cp_param_map(monee_net)
+
+    edge_class: dict = {}
+    mapped = 0
+    total = 0
+    for u, v, data in G.edges(data=True):
+        total += 1
+        br = data.get("internal_branch", None)
+        if br is None:
+            for cand in ((u, v, 0), (v, u, 0), (u, v), (v, u)):
+                try:
+                    br = monee_net.branch_by_id(cand)
+                    break
+                except Exception:
+                    continue
+
+        # 1) check CP membership first (covers branch CPs AND internal
+        #    edges of compound CPs).
+        cp_key = frozenset({u, v})
+        if cp_key in cp_params:
+            mapped += 1
+            eta, cap, _label = cp_params[cp_key]
+            raw_cp = (2.0 - eta) / max(cap, 1e-6)
+            edge_class[(u, v)] = ("cp", raw_cp)
+            continue
+
+        # 2) passive carrier branches.
+        carrier = "other"  # falls back to median = 1
+        raw: Optional[float] = None
+        if br is not None:
+            mapped += 1
+            bm = br.model
+            if isinstance(bm, mm.GenericPowerBranch):
+                carrier = "power"
+                x = abs(_val(getattr(bm, "br_x", 0.0), 0.0))
+                raw = x if x > 0 else None
+            elif isinstance(bm, mm.GasPipe):
+                carrier = "gas"
+                d = _val(getattr(bm, "diameter_m", 0.0), 0.0)
+                L = _val(getattr(bm, "length_m", 1.0), 1.0)
+                raw = (L / (d**5)) if d > 0 else None
+            elif isinstance(bm, mm.WaterPipe):
+                carrier = "heat"
+                Rm = _darcy_resistance(bm)
+                raw = Rm if (Rm is not None and Rm > 0) else None
+        edge_class[(u, v)] = (carrier, raw)
+
+    class_medians: dict = {}
+    for cls in ("power", "gas", "heat", "cp"):
+        vals = [w for (c, w) in edge_class.values()
+                if c == cls and w is not None and np.isfinite(w)]
+        class_medians[cls] = float(np.median(vals)) if vals else 1.0
+
+    for (u, v), (cls, raw) in edge_class.items():
+        if cls == "other" or raw is None:
+            w_norm = 1.0
+        else:
+            denom = class_medians.get(cls, 1.0) or 1.0
+            w_norm = raw / denom
+        G.edges[u, v]["weight"] = float(w_norm)
+
+    bc = nx.betweenness_centrality(G, weight="weight")
+    deg = dict(G.degree())
+    debug = {
+        "topo_edge_count": total,
+        "topo_mapped_ratio": (mapped / total) if total else 0.0,
+        "topo_class_medians": class_medians,
+        "topo_cp_edge_count": sum(1 for (c, _) in edge_class.values() if c == "cp"),
+    }
+    return G, bc, deg, debug
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Exergy-aware physical-topology metrics
+#
+# Companion to ``compute_physical_topology_metrics_cp_aware`` that replaces
+# the energy efficiency η with the *exergetic* efficiency η_ex per the
+# corrected derivation in ``docs/new_edge_weight_theory.tex``:
+#
+#     η_ex = (Σ_j η_j q_j) / q_in        (multi-port, energy-summed)
+#     w_cp = (2 − η_ex) / Φ_rated        [MW⁻¹]
+#
+# where q_k ∈ (0,1] is the carrier exergy quality factor:
+#   q_el  = 1            (pure exergy)
+#   q_gas = 1            (Szargut β capped at 1 for BC use)
+#   q_heat= 1 − T0/Ts    (Carnot factor; depends on the heat-grid Ts)
+#
+# This penalises low-exergy outputs (district heat) so that e.g. a gas
+# boiler — which destroys ~80 % of the input exergy despite ~92 % energy
+# efficiency — gets a noticeably higher weight than its energy-only
+# variant would suggest.  The classification, normalisation, and
+# return-value shapes are otherwise identical to the CP-aware variant.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+# Carrier of the input port and (output_carrier → energy_efficiency_attr)
+# map for the output ports.  Used by ``_cp_exergy_efficiency`` to compute
+# the per-carrier exergy contributions.
+_CP_IO_SPEC: Dict[str, Tuple[str, List[Tuple[str, str]]]] = {
+    "CHP":           ("gas", [("power", "efficiency_power"),
+                              ("heat",  "efficiency_heat")]),
+    "CHPHG":         ("gas", [("power", "efficiency_power"),
+                              ("heat",  "efficiency_heat")]),
+    "PowerToHeat":   ("power", [("heat", "efficiency")]),
+    "PowerToHeatHG": ("power", [("heat", "efficiency")]),
+    "GasToHeatHG":   ("gas",   [("heat", "efficiency_heat")]),
+    "PowerToGas":    ("power", [("gas",  "efficiency")]),
+    "GasToPower":    ("gas",   [("power", "efficiency")]),
+}
+
+
+def _carrier_quality_factor(carrier: str, monee_net, cfg: CPMetricConfig) -> float:
+    """Return q_k ∈ (0,1] for a given carrier.
+
+    Heat uses the Carnot factor 1 − T0/Ts.  Ts is read from the network's
+    WaterGrid ``t_ref`` if present (so a 70 °C system gets a different
+    factor than a 120 °C system), otherwise from
+    ``cfg.EXERGY_T_HEAT_SUPPLY_K``.
+    """
+    c = (carrier or "").lower()
+    if c in ("electricity", "el", "power"):
+        return float(cfg.EXERGY_Q_EL)
+    if c == "gas":
+        return float(cfg.EXERGY_Q_GAS)
+    if c in ("heat", "water"):
+        T0 = float(cfg.EXERGY_T_AMBIENT_K)
+        Ts = float(cfg.EXERGY_T_HEAT_SUPPLY_K)
+        if monee_net is not None:
+            try:
+                for grid in getattr(monee_net, "grids", []) or []:
+                    name = (getattr(grid, "name", "") or "").lower()
+                    if name in ("heat", "water"):
+                        tref = float(getattr(grid, "t_ref", Ts))
+                        if tref > T0:
+                            Ts = tref
+                            break
+            except Exception:
+                pass
+        if Ts <= T0:
+            return 1e-3
+        return float(np.clip(1.0 - T0 / Ts, 1e-3, 1.0))
+    return 1.0  # default to "high-quality" for unknown carriers
+
+
+def _cp_exergy_efficiency(model, label: str,
+                          monee_net, cfg: CPMetricConfig) -> float:
+    """Aggregate exergetic efficiency η_ex = (Σ η_j q_j) / q_in.
+
+    For multi-output CPs (CHP, CHPHG) the numerator sums over each output
+    port's *energy* efficiency weighted by the output carrier's quality.
+    For single-output CPs the formula reduces to η · q_out / q_in.
+    """
+    spec = _CP_IO_SPEC.get(label)
+    if spec is None:
+        return _cp_efficiency(model, label)  # fall back to energy-η
+
+    in_carrier, outputs = spec
+    q_in = _carrier_quality_factor(in_carrier, monee_net, cfg)
+    if q_in <= 0:
+        return 0.0
+
+    weighted = 0.0
+    for out_carrier, attr in outputs:
+        try:
+            eta_j = float(getattr(model, attr, 0.0))
+        except Exception:
+            eta_j = 0.0
+        eta_j = float(np.clip(eta_j, 0.0, 1.0))
+        q_out = _carrier_quality_factor(out_carrier, monee_net, cfg)
+        weighted += eta_j * q_out
+
+    eta_ex = weighted / q_in
+    # Heat pumps and other carriers where COP > 1 can push η_ex above 1;
+    # cap to 1 so the (2 − η_ex) term stays in [1, 2) per Axiom W1 of the
+    # exergy theory.
+    return float(np.clip(eta_ex, 1e-3, 1.0))
+
+
+def _build_cp_param_map_exergy(monee_net, cfg: CPMetricConfig) -> Dict[Tuple, Tuple[float, float, str]]:
+    """Same shape as ``_build_cp_param_map`` but stores η_ex (not η)."""
+    param_map: Dict[Tuple, Tuple[float, float, str]] = {}
+
+    for cls, label in _CP_BRANCH_LABEL.items():
+        for br in monee_net.branches_by_type(cls):
+            try:
+                eta_ex = _cp_exergy_efficiency(br.model, label, monee_net, cfg)
+                cap = _cp_rated_capacity_mw(br, label, monee_net)
+                key = frozenset({br.from_node_id, br.to_node_id})
+                param_map[key] = (eta_ex, cap, label)
+            except Exception:
+                continue
+
+    for cls, label in _CP_COMPOUND_LABEL.items():
+        for cp in monee_net.compounds_by_type(cls):
+            try:
+                eta_ex = _cp_exergy_efficiency(cp.model, label, monee_net, cfg)
+                cap = _cp_rated_capacity_mw(cp, label, monee_net)
+            except Exception:
+                continue
+            internal_node_ids = {n.id for n in cp.component_of_type(MNode)}
+            external_ids = list((cp.connected_to or {}).values())
+            for ext in external_ids:
+                for intn in internal_node_ids:
+                    param_map[frozenset({intn, ext})] = (eta_ex, cap, label)
+            for a in internal_node_ids:
+                for b in internal_node_ids:
+                    if a == b:
+                        continue
+                    param_map[frozenset({a, b})] = (eta_ex, cap, label)
+    return param_map
+
+
+def compute_physical_topology_metrics_exergy_aware(
+    monee_net, cfg: Optional[CPMetricConfig] = None,
+):
+    """Patch-C topology + CP weights based on the exergetic efficiency.
+
+    Identical structure to
+    :func:`compute_physical_topology_metrics_cp_aware`, but the CP raw
+    weight uses η_ex (multi-port aggregated) instead of the energy
+    efficiency η:
+
+      w_cp_raw = (2 − η_ex) / Φ_rated      [MW⁻¹]
+                 with η_ex = (Σ η_j q_j) / q_in
+
+    See ``docs/new_edge_weight_theory.tex`` for the derivation and
+    ``_carrier_quality_factor`` / ``_cp_exergy_efficiency`` for the
+    quality-factor definitions.
+    """
+    if cfg is None:
+        cfg = CPMetricConfig()
+
+    G0 = monee_net._network_internal
+    G = nx.Graph(G0)
+    cp_params = _build_cp_param_map_exergy(monee_net, cfg)
+
+    edge_class: dict = {}
+    mapped = 0
+    total = 0
+    for u, v, data in G.edges(data=True):
+        total += 1
+        br = data.get("internal_branch", None)
+        if br is None:
+            for cand in ((u, v, 0), (v, u, 0), (u, v), (v, u)):
+                try:
+                    br = monee_net.branch_by_id(cand)
+                    break
+                except Exception:
+                    continue
+
+        cp_key = frozenset({u, v})
+        if cp_key in cp_params:
+            mapped += 1
+            eta_ex, cap, _label = cp_params[cp_key]
+            raw_cp = (2.0 - eta_ex) / max(cap, 1e-6)
+            edge_class[(u, v)] = ("cp", raw_cp)
+            continue
+
+        carrier = "other"
+        raw: Optional[float] = None
+        if br is not None:
+            mapped += 1
+            bm = br.model
+            if isinstance(bm, mm.GenericPowerBranch):
+                carrier = "power"
+                x = abs(_val(getattr(bm, "br_x", 0.0), 0.0))
+                raw = x if x > 0 else None
+            elif isinstance(bm, mm.GasPipe):
+                carrier = "gas"
+                d = _val(getattr(bm, "diameter_m", 0.0), 0.0)
+                L = _val(getattr(bm, "length_m", 1.0), 1.0)
+                raw = (L / (d**5)) if d > 0 else None
+            elif isinstance(bm, mm.WaterPipe):
+                carrier = "heat"
+                Rm = _darcy_resistance(bm)
+                raw = Rm if (Rm is not None and Rm > 0) else None
+        edge_class[(u, v)] = (carrier, raw)
+
+    class_medians: dict = {}
+    for cls in ("power", "gas", "heat", "cp"):
+        vals = [w for (c, w) in edge_class.values()
+                if c == cls and w is not None and np.isfinite(w)]
+        class_medians[cls] = float(np.median(vals)) if vals else 1.0
+
+    for (u, v), (cls, raw) in edge_class.items():
+        if cls == "other" or raw is None:
+            w_norm = 1.0
+        else:
+            denom = class_medians.get(cls, 1.0) or 1.0
+            w_norm = raw / denom
+        G.edges[u, v]["weight"] = float(w_norm)
+
+    bc = nx.betweenness_centrality(G, weight="weight")
+    deg = dict(G.degree())
+    debug = {
+        "topo_edge_count": total,
+        "topo_mapped_ratio": (mapped / total) if total else 0.0,
+        "topo_class_medians": class_medians,
+        "topo_cp_edge_count": sum(1 for (c, _) in edge_class.values() if c == "cp"),
+        "exergy_q_heat": _carrier_quality_factor("heat", monee_net, cfg),
     }
     return G, bc, deg, debug
 
@@ -2043,7 +2556,21 @@ def _row_from_detail(
     reliable,
     detail,
     input_adequacy: float = 1.0,
+    # CP-aware (energy-η) variant: w_cp = (2−η)/Φ_rated.
+    topo_bc_cp_aware: float = 0.0,
+    topo_factor_cp_aware: float = 1.0,
+    score_cp_aware: Optional[float] = None,
+    # Exergy-aware variant (η_ex = (Σ η_j q_j)/q_in, see
+    # docs/new_edge_weight_theory.tex): w_cp = (2 − η_ex)/Φ_rated.
+    topo_bc_exergy: float = 0.0,
+    topo_factor_exergy: float = 1.0,
+    score_exergy: Optional[float] = None,
 ):
+    # score_cp_aware / score_exergy MUST be computed via ``_apply_ablations`` at
+    # the call site with the corresponding topo factor. Falling back to
+    # ``score * topo_new/topo_old`` was incorrect under ``ABLATE_TOPO=True``,
+    # which forces the topo factor inside ``score`` to 1.0 — the ratio rescaled
+    # by an inactive divisor.
     row = dict(
         cp_id=cp_id,
         cp_type=cp_type,
@@ -2051,8 +2578,14 @@ def _row_from_detail(
         throughput=float(throughput),
         topo_bc=float(topo_bc),
         topo_factor=float(topo_factor),
+        topo_bc_cp_aware=float(topo_bc_cp_aware),
+        topo_factor_cp_aware=float(topo_factor_cp_aware),
+        topo_bc_exergy=float(topo_bc_exergy),
+        topo_factor_exergy=float(topo_factor_exergy),
         total_stress=float(total_stress),
         score=float(score),
+        score_cp_aware=float(score_cp_aware if score_cp_aware is not None else score),
+        score_exergy=float(score_exergy if score_exergy is not None else score),
         reliable=bool(reliable),
         input_adequacy=float(input_adequacy),
     )
@@ -2074,8 +2607,20 @@ def _row_from_detail(
 def mes_cp_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig()):
     fail_prob = cfg.CP_FAIL_PROB or DEFAULT_FAIL_PROB
 
-    # topology
+    # topology — three variants, all emitted in parallel so downstream eval
+    # can A/B/C-compare them. See docs/cp_edge_weight_theory.tex (CMRES-v1)
+    # and docs/new_edge_weight_theory.tex (corrected exergy-aware) for the
+    # derivations.
+    #   topo_*           : placeholder w_cp=1, per-carrier median norm
+    #   topo_*_cp_aware  : energy-η, w_cp = (2−η)/Φ_rated
+    #   topo_*_exergy    : exergy-η, w_cp = (2−η_ex)/Φ_rated
     G_phys, bc_individual, deg, topo_dbg = compute_physical_topology_metrics(monee_net)
+    G_phys_cpa, bc_individual_cpa, _, topo_dbg_cpa = (
+        compute_physical_topology_metrics_cp_aware(monee_net)
+    )
+    G_phys_ex, bc_individual_ex, _, topo_dbg_ex = (
+        compute_physical_topology_metrics_exergy_aware(monee_net, cfg)
+    )
 
     # PTDF contexts
     ctx = CarrierPTDFContext(cfg)
@@ -2110,6 +2655,10 @@ def mes_cp_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig()):
 
             bc_group = _group_bc(G_phys, cp)
             topo_factor = (1.0 + cfg.TOPO_ALPHA * float(bc_group))
+            bc_group_cpa = _group_bc(G_phys_cpa, cp)
+            topo_factor_cpa = (1.0 + cfg.TOPO_ALPHA * float(bc_group_cpa))
+            bc_group_ex = _group_bc(G_phys_ex, cp)
+            topo_factor_ex = (1.0 + cfg.TOPO_ALPHA * float(bc_group_ex))
 
             carrier_detail = {}
             total_stress = 0.0
@@ -2174,6 +2723,12 @@ def mes_cp_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig()):
             score = _apply_ablations(
                 cfg, throughput, total_stress, topo_factor, input_adequacy, is_cp=True
             )
+            score_cpa = _apply_ablations(
+                cfg, throughput, total_stress, topo_factor_cpa, input_adequacy, is_cp=True
+            )
+            score_ex = _apply_ablations(
+                cfg, throughput, total_stress, topo_factor_ex, input_adequacy, is_cp=True
+            )
 
             rows.append(
                 _row_from_detail(
@@ -2183,8 +2738,14 @@ def mes_cp_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig()):
                     throughput=throughput,
                     topo_bc=bc_group,
                     topo_factor=topo_factor,
+                    topo_bc_cp_aware=bc_group_cpa,
+                    topo_factor_cp_aware=topo_factor_cpa,
+                    topo_bc_exergy=bc_group_ex,
+                    topo_factor_exergy=topo_factor_ex,
                     total_stress=total_stress,
                     score=score,
+                    score_cp_aware=score_cpa,
+                    score_exergy=score_ex,
                     reliable=reliable_all,
                     detail=carrier_detail,
                     input_adequacy=input_adequacy,
@@ -2221,6 +2782,24 @@ def mes_cp_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig()):
                 )
             )
             topo_factor = (1.0 + cfg.TOPO_ALPHA * bc_avg)
+            bc_avg_cpa = float(
+                np.mean(
+                    [
+                        bc_individual_cpa.get(n, 0.0)
+                        for n in (br.from_node_id, br.to_node_id)
+                    ]
+                )
+            )
+            topo_factor_cpa = (1.0 + cfg.TOPO_ALPHA * bc_avg_cpa)
+            bc_avg_ex = float(
+                np.mean(
+                    [
+                        bc_individual_ex.get(n, 0.0)
+                        for n in (br.from_node_id, br.to_node_id)
+                    ]
+                )
+            )
+            topo_factor_ex = (1.0 + cfg.TOPO_ALPHA * bc_avg_ex)
 
             carrier_detail = {}
             total_stress = 0.0
@@ -2282,6 +2861,12 @@ def mes_cp_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig()):
             score = _apply_ablations(
                 cfg, throughput, total_stress, topo_factor, input_adequacy, is_cp=True
             )
+            score_cpa = _apply_ablations(
+                cfg, throughput, total_stress, topo_factor_cpa, input_adequacy, is_cp=True
+            )
+            score_ex = _apply_ablations(
+                cfg, throughput, total_stress, topo_factor_ex, input_adequacy, is_cp=True
+            )
 
             rows.append(
                 _row_from_detail(
@@ -2291,8 +2876,14 @@ def mes_cp_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig()):
                     throughput=throughput,
                     topo_bc=bc_avg,
                     topo_factor=topo_factor,
+                    topo_bc_cp_aware=bc_avg_cpa,
+                    topo_factor_cp_aware=topo_factor_cpa,
+                    topo_bc_exergy=bc_avg_ex,
+                    topo_factor_exergy=topo_factor_ex,
                     total_stress=total_stress,
                     score=score,
+                    score_cp_aware=score_cpa,
+                    score_exergy=score_ex,
                     reliable=reliable_all,
                     detail=carrier_detail,
                     input_adequacy=input_adequacy,
@@ -2314,6 +2905,8 @@ def mes_cp_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig()):
             cp_id="", cp_type="", p_fail=0.0, throughput=0.0,
             topo_bc=0.0, topo_factor=0.0, total_stress=0.0,
             score=0.0, reliable=False, detail={}, input_adequacy=1.0,
+            topo_bc_cp_aware=0.0, topo_factor_cp_aware=1.0, score_cp_aware=0.0,
+            topo_bc_exergy=0.0, topo_factor_exergy=1.0, score_exergy=0.0,
         )
         df_scores = pd.DataFrame(columns=list(empty_row.keys()))
 
@@ -2330,6 +2923,8 @@ def mes_cp_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig()):
         d = ctx.debug.get(carrier, {})
         debug_rows.append({"carrier": carrier, **d})
     debug_rows.append({"carrier": "topology", **topo_dbg})
+    debug_rows.append({"carrier": "topology_cp_aware", **topo_dbg_cpa})
+    debug_rows.append({"carrier": "topology_exergy", **topo_dbg_ex})
     for carrier, d in input_adequacy_dbg.items():
         debug_rows.append({"carrier": f"input_adequacy_{carrier}", **d})
 
@@ -2397,7 +2992,7 @@ def mes_all_components_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig())
     Score ALL active grid branches (CP and non-CP) using the LODF approximation.
 
     CPs (CHP, PowerToHeat, GasToPower, PowerToGas) are scored as in
-    mes_cp_metric_bulletproof().  Non-CP branches (PowerLine/GenericPowerBranch,
+    mes_cp_metric().  Non-CP branches (PowerLine/GenericPowerBranch,
     GasPipe, WaterPipe, HeatExchanger) use the PTDF difference approximation
     ptdf_from - ptdf_to as a proxy for the line-outage distribution factor.
 
@@ -2419,9 +3014,15 @@ def mes_all_components_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig())
     df_cp = df_cp.copy()
     df_cp["is_cp"] = True
 
-    # Build shared context (already built internally by mes_cp_metric_bulletproof,
-    # but we need a fresh one here so we can access it).
+    # Build shared context (already built internally by mes_cp_metric, but we
+    # need a fresh one here so we can access it).
     G_phys, bc_individual, _deg, _topo_dbg = compute_physical_topology_metrics(monee_net)
+    G_phys_cpa, bc_individual_cpa, _, _topo_dbg_cpa = (
+        compute_physical_topology_metrics_cp_aware(monee_net)
+    )
+    G_phys_ex, bc_individual_ex, _, _topo_dbg_ex = (
+        compute_physical_topology_metrics_exergy_aware(monee_net, cfg)
+    )
     ctx = CarrierPTDFContext(cfg)
     ctx.power_prebuild(monee_net)
     ctx.gas_prebuild(monee_net)
@@ -2455,6 +3056,16 @@ def mes_all_components_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig())
             bc_individual.get(br.to_node_id, 0.0),
         ]))
         topo_factor = (1.0 + cfg.TOPO_ALPHA * bc_avg)
+        bc_avg_cpa = float(np.mean([
+            bc_individual_cpa.get(br.from_node_id, 0.0),
+            bc_individual_cpa.get(br.to_node_id, 0.0),
+        ]))
+        topo_factor_cpa = (1.0 + cfg.TOPO_ALPHA * bc_avg_cpa)
+        bc_avg_ex = float(np.mean([
+            bc_individual_ex.get(br.from_node_id, 0.0),
+            bc_individual_ex.get(br.to_node_id, 0.0),
+        ]))
+        topo_factor_ex = (1.0 + cfg.TOPO_ALPHA * bc_avg_ex)
 
         mean_s, max_s, agg_s, reliable = _branch_lodf_stress(
             monee_net, ctx, "power", br.from_node_id, br.to_node_id, cfg
@@ -2462,6 +3073,12 @@ def mes_all_components_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig())
         total_stress = cfg.W_POWER * agg_s
         score = _apply_ablations(
             cfg, throughput, total_stress, topo_factor, 1.0, is_cp=False
+        )
+        score_cpa = _apply_ablations(
+            cfg, throughput, total_stress, topo_factor_cpa, 1.0, is_cp=False
+        )
+        score_ex = _apply_ablations(
+            cfg, throughput, total_stress, topo_factor_ex, 1.0, is_cp=False
         )
 
         row = dict(
@@ -2472,8 +3089,14 @@ def mes_all_components_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig())
             throughput=throughput,
             topo_bc=bc_avg,
             topo_factor=topo_factor,
+            topo_bc_cp_aware=bc_avg_cpa,
+            topo_factor_cp_aware=topo_factor_cpa,
+            topo_bc_exergy=bc_avg_ex,
+            topo_factor_exergy=topo_factor_ex,
             total_stress=total_stress,
             score=score,
+            score_cp_aware=score_cpa,
+            score_exergy=score_ex,
             reliable=reliable,
             power_node_id=br.from_node_id,
             power_reliable=reliable,
@@ -2507,6 +3130,16 @@ def mes_all_components_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig())
             bc_individual.get(br.to_node_id, 0.0),
         ]))
         topo_factor = (1.0 + cfg.TOPO_ALPHA * bc_avg)
+        bc_avg_cpa = float(np.mean([
+            bc_individual_cpa.get(br.from_node_id, 0.0),
+            bc_individual_cpa.get(br.to_node_id, 0.0),
+        ]))
+        topo_factor_cpa = (1.0 + cfg.TOPO_ALPHA * bc_avg_cpa)
+        bc_avg_ex = float(np.mean([
+            bc_individual_ex.get(br.from_node_id, 0.0),
+            bc_individual_ex.get(br.to_node_id, 0.0),
+        ]))
+        topo_factor_ex = (1.0 + cfg.TOPO_ALPHA * bc_avg_ex)
 
         mean_s, max_s, agg_s, reliable = _branch_lodf_stress(
             monee_net, ctx, "gas", br.from_node_id, br.to_node_id, cfg
@@ -2514,6 +3147,12 @@ def mes_all_components_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig())
         total_stress = cfg.W_GAS * agg_s
         score = _apply_ablations(
             cfg, throughput, total_stress, topo_factor, 1.0, is_cp=False
+        )
+        score_cpa = _apply_ablations(
+            cfg, throughput, total_stress, topo_factor_cpa, 1.0, is_cp=False
+        )
+        score_ex = _apply_ablations(
+            cfg, throughput, total_stress, topo_factor_ex, 1.0, is_cp=False
         )
 
         row = dict(
@@ -2524,8 +3163,14 @@ def mes_all_components_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig())
             throughput=throughput,
             topo_bc=bc_avg,
             topo_factor=topo_factor,
+            topo_bc_cp_aware=bc_avg_cpa,
+            topo_factor_cp_aware=topo_factor_cpa,
+            topo_bc_exergy=bc_avg_ex,
+            topo_factor_exergy=topo_factor_ex,
             total_stress=total_stress,
             score=score,
+            score_cp_aware=score_cpa,
+            score_exergy=score_ex,
             reliable=reliable,
             power_node_id=None, power_reliable=None,
             power_stress_mean=0.0, power_stress_max=0.0, power_stress=0.0,
@@ -2562,6 +3207,16 @@ def mes_all_components_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig())
             bc_individual.get(br.to_node_id, 0.0),
         ]))
         topo_factor = (1.0 + cfg.TOPO_ALPHA * bc_avg)
+        bc_avg_cpa = float(np.mean([
+            bc_individual_cpa.get(br.from_node_id, 0.0),
+            bc_individual_cpa.get(br.to_node_id, 0.0),
+        ]))
+        topo_factor_cpa = (1.0 + cfg.TOPO_ALPHA * bc_avg_cpa)
+        bc_avg_ex = float(np.mean([
+            bc_individual_ex.get(br.from_node_id, 0.0),
+            bc_individual_ex.get(br.to_node_id, 0.0),
+        ]))
+        topo_factor_ex = (1.0 + cfg.TOPO_ALPHA * bc_avg_ex)
 
         mean_s, max_s, agg_s, reliable = _branch_lodf_stress(
             monee_net, ctx, "heat", br.from_node_id, br.to_node_id, cfg
@@ -2576,6 +3231,12 @@ def mes_all_components_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig())
         score = _apply_ablations(
             cfg, throughput, total_stress, topo_factor, 1.0, is_cp=False
         )
+        score_cpa = _apply_ablations(
+            cfg, throughput, total_stress, topo_factor_cpa, 1.0, is_cp=False
+        )
+        score_ex = _apply_ablations(
+            cfg, throughput, total_stress, topo_factor_ex, 1.0, is_cp=False
+        )
 
         row = dict(
             cp_id=str(pipe_id),
@@ -2585,8 +3246,14 @@ def mes_all_components_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig())
             throughput=throughput,
             topo_bc=bc_avg,
             topo_factor=topo_factor,
+            topo_bc_cp_aware=bc_avg_cpa,
+            topo_factor_cp_aware=topo_factor_cpa,
+            topo_bc_exergy=bc_avg_ex,
+            topo_factor_exergy=topo_factor_ex,
             total_stress=total_stress,
             score=score,
+            score_cp_aware=score_cpa,
+            score_exergy=score_ex,
             reliable=reliable,
             power_node_id=None, power_reliable=None,
             power_stress_mean=0.0, power_stress_max=0.0, power_stress=0.0,
@@ -2601,11 +3268,14 @@ def mes_all_components_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig())
         )
         rows_non_cp.append(row)
 
+    # ``df_cp`` already carries the ``is_cp`` column (added above), so the
+    # empty-non-CP fallback must NOT re-append it — otherwise the resulting
+    # frame has two ``is_cp`` columns and downstream ``concat`` produces
+    # ambiguous selections.
     df_non_cp = pd.DataFrame(rows_non_cp) if rows_non_cp else pd.DataFrame(
-        columns=list(df_cp.columns) + ["is_cp"]
+        columns=list(df_cp.columns)
     )
 
-    # Ensure df_cp has same columns as df_non_cp (add is_cp already done above)
     df_all = pd.concat([df_cp, df_non_cp], ignore_index=True, sort=False)
     df_all = df_all.sort_values("score", ascending=False).reset_index(drop=True)
 
@@ -2626,16 +3296,35 @@ def mes_all_components_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig())
     #   n_critical_nbrs   → how many neighbours are stranded if I fail
     #   carrier_coupling  → how many domains my failure disrupts simultaneously
 
-    # Pre-build graph adjacency for 1-hop neighbour degree lookups
+    # Pre-build graph adjacency for 1-hop neighbour degree lookups. ``_deg``
+    # (from ``compute_physical_topology_metrics`` above) is the degree dict on
+    # the same node set, so we reuse it for the critical-neighbour count.
     G_local = nx.Graph(monee_net._network_internal)
 
     def _connected_node_ids(row):
-        """All network node IDs directly connected to this component."""
+        """All endpoint network node IDs for this component.
+
+        For CPs we read the ``*_node_id`` columns directly; for non-CP branches
+        we additionally parse ``cp_id`` (a stringified ``(u, v, k)`` tuple) and
+        add the second endpoint, because the row only stores ``from_node_id``
+        on its single carrier column. Without this, centrality scores are
+        asymmetric and miss one endpoint.
+        """
         nids = []
         for col in ("power_node_id", "gas_node_id", "heat_node_id"):
             nid = row.get(col)
-            if nid is not None:
+            if nid is not None and nid == nid and nid not in nids:
                 nids.append(nid)
+        if not bool(row.get("is_cp", False)):
+            try:
+                import ast
+                tup = ast.literal_eval(str(row.get("cp_id", "")))
+                br = monee_net.branch_by_id(tup)
+                for nid in (br.from_node_id, br.to_node_id):
+                    if nid not in nids:
+                        nids.append(nid)
+            except Exception:
+                pass
         if not nids:
             cp_type = row.get("cp_type", "")
             cp_id = row.get("cp_id")
@@ -2648,15 +3337,21 @@ def mes_all_components_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig())
         return nids
 
     def _n_critical_nbrs(row):
-        """Count of 1-hop neighbours whose degree is ≤ 2 (critically dependent)."""
+        """Count of distinct 1-hop neighbours whose degree is ≤ 2 (critically
+        dependent). We deduplicate across endpoints so a branch (u, v) whose
+        two endpoints share neighbours doesn't double-count them.
+        """
         nids = [n for n in _connected_node_ids(row)
                 if n is not None and n == n and G_local.has_node(n)]
-        count = 0
+        endpoint_set = set(nids)
+        critical_nbrs = set()
         for nid in nids:
             for nbr in G_local.neighbors(nid):
-                if nbr != nid and _deg.get(nbr, 1) <= 2:
-                    count += 1
-        return float(count)
+                if nbr in endpoint_set:
+                    continue
+                if _deg.get(nbr, 1) <= 2:
+                    critical_nbrs.add(nbr)
+        return float(len(critical_nbrs))
 
     def _carrier_coupling(row):
         """Number of distinct energy carriers this component connects (1–3)."""
@@ -2739,32 +3434,10 @@ def mes_all_components_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig())
         katz_individual = {n: 0.0 for n in G_phys.nodes()}
 
     def _katz_for_row(row):
-        cp_type = row.get("cp_type", "")
-        cp_id = row.get("cp_id")
-
-        cp_cls = _COMPOUND_CP_CLASSES.get(cp_type)
-        if cp_cls is not None:
-            for cp in monee_net.compounds_by_type(cp_cls):
-                if cp.id == cp_id:
-                    vals = [katz_individual.get(nid, 0.0)
-                            for nid in cp.connected_to.values()]
-                    return float(np.mean(vals)) if vals else 0.0
-            return 0.0
-
-        node_ids = [row.get(col) for col in ("power_node_id", "gas_node_id", "heat_node_id")]
-        node_ids = [n for n in node_ids if n is not None and n == n]
+        node_ids = _connected_node_ids(row)
         if node_ids:
             return float(np.mean([katz_individual.get(n, 0.0) for n in node_ids]))
-
-        # Branch CPs: cp_id = "from→to"
-        try:
-            from_id, to_id = str(cp_id).split("→")
-            return float(np.mean([
-                katz_individual.get(from_id.strip(), 0.0),
-                katz_individual.get(to_id.strip(), 0.0),
-            ]))
-        except Exception:
-            return 0.0
+        return 0.0
 
     df_all["katz_score"] = df_all.apply(_katz_for_row, axis=1)
 
@@ -2790,31 +3463,10 @@ def mes_all_components_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig())
         vitality_individual = {n: 0.0 for n in G_phys.nodes()}
 
     def _vitality_for_row(row):
-        cp_type = row.get("cp_type", "")
-        cp_id = row.get("cp_id")
-
-        cp_cls = _COMPOUND_CP_CLASSES.get(cp_type)
-        if cp_cls is not None:
-            for cp in monee_net.compounds_by_type(cp_cls):
-                if cp.id == cp_id:
-                    vals = [vitality_individual.get(nid, 0.0)
-                            for nid in cp.connected_to.values()]
-                    return float(np.mean(vals)) if vals else 0.0
-            return 0.0
-
-        node_ids = [row.get(col) for col in ("power_node_id", "gas_node_id", "heat_node_id")]
-        node_ids = [n for n in node_ids if n is not None and n == n]
+        node_ids = _connected_node_ids(row)
         if node_ids:
             return float(np.mean([vitality_individual.get(n, 0.0) for n in node_ids]))
-
-        try:
-            from_id, to_id = str(cp_id).split("→")
-            return float(np.mean([
-                vitality_individual.get(from_id.strip(), 0.0),
-                vitality_individual.get(to_id.strip(), 0.0),
-            ]))
-        except Exception:
-            return 0.0
+        return 0.0
 
     df_all["vitality_score"] = df_all.apply(_vitality_for_row, axis=1)
 
@@ -2837,30 +3489,34 @@ def mes_all_components_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig())
                         return float(_group_bc(_G_stress, cp, weight="stress_weight"))
                 return 0.0
 
-            # For all branch types, average the endpoint node BCs
-            node_ids = []
-            for col in ("power_node_id", "gas_node_id", "heat_node_id"):
-                nid = row.get(col)
-                if nid is not None:
-                    node_ids.append(stress_bc_nodes.get(nid, 0.0))
-            if node_ids:
-                return float(np.mean(node_ids))
-
-            # Fallback: try to parse cp_id as edge tuple (non-CP branches)
-            try:
-                import ast
-                tup = ast.literal_eval(str(cp_id))
-                br = monee_net.branch_by_id(tup)
-                return float(np.mean([
-                    stress_bc_nodes.get(br.from_node_id, 0.0),
-                    stress_bc_nodes.get(br.to_node_id, 0.0),
-                ]))
-            except Exception:
-                return 0.0
+            # All other rows (branch CPs, non-CP branches): average BC over
+            # the resolved endpoint set, which now includes both endpoints of
+            # non-CP branches via cp_id parsing.
+            nids = _connected_node_ids(row)
+            if nids:
+                return float(np.mean([stress_bc_nodes.get(n, 0.0) for n in nids]))
+            return 0.0
 
         df_all["stress_bc"] = df_all.apply(_stress_bc_for_row, axis=1)
         df_all["stress_topo_factor"] = 1.0 + cfg.TOPO_ALPHA * df_all["stress_bc"]
-        df_all["stress_score"] = df_all["score"] / df_all["topo_factor"].replace(0, np.nan) * df_all["stress_topo_factor"]
+
+        # Recompose stress_score via the same ablation-aware path used for
+        # ``score`` instead of rescaling ``score`` by the topo-factor ratio.
+        # The latter silently produced ``stress_topo_factor / topo_factor``
+        # when ``ABLATE_TOPO=True`` (because the topo factor inside ``score``
+        # is forced to 1.0 there), instead of the intended stress topo factor.
+        def _stress_score_for_row(row):
+            is_cp = bool(row.get("is_cp", False))
+            return _apply_ablations(
+                cfg,
+                float(row.get("throughput", 1.0)),
+                   float(row.get("total_stress", 0.0)),
+                float(row.get("stress_topo_factor", 1.0)),
+                float(row.get("input_adequacy", 1.0)),
+                is_cp=is_cp,
+            )
+
+        df_all["stress_score"] = df_all.apply(_stress_score_for_row, axis=1)
     except Exception as e:
         df_all["stress_bc"] = 0.0
         df_all["stress_topo_factor"] = 1.0
@@ -2892,9 +3548,374 @@ def mes_all_components_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig())
         )
         print(f"[warn] first few offending rows:\n{bad_rows.head(8).to_string(index=False)}")
 
+    # ── Balanced composite (S1+C1+C2+C3) ──────────────────────────────────
+    # Adds a parallel ``predicted_score_balanced`` column that applies four
+    # corrections on top of the existing composite. See
+    # ``attach_balanced_score`` for the formulas. The original
+    # ``predicted_score`` is preserved unchanged for A/B comparison.
+    df_all = attach_balanced_score(df_all, monee_net, cfg)
+
+    # ── Per-carrier atomic predictors (option 3) ─────────────────────────
+    # The single composite ``predicted_score`` necessarily competes with
+    # itself across carriers (S1 helped gas but hurt heat in the ablation
+    # diagnostics). Emit one prediction per carrier so each can be ranked
+    # against its own per-carrier shed without cross-carrier mixing.
+    df_all = attach_per_carrier_scores(df_all, cfg)
+
     if cfg.RETURN_DEBUG:
         return df_all, df_debug
     return df_all
+
+
+# =============================================================================
+# Per-carrier atomic predictors (option 3 — separate predictions per sector)
+# =============================================================================
+
+
+def attach_per_carrier_scores(
+    df: pd.DataFrame, cfg: CPMetricConfig,
+) -> pd.DataFrame:
+    """Emit one carrier-specific score per row.
+
+    Each ``predicted_<carrier>`` is the carrier's own contribution to the
+    composite ``predicted_score`` — i.e. ``throughput × W_carrier ×
+    stress_carrier × topo_factor × input_adequacy``, exactly the per-carrier
+    slice of the existing composite. By construction:
+
+      * For a non-CP branch the score is non-zero only on its own carrier
+        (the other carriers' stress columns are 0).
+      * For a coupling point all carriers it touches receive a positive
+        score; the others stay 0.
+      * Summing the three ``predicted_<carrier>`` values reproduces the
+        original ``score`` column (modulo ablation-flag scalings).
+
+    Three additional column families are emitted in parallel using the
+    CP-aware, exergy and balanced topology/multiplier stacks so callers
+    can choose which weighting to evaluate per carrier:
+
+      * ``predicted_<carrier>_cp_aware`` — uses ``topo_factor_cp_aware``.
+      * ``predicted_<carrier>_exergy``   — uses ``topo_factor_exergy``.
+      * ``predicted_<carrier>_balanced`` — applies S1 stress normalisation
+        plus the C1/C2/C3 multipliers (per-carrier this time, so cross-
+        carrier mixing no longer destroys within-carrier signal).
+    """
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+
+    n = len(out)
+    thr = out.get("throughput", pd.Series(np.ones(n))).astype(float)
+    adq = out.get("input_adequacy", pd.Series(np.ones(n))).astype(float)
+    topo = out.get("topo_factor", pd.Series(np.ones(n))).astype(float)
+    topo_cpa = out.get("topo_factor_cp_aware", topo).astype(float)
+    topo_ex = out.get("topo_factor_exergy", topo).astype(float)
+    ext = out.get("ext_headroom_mult", pd.Series(np.ones(n))).astype(float)
+    dem = out.get("demand_coupling_mult", pd.Series(np.ones(n))).astype(float)
+    sub = out.get("substitutability_mult", pd.Series(np.ones(n))).astype(float)
+
+    carrier_weights = {
+        "power": float(cfg.W_POWER),
+        "gas":   float(cfg.W_GAS),
+        "heat":  float(cfg.W_HEAT),
+    }
+
+    # Per-carrier S1 medians (across rows with non-zero stress on that carrier).
+    medians: Dict[str, float] = {}
+    for carrier in ("power", "gas", "heat"):
+        col = f"{carrier}_stress"
+        if col not in out.columns:
+            medians[carrier] = 1.0
+            continue
+        v = out[col].astype(float)
+        v_pos = v[v > 0]
+        medians[carrier] = float(v_pos.median()) if len(v_pos) else 1.0
+
+    zero = np.zeros(n, dtype=float)
+    for carrier, w in carrier_weights.items():
+        stress_col = f"{carrier}_stress"
+        if stress_col not in out.columns:
+            out[f"predicted_{carrier}"] = zero.copy()
+            out[f"predicted_{carrier}_cp_aware"] = zero.copy()
+            out[f"predicted_{carrier}_exergy"] = zero.copy()
+            out[f"predicted_{carrier}_balanced"] = zero.copy()
+            continue
+        stress = out[stress_col].astype(float)
+        denom = max(medians[carrier], 1e-12)
+        stress_norm = stress / denom
+
+        base = (thr * w * stress * adq).values
+        out[f"predicted_{carrier}"] = base * topo.values
+        out[f"predicted_{carrier}_cp_aware"] = base * topo_cpa.values
+        out[f"predicted_{carrier}_exergy"] = base * topo_ex.values
+        # Balanced per-carrier predictor: S1 (median norm) + C1/C2/C3 mults.
+        # Stays inside the carrier so cross-carrier mixing can't destroy
+        # within-carrier signal (unlike the composite ``predicted_score
+        # _balanced``).
+        out[f"predicted_{carrier}_balanced"] = (
+            thr * w * stress_norm * adq * topo
+            * ext * dem * sub
+        ).values
+
+    return out
+
+
+# =============================================================================
+# Balanced composite — S1 + C1 + C2 + C3 fixes
+# =============================================================================
+
+
+def _ext_capacity_per_carrier_mw(monee_net) -> Dict[str, float]:
+    """Return ``{carrier → max |ext-grid throughput| in MW}``.
+
+    Sums absolute upper/lower bounds across every ExtPowerGrid / ExtHydrGrid
+    on each carrier. Falls back to 0 when a grid lacks a finite bound (which
+    we read as "unbounded → don't credit it as headroom"; conservative).
+    """
+    cap: Dict[str, float] = {"power": 0.0, "gas": 0.0, "heat": 0.0}
+
+    def _bound_mag(var):
+        try:
+            lo = mm.lower(var) if hasattr(var, "min") else None
+            hi = mm.upper(var) if hasattr(var, "max") else None
+            lo = float(lo) if (lo is not None and np.isfinite(lo)) else 0.0
+            hi = float(hi) if (hi is not None and np.isfinite(hi)) else 0.0
+            return max(abs(lo), abs(hi))
+        except Exception:
+            return 0.0
+
+    # ExtPowerGrid → power, p_mw [MW] directly.
+    try:
+        for c in monee_net.childs_by_type(mm.ExtPowerGrid):
+            cap["power"] += _bound_mag(c.model.p_mw)
+    except Exception:
+        pass
+
+    # ExtHydrGrid → either gas (kg/s × HHV × 3.6 → MW) or heat (water grid).
+    try:
+        for c in monee_net.childs_by_type(mm.ExtHydrGrid):
+            grid = getattr(c, "grid", None)
+            if grid is None:
+                continue
+            mag = _bound_mag(c.model.mass_flow)
+            if hasattr(grid, "higher_heating_value"):
+                cap["gas"] += mag * 3.6 * float(grid.higher_heating_value)
+            else:
+                # Heat slack: convert ṁ to MW via cp · ΔT, using cfg-style
+                # defaults so we don't need a config object here.
+                cp_water = 4186.0          # J/(kg·K)
+                dT = 30.0                  # K (typical supply-return)
+                cap["heat"] += mag * cp_water * dT / 1e6
+    except Exception:
+        pass
+    return cap
+
+
+def _total_demand_per_carrier_mw(monee_net) -> Dict[str, float]:
+    """Return ``{carrier → total active load in MW}`` (mirrors the per-
+    carrier accounting of ``CascadingModel._max_load_shedding``)."""
+    passive_hx = getattr(mm, "PassiveHeatExchangerLoad", mm.HeatExchangerLoad)
+    power = 0.0
+    heat = 0.0
+    gas = 0.0
+    for c in monee_net.childs:
+        m = c.model
+        if not getattr(c, "active", True) or getattr(c, "ignored", False):
+            continue
+        try:
+            if isinstance(m, mm.PowerLoad):
+                power += float(mm.upper(m.p_mw) or 0.0)
+            elif isinstance(m, mm.HeatLoad):
+                heat += float(mm.upper(m.q_mw_heat) or 0.0)
+            elif isinstance(m, (mm.HeatExchangerLoad, passive_hx)):
+                heat += float(mm.upper(m.q_mw) or 0.0)
+            elif isinstance(m, mm.Sink):
+                grid = getattr(c, "grid", None)
+                if grid is not None and hasattr(grid, "higher_heating_value"):
+                    gas += float(mm.upper(m.mass_flow) or 0.0) * 3.6 \
+                        * float(grid.higher_heating_value)
+        except Exception:
+            continue
+    for b in monee_net.branches:
+        m = b.model
+        if not getattr(b, "active", True) or getattr(b, "ignored", False):
+            continue
+        if isinstance(m, (mm.HeatExchangerLoad, passive_hx)):
+            try:
+                heat += float(mm.upper(m.q_mw) or 0.0)
+            except Exception:
+                continue
+    return {"power": power, "heat": heat, "gas": gas}
+
+
+def _per_carrier_throughput_mw(row, monee_net) -> Dict[str, float]:
+    """Best-effort MW throughput per carrier this component is on."""
+    out: Dict[str, float] = {}
+    try:
+        cp_type = str(row.get("cp_type", ""))
+        sn_mva = _system_sn_mva(monee_net)
+        # CP rows store the throughput proxy in pu of sn_mva; back-transform.
+        thr_pu = float(row.get("throughput", 0.0))
+        if cp_type in _CP_IO_SPEC:
+            mw_total = thr_pu * sn_mva
+            in_carrier, outputs = _CP_IO_SPEC[cp_type]
+            out[in_carrier] = max(out.get(in_carrier, 0.0), mw_total)
+            for out_carrier, _attr in outputs:
+                out[out_carrier] = max(out.get(out_carrier, 0.0), mw_total)
+            return out
+        # Non-CP rows: use loading × limit on the single carrier.
+        if cp_type == "PowerLine":
+            out["power"] = thr_pu * sn_mva
+        elif cp_type == "GasPipe":
+            out["gas"] = thr_pu * sn_mva
+        elif cp_type in ("WaterPipe", "HeatExchanger"):
+            out["heat"] = thr_pu * sn_mva
+    except Exception:
+        pass
+    return out
+
+
+def attach_balanced_score(
+    df: pd.DataFrame, monee_net, cfg: CPMetricConfig,
+) -> pd.DataFrame:
+    """Compose ``predicted_score_balanced`` from four corrections:
+
+    * **S1** — per-carrier stress median normalisation. Each row's
+      per-carrier stress (``power_stress`` / ``gas_stress`` /
+      ``heat_stress``) is divided by the median of that carrier's
+      non-zero stresses across all components, putting the three
+      carriers on a comparable [0, ~few] scale before the W-weighting
+      is reapplied.
+    * **C1** — ext-grid headroom multiplier. Components on carriers
+      where the ext grid can absorb their full throughput get
+      down-weighted; under-covered carriers stay full-weight. Stored
+      in ``ext_headroom_mult`` ∈ [0.05, 1].
+    * **C2** — demand-coupling multiplier. Components are weighted by
+      the share of total system demand carried by their carrier(s),
+      capturing "this carrier matters more for shed than that one".
+      Stored in ``demand_coupling_mult`` ∈ (0, 1].
+    * **C3** — substitutability multiplier. Uses
+      ``cp_metric_structural.compute_cp_substitutability`` so a CP
+      that holds 100 % of its type's capacity stays full-weight while
+      a CP that's one of N equal alternatives is reduced toward 1/N.
+      Non-CP rows default to 1.0. Stored in ``substitutability_mult``.
+
+    Composite::
+
+        total_stress_balanced
+            = W_p · power_stress/median(power_stress)
+            + W_g · gas_stress  /median(gas_stress)
+            + W_h · heat_stress /median(heat_stress)
+        predicted_score_balanced
+            = throughput · total_stress_balanced
+              · topo_factor · input_adequacy
+              · ext_headroom_mult · demand_coupling_mult · substitutability_mult
+
+    All four multipliers are also persisted as separate columns so the
+    eval can ablate any one in isolation.
+    """
+    if df is None or df.empty:
+        return df
+
+    out = df.copy()
+
+    # ── S1: per-carrier stress median normalisation ──────────────────────
+    medians: Dict[str, float] = {}
+    for carrier in ("power", "gas", "heat"):
+        col = f"{carrier}_stress"
+        if col not in out.columns:
+            medians[carrier] = 1.0
+            continue
+        vals = out[col].astype(float)
+        vals_pos = vals[vals > 0]
+        medians[carrier] = float(vals_pos.median()) if len(vals_pos) else 1.0
+
+    weights = {"power": cfg.W_POWER, "gas": cfg.W_GAS, "heat": cfg.W_HEAT}
+    total_stress_balanced = np.zeros(len(out), dtype=float)
+    for carrier in ("power", "gas", "heat"):
+        col = f"{carrier}_stress"
+        if col not in out.columns:
+            continue
+        denom = max(medians[carrier], 1e-12)
+        norm = out[col].astype(float) / denom
+        total_stress_balanced += float(weights[carrier]) * norm.values
+    out["total_stress_balanced"] = total_stress_balanced
+    out["_stress_medians_debug"] = ";".join(
+        f"{c}={medians[c]:.4g}" for c in ("power", "gas", "heat")
+    )
+
+    # ── C1: ext-grid headroom multiplier ─────────────────────────────────
+    ext_cap = _ext_capacity_per_carrier_mw(monee_net)
+    demand = _total_demand_per_carrier_mw(monee_net)
+    cov: Dict[str, float] = {}
+    for c in ("power", "gas", "heat"):
+        d = max(demand.get(c, 0.0), 1e-9)
+        cov[c] = float(np.clip(ext_cap.get(c, 0.0) / d, 0.0, 1.0))
+
+    # For each row pick the carriers it lives on, then take min coverage
+    # (the weakest link decides whether the ext grid can really compensate).
+    ext_mult = np.ones(len(out), dtype=float)
+    for i, row in out.iterrows():
+        carriers = list(_per_carrier_throughput_mw(row, monee_net).keys())
+        if not carriers:
+            continue
+        min_cov = min(cov[c] for c in carriers if c in cov) if carriers else 0.0
+        ext_mult[out.index.get_loc(i)] = max(0.05, 1.0 - min_cov)
+    out["ext_headroom_mult"] = ext_mult
+
+    # ── C2: demand-coupling multiplier ───────────────────────────────────
+    total_d = sum(demand.values()) or 1.0
+    demand_share = {c: demand.get(c, 0.0) / total_d for c in ("power", "gas", "heat")}
+    dem_mult = np.zeros(len(out), dtype=float)
+    for i, row in out.iterrows():
+        carriers = list(_per_carrier_throughput_mw(row, monee_net).keys())
+        if not carriers:
+            dem_mult[out.index.get_loc(i)] = 1.0 / len(demand_share) if demand_share else 1.0
+            continue
+        # Sum-of-shares for CPs (multi-carrier exposure), capped at 1.
+        share = sum(demand_share.get(c, 0.0) for c in carriers)
+        dem_mult[out.index.get_loc(i)] = float(np.clip(share, 1e-3, 1.0))
+    out["demand_coupling_mult"] = dem_mult
+
+    # ── C3: substitutability multiplier ──────────────────────────────────
+    try:
+        import cp_metric_structural as cms
+        sub_df = cms.compute_cp_substitutability(monee_net)
+    except Exception:
+        sub_df = pd.DataFrame(columns=["cp_id", "substitutability"])
+    if not sub_df.empty:
+        sub_map = dict(
+            zip(sub_df["cp_id"].astype(str),
+                sub_df["substitutability"].astype(float))
+        )
+    else:
+        sub_map = {}
+    # compute_cp_substitutability returns ``cp_id`` as ``compound:{id}`` for
+    # compounds and ``f"{from}→{to}"`` for branch CPs. mes_*_metric stores
+    # cp.id (an int) for compounds in the df, so normalise on the fly.
+    def _sub_for_row(row):
+        cp_id = str(row.get("cp_id", ""))
+        cp_type = str(row.get("cp_type", ""))
+        if cp_type in _CP_COMPOUND_LABEL.values() and not cp_id.startswith("compound:"):
+            cp_id = f"compound:{cp_id}"
+        # Default 1.0: non-CP rows are not penalised (no concept of a same-
+        # type alternative for a plain branch).
+        return float(sub_map.get(cp_id, 1.0))
+    out["substitutability_mult"] = out.apply(_sub_for_row, axis=1).values
+
+    # ── Compose ──────────────────────────────────────────────────────────
+    throughput = out.get("throughput", pd.Series(np.ones(len(out)))).astype(float).values
+    topo_factor = out.get("topo_factor", pd.Series(np.ones(len(out)))).astype(float).values
+    adequacy = out.get("input_adequacy", pd.Series(np.ones(len(out)))).astype(float).values
+    out["predicted_score_balanced"] = (
+        throughput
+        * out["total_stress_balanced"].astype(float).values
+        * topo_factor
+        * adequacy
+        * out["ext_headroom_mult"].astype(float).values
+        * out["demand_coupling_mult"].astype(float).values
+        * out["substitutability_mult"].astype(float).values
+    )
+    return out
 
 
 # =============================================================================

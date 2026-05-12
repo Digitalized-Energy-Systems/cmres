@@ -674,6 +674,10 @@ def experiment_e11_null_models(
                 try:
                     z = cmc.null_model_z_scores(G, fn, n=n_nulls, kind=kind, seed=42)
                 except Exception as e:
+                    print(
+                        f"[E11:{art.label}] null_model_z_scores({name}, {kind}) "
+                        f"failed: {type(e).__name__}: {e}"
+                    )
                     z = {"observed": float("nan"), "null_mean": float("nan"),
                          "null_std": float("nan"), "z": float("nan"),
                          "p_one_sided_upper": float("nan")}
@@ -719,7 +723,10 @@ def experiment_e12_community(
         comp_actual: List[float] = []
         comp_bc: List[float] = []
         for r in df.itertuples(index=False):
-            if not r._orig_id:
+            # ``_orig_id`` is the integer node id parsed from cp_id; a falsy
+            # check would drop the legitimate id 0. Skip only when parsing
+            # actually failed.
+            if r._orig_id is None:
                 continue
             for carrier in ("power", "gas", "heat"):
                 nid = (carrier, int(r._orig_id))
@@ -943,6 +950,25 @@ def experiment_e16_single_removal_validation(
     metrics = metrics or [
         "predicted_score", "predicted_stress",
         "topo_factor", "topo_bc",
+        # CP-aware (energy-η) topology variant — w_cp = (2−η)/Φ_rated.
+        # See docs/cp_edge_weight_theory.tex.
+        "predicted_score_cp_aware", "topo_factor_cp_aware", "topo_bc_cp_aware",
+        # Exergy-aware variant — w_cp = (2−η_ex)/Φ_rated with carrier
+        # quality factors. See docs/new_edge_weight_theory.tex.
+        "predicted_score_exergy", "topo_factor_exergy", "topo_bc_exergy",
+        # Balanced composite (S1+C1+C2+C3) — per-carrier stress normalisation,
+        # ext-grid headroom, demand coupling, substitutability multipliers.
+        # See cp_metric.attach_balanced_score.
+        "predicted_score_balanced", "total_stress_balanced",
+        "ext_headroom_mult", "demand_coupling_mult", "substitutability_mult",
+        # Per-carrier atomic predictors (option 3). Each is rank-evaluated
+        # against its OWN carrier's shed via the per-sector ρ block, so
+        # the within-carrier signal isn't drowned out by other carriers.
+        # See cp_metric.attach_per_carrier_scores.
+        "predicted_power", "predicted_gas", "predicted_heat",
+        "predicted_power_cp_aware", "predicted_gas_cp_aware", "predicted_heat_cp_aware",
+        "predicted_power_exergy",   "predicted_gas_exergy",   "predicted_heat_exergy",
+        "predicted_power_balanced", "predicted_gas_balanced", "predicted_heat_balanced",
         "input_adequacy", "local_score", "self_score",
         "katz_score", "vitality_score",
         "ddar_mw_total", "ss_bc_total", "kshortest_redundancy_total",
@@ -978,17 +1004,25 @@ def experiment_e16_single_removal_validation(
                     "n": int(cmask.sum()),
                 })
 
-        # Per-metric ρ vs analytical shed (the metric quality ceiling).
-        # We compute one ρ per carrier (power/heat/gas) in addition to the
-        # total so the plot side can break correlations and scatters out by
-        # sector. Each per-carrier ρ is conditioned on that carrier's shed
-        # being non-zero — otherwise a component that never affects (say)
-        # heat would drag every metric's heat-ρ toward zero.
-        carrier_targets = [
-            ("total", "total_shed"),
-            ("power", "power_shed"),
-            ("heat",  "heat_shed"),
-            ("gas",   "gas_shed"),
+        # Per-metric ρ — sliced into five groups so the per-sector signal on
+        # plain branches isn't distorted by coupling-point rows (which carry
+        # huge composite stress but small single-removal shed):
+        #   total      — every matched row, vs total_shed
+        #   multi      — CP rows only (kind != "branch"), vs total_shed —
+        #                tells us how well the metric ranks coupling
+        #                components, which are inherently multi-sector
+        #   power/heat/gas — non-CP rows (kind == "branch") only, vs the
+        #                same-sector shed, so the per-carrier number is
+        #                a clean within-carrier ranking score
+        # Each per-carrier ρ is conditioned on that carrier's shed being
+        # non-zero — otherwise a component that never affects (say) heat
+        # would drag every metric's heat-ρ toward zero.
+        sector_specs = [
+            ("total", "total_shed", None),
+            ("multi", "total_shed", "cp"),
+            ("power", "power_shed", "branch"),
+            ("heat",  "heat_shed",  "branch"),
+            ("gas",   "gas_shed",   "branch"),
         ]
         for m in metrics:
             if m not in merged.columns or merged[m].notna().sum() < 3:
@@ -997,29 +1031,35 @@ def experiment_e16_single_removal_validation(
             if len(sub_base) < 3:
                 continue
             row: dict = {"scenario": art.label, "metric": m, "n": int(len(sub_base))}
-            for tag, col in carrier_targets:
+            for tag, col, kind_filter in sector_specs:
+                rho_key, p_key = f"rho_vs_{tag}_shed", f"p_vs_{tag}_shed"
+                lo_key, hi_key, n_key = f"ci_lo_{tag}_shed", f"ci_hi_{tag}_shed", f"n_{tag}"
                 if col not in sub_base.columns:
-                    row[f"rho_vs_{tag}_shed"] = float("nan")
-                    row[f"p_vs_{tag}_shed"] = float("nan")
-                    row[f"ci_lo_{tag}_shed"] = float("nan")
-                    row[f"ci_hi_{tag}_shed"] = float("nan")
-                    row[f"n_{tag}"] = 0
+                    row[rho_key] = row[p_key] = row[lo_key] = row[hi_key] = float("nan")
+                    row[n_key] = 0
                     continue
-                sub = sub_base[sub_base[col].notna() & (sub_base[col] > 0)] \
-                    if tag != "total" else sub_base[sub_base[col].notna()]
+                sub = sub_base
+                if kind_filter == "branch" and "kind" in sub.columns:
+                    sub = sub[sub["kind"] == "branch"]
+                elif kind_filter == "cp" and "kind" in sub.columns:
+                    sub = sub[sub["kind"] != "branch"]
+                # Drop zero / NaN values for per-carrier slices; keep all
+                # rows for the "total" view so it can be compared 1-to-1
+                # with the rest of the eval pipeline.
+                if tag != "total":
+                    sub = sub[sub[col].notna() & (sub[col] > 0)]
+                else:
+                    sub = sub[sub[col].notna()]
                 if len(sub) < 3 or sub[m].nunique() < 2 or sub[col].nunique() < 2:
-                    row[f"rho_vs_{tag}_shed"] = float("nan")
-                    row[f"p_vs_{tag}_shed"] = float("nan")
-                    row[f"ci_lo_{tag}_shed"] = float("nan")
-                    row[f"ci_hi_{tag}_shed"] = float("nan")
-                    row[f"n_{tag}"] = int(len(sub))
+                    row[rho_key] = row[p_key] = row[lo_key] = row[hi_key] = float("nan")
+                    row[n_key] = int(len(sub))
                     continue
                 rho, p, lo, hi = _spearman_with_ci(sub[m], sub[col])
-                row[f"rho_vs_{tag}_shed"] = rho
-                row[f"p_vs_{tag}_shed"] = p
-                row[f"ci_lo_{tag}_shed"] = lo
-                row[f"ci_hi_{tag}_shed"] = hi
-                row[f"n_{tag}"] = int(len(sub))
+                row[rho_key] = rho
+                row[p_key] = p
+                row[lo_key] = lo
+                row[hi_key] = hi
+                row[n_key] = int(len(sub))
             # Back-compat aliases so existing plot code keeps working.
             row["rho_vs_shed"] = row["rho_vs_total_shed"]
             row["p_vs_shed"] = row["p_vs_total_shed"]

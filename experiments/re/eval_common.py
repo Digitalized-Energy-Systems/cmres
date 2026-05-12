@@ -365,6 +365,46 @@ def build_matched_df(
             "predicted_stress": score_row.total_stress,
             "topo_factor": score_row.topo_factor,
             "topo_bc": score_row.topo_bc,
+            # CP-aware variant: BC computed with w_cp = (2−η)/Φ_rated and a
+            # ``cp`` normalisation class alongside power/gas/heat (see the
+            # standalone derivation in docs/cp_edge_weight_theory.tex).
+            "topo_factor_cp_aware": score_dict.get(
+                "topo_factor_cp_aware", score_row.topo_factor),
+            "topo_bc_cp_aware": score_dict.get("topo_bc_cp_aware", score_row.topo_bc),
+            "predicted_score_cp_aware": score_dict.get("score_cp_aware", score_row.score),
+            # Exergy-aware variant: w_cp = (2−η_ex)/Φ_rated with carrier
+            # quality factors q_k (electricity = 1, gas ≈ 1, heat = Carnot).
+            # See docs/new_edge_weight_theory.tex.
+            "topo_factor_exergy": score_dict.get(
+                "topo_factor_exergy", score_row.topo_factor),
+            "topo_bc_exergy": score_dict.get("topo_bc_exergy", score_row.topo_bc),
+            "predicted_score_exergy": score_dict.get("score_exergy", score_row.score),
+            # Balanced composite — S1 (per-carrier stress norm) + C1 (ext-
+            # grid headroom) + C2 (demand-coupling) + C3 (substitutability).
+            # Computed by ``cp_metric.attach_balanced_score``.
+            "predicted_score_balanced": score_dict.get(
+                "predicted_score_balanced", score_row.score),
+            "total_stress_balanced": score_dict.get(
+                "total_stress_balanced", score_row.total_stress),
+            "ext_headroom_mult": score_dict.get("ext_headroom_mult", 1.0),
+            "demand_coupling_mult": score_dict.get("demand_coupling_mult", 1.0),
+            "substitutability_mult": score_dict.get("substitutability_mult", 1.0),
+            # Per-carrier atomic predictors (option 3): one score per
+            # carrier × per topology variant, so each can be ranked against
+            # its own carrier's shed without cross-carrier mixing. See
+            # cp_metric.attach_per_carrier_scores.
+            "predicted_power":          score_dict.get("predicted_power", 0.0),
+            "predicted_gas":            score_dict.get("predicted_gas", 0.0),
+            "predicted_heat":           score_dict.get("predicted_heat", 0.0),
+            "predicted_power_cp_aware": score_dict.get("predicted_power_cp_aware", 0.0),
+            "predicted_gas_cp_aware":   score_dict.get("predicted_gas_cp_aware", 0.0),
+            "predicted_heat_cp_aware":  score_dict.get("predicted_heat_cp_aware", 0.0),
+            "predicted_power_exergy":   score_dict.get("predicted_power_exergy", 0.0),
+            "predicted_gas_exergy":     score_dict.get("predicted_gas_exergy", 0.0),
+            "predicted_heat_exergy":    score_dict.get("predicted_heat_exergy", 0.0),
+            "predicted_power_balanced": score_dict.get("predicted_power_balanced", 0.0),
+            "predicted_gas_balanced":   score_dict.get("predicted_gas_balanced", 0.0),
+            "predicted_heat_balanced":  score_dict.get("predicted_heat_balanced", 0.0),
             "stress_bc": score_dict.get("stress_bc", 0.0),
             "stress_score": score_dict.get("stress_score", score_row.score),
             "local_score": score_dict.get("local_score", score_row.score),
@@ -403,14 +443,14 @@ def derive_metric_columns(df: pd.DataFrame) -> pd.DataFrame:
                                   i.e. unreachable input nodes)
 
     The function is idempotent — already-present columns are kept.
-    Returns the same DataFrame for chaining.
+    Always returns a copy so the caller's frame is never mutated; the
+    previous implementation only copied on the first branch, then mutated
+    the caller's frame in later branches.
     """
+    df = df.copy()
     if "score_no_topo" not in df.columns and "predicted_stress" in df.columns:
-        df = df.copy()
         df["score_no_topo"] = df["predicted_stress"]
     if "score_topo_only" not in df.columns and "topo_bc" in df.columns:
-        if not df is df:  # pragma: no cover  # noqa
-            pass
         df["score_topo_only"] = df["topo_bc"]
     if "score_no_adequacy" not in df.columns and "predicted_score" in df.columns:
         if "input_adequacy" in df.columns:
