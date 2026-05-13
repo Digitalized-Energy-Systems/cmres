@@ -37,7 +37,9 @@ N_GRIDS=${N_GRIDS:-9}
 N_SHARDS=${N_SHARDS:-8}
 
 # SLURM array index → (grid_idx, shard_idx) — both 0-based.
-INPUT_DIR=${INPUT_DIR:-/user/towo7024/cmres_new/cmres/data/res}
+# Networks are built per-task from experiments/re/test_grids.py::ALL_GRIDS
+# (same path the MC simulation uses), so no pre-built pickle directory is
+# required any more — only the output dir.
 OUTPUT_DIR=${OUTPUT_DIR:-data/out/single_removal_shed}
 
 # Grid catalogue MUST stay aligned with experiments/re/test_grids.py::ALL_GRIDS
@@ -115,7 +117,6 @@ else
 
     echo "[run] grid=$GRID shard=$SHARD/$N_SHARDS  array_id=$SLURM_ARRAY_TASK_ID"
     python -u "$SCRIPT" "$GRID" \
-        --input-dir  "$INPUT_DIR" \
         --output-dir "$OUTPUT_DIR" \
         --shard      "$SHARD" \
         --n-shards   "$N_SHARDS"

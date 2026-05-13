@@ -1,10 +1,15 @@
 """Analytical single-removal load-shed tool.
 
-For each component on a solved monee network, deactivate it, run a
+For each component on a freshly built monee network, deactivate it, run a
 min-load-shedding optimisation, record the total load shed, then reactivate.
 The resulting (component_id → total_shed_mw) table is the deterministic,
 MC-independent ground truth that bounds what any structural criticality
 metric could achieve on this grid.
+
+Networks are built from ``experiments/re/test_grids.py::ALL_GRIDS`` — the
+same factories the MC resilience simulation uses — so a single grid name
+on the CLI resolves to exactly one configuration (CP density, ``central``
+flag, ``cp_capacity_invariant`` flag, ext-grid bounds).
 
 CLI for SLURM
 -------------
@@ -12,7 +17,6 @@ CLI for SLURM
 Per-shard run::
 
     python single_removal_shed.py simbench_lv \\
-        --input-dir /path/to/run_simulation_output \\
         --output-dir data/out/single_removal_shed \\
         --shard 1 --n-shards 8
 
@@ -29,8 +33,9 @@ Final merge::
 Output: ``single_removal_shed_<grid>.csv`` ready to join against df_eval
 on ``cp_id``.
 
-The component slicing is deterministic (sorted by id), so re-running a
-particular shard reproduces its slice.
+The component slicing is deterministic (round-robin striping over the
+component list sorted by cp_id), so re-running a particular shard
+reproduces its slice.
 """
 
 from __future__ import annotations
@@ -264,10 +269,10 @@ def compute_single_removal_shed(
 
     because ``_apply`` expects each variable it sets bounds on to still be
     a Pyomo Var. ``Network.copy()`` doesn't reliably reconstitute every
-    Var — under our pickled+formulated networks the copied Vars sometimes
-    survive as floats. Calling ``net_factory()`` (typically
-    ``pickle.loads(cached_bytes)``) returns a guaranteed-fresh formulated-
-    but-unsolved network for every iteration.
+    Var — the copied network's Vars sometimes survive as floats. Calling
+    ``net_factory()`` (typically ``pickle.loads(cached_bytes)`` over an
+    in-memory snapshot of a ``test_grids.ALL_GRIDS`` build) returns a
+    guaranteed-fresh formulated-but-unsolved network for every iteration.
 
     ``net_factory`` is also accepted as a Network instance for backwards
     compat — that path uses ``net.copy()`` and inherits the brittleness
@@ -374,21 +379,20 @@ def _slice_targets(
     return [t for i, t in enumerate(targets) if (i % n_shards) == (shard - 1)]
 
 
-# NOTE: we intentionally do NOT pre-solve the network here. A successful
-# Pyomo solve replaces the network's per-component Vars with their solved
-# float values, after which the next ``optimization_problem._apply()``
-# crashes with ``AttributeError: 'float' object has no attribute 'max'``.
-# Each per-component iteration runs on a fresh ``net.copy()`` instead;
-# see ``compute_single_removal_shed``.
 
 
-def _resolve_ext_grid_bounds(grid_name: str) -> dict:
-    """Return the ext-grid bound dict the resilience MC used for *grid_name*.
+def _resolve_grid(grid_name: str):
+    """Build the network from ``test_grids.ALL_GRIDS`` and return everything
+    the shed loop needs: a factory that returns a guaranteed-fresh
+    formulated network, the ext-grid bounds matching the resilience MC, and
+    one freshly built network for target enumeration / logging.
 
-    Reads ``MESContainer.ext_grid_*_bounds`` from ``test_grids.ALL_GRIDS``
-    so the analytical shed solve has the same external slack as the MC
-    simulation it is being validated against. Builds the network once,
-    which is moderately expensive, but only happens at startup.
+    The factory route mirrors the previous pickle-file design (deserialise
+    per iteration to dodge in-place Pyomo Var mutation) but the bytes come
+    from a single in-memory ``pickle.dumps`` over the
+    ``test_grids``-constructed network rather than from a disk artefact —
+    so a run depends only on the grid name and the source-of-truth in
+    ``test_grids.py``, not on a pickled MC run.
     """
     from test_grids import ALL_GRIDS  # local import keeps CLI startup cheap
 
@@ -399,23 +403,27 @@ def _resolve_ext_grid_bounds(grid_name: str) -> dict:
         )
     create_fn, _ = ALL_GRIDS[grid_name]
     container = create_fn()
-    return {
+    # Snapshot the formulated network once — re-running the factory per
+    # iteration would re-load simbench and reapply the MISOCP / McCormick
+    # formulations, which is much more expensive than a pickle round-trip.
+    net_bytes = pickle.dumps(container.network)
+
+    def net_factory():
+        return pickle.loads(net_bytes)
+
+    bounds = {
         "ext_grid_el_bounds": container.ext_grid_el_bounds,
         "ext_grid_gas_bounds": container.ext_grid_gas_bounds,
         "ext_grid_heat_bounds": container.ext_grid_heat_bounds,
     }
+    return net_factory, bounds, container.network
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument(
         "grid",
-        help="Grid name as in run_simulation.py (e.g. simbench_lv).",
-    )
-    parser.add_argument(
-        "--input-dir", type=Path,
-        default=Path("/user/towo7024/cmres_new/cmres/data/res"),
-        help="Directory containing MoneeResilienceExperiment-<grid>/network.p",
+        help="Grid name from test_grids.ALL_GRIDS (e.g. simbench_lv).",
     )
     parser.add_argument(
         "--output-dir", type=Path,
@@ -451,23 +459,15 @@ def main():
         return 0
 
     # Single-shard or unsharded run.
-    network_pkl = args.input_dir / f"MoneeResilienceExperiment-{args.grid}" / "network.p"
-    # Read the pickle bytes ONCE; deserialise per iteration to get a
-    # guaranteed-fresh formulated network. ``Network.copy()`` does NOT
-    # restore Pyomo Var state cleanly under our pickled+formulated setup —
-    # the copied network's Vars come back as floats, and
-    # ``optimization_problem._apply`` crashes on the first
-    # ``var.max = max_value`` call. Re-pickling per iteration mirrors what
-    # cp_cn_evaluation does (``pickle.load(network.p)`` → load-shed solve
-    # works), so it sidesteps the broken-copy problem entirely.
-    with open(network_pkl, "rb") as f:
-        net_bytes = f.read()
-
-    def net_factory():
-        return pickle.loads(net_bytes)
-
-    net = net_factory()
-    log.info("loaded %s (%s)", network_pkl, net.statistics())
+    # Build the network from test_grids (same source-of-truth the MC
+    # resilience simulation consumes) and snapshot it to in-memory bytes
+    # so each per-component iteration deserialises a fresh Pyomo Var
+    # state. ``Network.copy()`` doesn't reliably round-trip Vars (they
+    # come back as floats), and rebuilding from scratch via the factory
+    # would re-pay the simbench load + formulation cost on every solve.
+    net_factory, ext_bounds, net = _resolve_grid(args.grid)
+    log.info("built %s from test_grids.ALL_GRIDS (%s)", args.grid, net.statistics())
+    log.info("ext-grid bounds for %s: %s", args.grid, ext_bounds)
 
     targets = _enumerate_targets(net)
     log.info(
@@ -477,8 +477,6 @@ def main():
     )
 
     sliced = _slice_targets(targets, args.shard, args.n_shards) if args.n_shards > 1 else targets
-    ext_bounds = _resolve_ext_grid_bounds(args.grid)
-    log.info("ext-grid bounds for %s: %s", args.grid, ext_bounds)
     df = compute_single_removal_shed(net_factory, ext_bounds, targets=sliced)
     if args.shard and args.n_shards > 1:
         path = args.output_dir / f"single_removal_shed_{args.grid}_shard_{args.shard}_of_{args.n_shards}.csv"

@@ -19,12 +19,12 @@
 #
 # Usage notes
 # -----------
-# - INPUT_DIR    where MoneeResilienceExperiment-<grid>/network.p lives
-#                (default: /user/towo7024/cmres_new/cmres/data/res)
 # - OUTPUT_DIR   per-shard CSV destination
 #                (default: data/out/single_removal_shed)
 # - GRIDS list   defined inside slurm_single_removal_shed.sh; keep aligned
-#                with experiments/re/test_grids.py::ALL_GRIDS.
+#                with experiments/re/test_grids.py::ALL_GRIDS — that file is
+#                also the network source-of-truth (no pre-built pickle is
+#                needed any more).
 # ─────────────────────────────────────────────────────────────────────────────
 
 set -e
@@ -32,7 +32,6 @@ set -e
 N_GRIDS=${N_GRIDS:-9}
 N_SHARDS=${N_SHARDS:-8}
 SUBMIT_MERGE=${SUBMIT_MERGE:-1}
-INPUT_DIR=${INPUT_DIR:-/user/towo7024/cmres_new/cmres/data_0512/res}
 OUTPUT_DIR=${OUTPUT_DIR:-data/out/single_removal_shed}
 
 mkdir -p logs "$OUTPUT_DIR"
@@ -48,7 +47,7 @@ RUN_JID=$(
         -p rosa.p \
         --parsable \
         --array=0-$((N_RUN_TASKS - 1)) \
-        --export=ALL,N_GRIDS=$N_GRIDS,N_SHARDS=$N_SHARDS,INPUT_DIR=$INPUT_DIR,OUTPUT_DIR=$OUTPUT_DIR \
+        --export=ALL,N_GRIDS=$N_GRIDS,N_SHARDS=$N_SHARDS,OUTPUT_DIR=$OUTPUT_DIR \
         slurm_single_removal_shed.sh
 )
 echo "RUN array submitted: jobid=$RUN_JID"
