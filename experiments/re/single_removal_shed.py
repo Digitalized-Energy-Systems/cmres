@@ -51,6 +51,17 @@ import monee.model as mm
 import monee.problem as mp
 from monee import PyomoSolver, run_energy_flow_optimization
 
+# Cap per-solve Gurobi runtime and loosen the MIP gap slightly. With
+# ``demand_weight=1e3`` the LP objective is O(1e2-1e3), so the default
+# ``MIPGap=1e-3`` demands sub-mW precision — far below the analysis's
+# noise floor and prone to multi-hour B&B on degenerate single-removal
+# cases. ``MIPGap=5e-3`` gives ~0.5 % precision (~few mW absolute) and
+# the ``TimeLimit`` is a safety net so a single stuck solve cannot
+# block the whole sweep.
+from monee.solver.pyo import PER_SOLVER_OPTIONS as _MONEE_GUROBI_OPTS
+_MONEE_GUROBI_OPTS["gurobi"]["MIPGap"] = 5e-3
+_MONEE_GUROBI_OPTS["gurobi"]["TimeLimit"] = 300
+
 log = logging.getLogger(__name__)
 
 
