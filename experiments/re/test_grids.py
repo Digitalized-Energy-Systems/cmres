@@ -162,19 +162,31 @@ def create_large_lv_simbench(density, central=False, cp_capacity_invariant=False
             coupling_density=density,
             centralized=central,
             couplings=("chp", "p2g", "p2h"),
-            coupling_kwargs={"seed": 1, 
-                             "use_hg_variants": True, 
-                             "cp_size_multiplier": 2, 
-                             "replace_primary_generation": cp_capacity_invariant},
-            heat_kwargs={"node_based_heat_loads": True},
+            coupling_kwargs={
+                "seed": 1,
+                "use_hg_variants": True,
+                "chp_p_share": 2.0,
+                "p2g_p_share": 0.3,
+                "p2h_p_share": 0.5,
+                "cp_size_multiplier": 3.0,
+                "replace_primary_generation": cp_capacity_invariant,
+            },
+            heat_kwargs={
+                "node_based_heat_loads": True,
+                "node_heat_gen_share": 3.0,
+            },
+            gas_kwargs={
+                "gas_gen_share": 8.0,
+                "mesh_seed": 42,
+            },
         )
         mes.apply_formulation(MISOCP_NETWORK_FORMULATION)
         mes.apply_formulation(make_mccormick_dhs_formulation(num_partitions=16))
 
         return MESContainer(
             network=mes,
-            ext_grid_el_bounds=(-0.05, 0.05),
-            ext_grid_gas_bounds=(-0.006, 0.006),
+            ext_grid_el_bounds=(-0.10, 0.10),
+            ext_grid_gas_bounds=(-0.02, 0.02),
             ext_grid_heat_bounds=(-6, 6),
         )
     return create
@@ -186,16 +198,16 @@ def create_large_lv_simbench_ts(
 
 ALL_GRIDS = {
     "simbench_lv_no": (create_large_lv_simbench(0), create_large_lv_simbench_ts),
-    "simbench_lv_low": (create_large_lv_simbench(0.25), create_large_lv_simbench_ts),
-    "simbench_lv": (create_large_lv_simbench(0.5), create_large_lv_simbench_ts),
-    "simbench_lv_high": (create_large_lv_simbench(0.75), create_large_lv_simbench_ts),
+    "simbench_lv_low": (create_large_lv_simbench(0.1), create_large_lv_simbench_ts),
+    "simbench_lv": (create_large_lv_simbench(0.2), create_large_lv_simbench_ts),
+    "simbench_lv_high": (create_large_lv_simbench(0.3), create_large_lv_simbench_ts),
     
-    "simbench_lv_centralized": (create_large_lv_simbench(0.5, central=True), create_large_lv_simbench_ts),
-    "simbench_lv_centralized_same_cap": (create_large_lv_simbench(0.5, central=True, cp_capacity_invariant=True), create_large_lv_simbench_ts),
+    "simbench_lv_centralized": (create_large_lv_simbench(0.2, central=True), create_large_lv_simbench_ts),
+    "simbench_lv_centralized_same_cap": (create_large_lv_simbench(0.3, central=True, cp_capacity_invariant=True), create_large_lv_simbench_ts),
 
-    "simbench_lv_low_same_cap": (create_large_lv_simbench(0.25, cp_capacity_invariant=True), create_large_lv_simbench_ts),
-    "simbench_lv_same_cap": (create_large_lv_simbench(0.5, cp_capacity_invariant=True), create_large_lv_simbench_ts),
-    "simbench_lv_high_same_cap": (create_large_lv_simbench(0.75, cp_capacity_invariant=True), create_large_lv_simbench_ts),
+    "simbench_lv_low_same_cap": (create_large_lv_simbench(0.1, cp_capacity_invariant=True), create_large_lv_simbench_ts),
+    "simbench_lv_same_cap": (create_large_lv_simbench(0.2, cp_capacity_invariant=True), create_large_lv_simbench_ts),
+    "simbench_lv_high_same_cap": (create_large_lv_simbench(0.3, cp_capacity_invariant=True), create_large_lv_simbench_ts),
 }
 
 def print_demands(net: mm.Network) -> None:
