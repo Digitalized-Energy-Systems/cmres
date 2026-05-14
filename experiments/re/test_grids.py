@@ -153,6 +153,144 @@ def make_regional_mes_timeseries(
 # Convenience registry
 # =============================================================================
 
+def _balance_demand_for_cp_replacement(net) -> None:
+    """For ``cp_capacity_invariant=True`` grids: reduce PowerLoad and gas
+    Sink demand uniformly so the primary-side energy supply matches the
+    no-CP baseline.
+
+    Reasoning
+    ---------
+    In ``cp_capacity_invariant=True`` mode (``replace_primary_generation``
+    inside ``generate_supply_return_mes_based_on_power_net``), a CP that
+    produces output O_k replaces O_k of primary generation on the same
+    carrier. The end-user demand on the OUTPUT carrier (heat / gas /
+    power) is therefore still served. However, the CP also consumes
+    O_k / η on its INPUT carrier — and the primary supply on that input
+    side has *not* been reduced. Net effect: the system's primary energy
+    consumption goes up by O_k · (1/η − 1) per CP.
+
+    To keep the comparison across density variants fair (every grid sees
+    the same primary energy footprint), we subtract each CP's rated
+    INPUT draw from end-user demand on that carrier:
+
+        ΔPowerLoad_total = − Σ_{CP draws power} (rated_input_mw)
+        ΔSink_gas_total  = − Σ_{CP draws gas}   (rated_input_kgps)
+
+    The reduction is applied uniformly across every demand object on the
+    carrier (single scale factor on each `p_mw` / `mass_flow`), preserving
+    the spatial distribution of demand. Heat demand is NOT touched (the
+    chosen accounting policy targets only the "primary" carriers
+    electricity + gas).
+
+    Per-CP rated input draws
+    ------------------------
+    Indices: P=power, G=gas, H=heat. η_k is the conversion efficiency.
+
+      CHP / CHPHG       I = G        rated_in_MW  = mass_flow_setpoint · 3.6 · HHV
+      PowerToHeat       I = P        rated_in_MW  = load_p_mw  (= q_mw / η in the model)
+      PowerToHeatHG     I = P        rated_in_MW  = heat_energy_mw / η
+      GasToHeatHG       I = G        rated_in_MW  = heat_energy_mw / η
+      GasToPower        I = G        rated_in_MW  = el_mw / η
+      PowerToGas        I = P        rated_in_MW  = mass_flow_setpoint · 3.6 · HHV / η
+
+    No-op when ``net`` has no CPs (e.g. density=0 or central=True).
+    """
+    # ``net.grids`` chokes on multi-grid CP control nodes (whose ``.grid`` is
+    # a list and therefore unhashable inside the set comprehension in monee).
+    # Walk the Junction nodes directly to find the gas grid object — it's the
+    # only thing we need from there (``higher_heating_value``).
+    gas_grid = None
+    for n in net.nodes_by_type(mm.Junction):
+        g = n.grid
+        if g is not None and not isinstance(g, list) and getattr(g, "name", None) == "gas":
+            gas_grid = g
+            break
+    hhv = float(getattr(gas_grid, "higher_heating_value", 15.3)) if gas_grid else 15.3
+
+    p_in_mw = 0.0  # CP electricity draw [MW]
+    g_in_mw = 0.0  # CP gas draw [MW]
+
+    for cp in net.compounds:
+        m = cp.model
+        cn = type(m).__name__
+        if cn in ("CHP", "CHPHG"):
+            kgps = abs(float(getattr(m, "mass_flow_setpoint", 0.0) or 0.0))
+            g_in_mw += kgps * 3.6 * hhv
+        elif cn == "PowerToHeat":
+            # load_p_mw = heat_energy_mw / η, set in PowerToHeat.__init__.
+            p_in_mw += abs(float(getattr(m, "load_p_mw", 0.0) or 0.0))
+
+    for br in net.branches:
+        m = br.model
+        cn = type(m).__name__
+        if cn == "PowerToHeatHG":
+            h = abs(float(getattr(m, "heat_energy_mw", 0.0) or 0.0))
+            eta = float(getattr(m, "efficiency", 0.0) or 0.0)
+            if eta > 1e-6:
+                p_in_mw += h / eta
+        elif cn == "GasToHeatHG":
+            h = abs(float(getattr(m, "heat_energy_mw", 0.0) or 0.0))
+            eta = float(getattr(m, "efficiency", 0.0) or 0.0)
+            if eta > 1e-6:
+                g_in_mw += h / eta
+        elif cn == "GasToPower":
+            p = abs(float(getattr(m, "el_mw", 0.0) or 0.0))
+            eta = float(getattr(m, "efficiency", 0.0) or 0.0)
+            if eta > 1e-6:
+                g_in_mw += p / eta
+        elif cn == "PowerToGas":
+            # mass_flow_setpoint stored on the branch (positive magnitude);
+            # the constructor flips its sign onto gas_kgps internally.
+            kgps_out = abs(float(getattr(m, "gas_kgps", 0.0) or 0.0))
+            eta = float(getattr(m, "efficiency", 0.0) or 0.0)
+            if eta > 1e-6:
+                p_in_mw += (kgps_out * 3.6 * hhv) / eta
+
+    # Apply uniform scaling to PowerLoad (positive = consumption).
+    if p_in_mw > 0:
+        ploads = list(net.childs_by_type(mm.PowerLoad))
+        total_pload = sum(float(mm.value(c.model.p_mw) or 0.0) for c in ploads)
+        if total_pload > 0:
+            if p_in_mw >= total_pload:
+                print(
+                    f"[same_cap] WARN: CP power draw {p_in_mw:.4f} MW ≥ total "
+                    f"PowerLoad {total_pload:.4f} MW; setting PowerLoad to 1e-6 MW each."
+                )
+                for c in ploads:
+                    c.model.p_mw = 1e-6
+            else:
+                scale = (total_pload - p_in_mw) / total_pload
+                for c in ploads:
+                    c.model.p_mw = float(mm.value(c.model.p_mw) or 0.0) * scale
+
+    # Apply uniform scaling to gas-grid Sinks (positive = consumption).
+    if g_in_mw > 0 and gas_grid is not None:
+        sinks = [
+            c for c in net.childs_by_type(mm.Sink)
+            if c.grid is not None and getattr(c.grid, "name", None) == "gas"
+        ]
+        total_g_kgps = sum(float(mm.value(c.model.mass_flow) or 0.0) for c in sinks)
+        total_g_mw = total_g_kgps * 3.6 * hhv
+        if total_g_mw > 0:
+            if g_in_mw >= total_g_mw:
+                print(
+                    f"[same_cap] WARN: CP gas draw {g_in_mw:.4f} MW ≥ total "
+                    f"gas Sink {total_g_mw:.4f} MW; setting Sink mass_flow to 1e-9 kg/s each."
+                )
+                for c in sinks:
+                    c.model.mass_flow = 1e-9
+            else:
+                scale = (total_g_mw - g_in_mw) / total_g_mw
+                for c in sinks:
+                    c.model.mass_flow = float(mm.value(c.model.mass_flow) or 0.0) * scale
+
+    if p_in_mw > 0 or g_in_mw > 0:
+        print(
+            f"[same_cap] demand reduction: −{p_in_mw:.4f} MW power, "
+            f"−{g_in_mw:.4f} MW gas (≈ −{g_in_mw / (3.6 * hhv):.6f} kg/s)"
+        )
+
+
 def create_large_lv_simbench(density, central=False, cp_capacity_invariant=False):
     def create():
         net = simbench.get_simbench_net("1-LV-rural3--1-no_sw")
@@ -180,6 +318,17 @@ def create_large_lv_simbench(density, central=False, cp_capacity_invariant=False
                 "mesh_seed": 42,
             },
         )
+
+        # ``cp_capacity_invariant=True`` reduces non-CP primary generation by
+        # the added CP capacity, but the CPs themselves still draw on their
+        # input carrier. Without compensation, total primary energy
+        # consumption rises by Σ O_k·(1/η_k − 1). Subtracting the CP input
+        # draw from end-user demand on the input carrier keeps the primary
+        # supply matched to the no-CP baseline. Applied BEFORE
+        # ``apply_formulation`` so the formulations see the adjusted values.
+        if cp_capacity_invariant:
+            _balance_demand_for_cp_replacement(mes)
+
         mes.apply_formulation(MISOCP_NETWORK_FORMULATION)
         mes.apply_formulation(make_mccormick_dhs_formulation(num_partitions=16))
 
@@ -198,16 +347,19 @@ def create_large_lv_simbench_ts(
 
 ALL_GRIDS = {
     "simbench_lv_no": (create_large_lv_simbench(0), create_large_lv_simbench_ts),
+    
     "simbench_lv_low": (create_large_lv_simbench(0.1), create_large_lv_simbench_ts),
     "simbench_lv": (create_large_lv_simbench(0.2), create_large_lv_simbench_ts),
     "simbench_lv_high": (create_large_lv_simbench(0.3), create_large_lv_simbench_ts),
+    "simbench_lv_xl": (create_large_lv_simbench(0.4), create_large_lv_simbench_ts),
+    "simbench_lv_xxl": (create_large_lv_simbench(0.5), create_large_lv_simbench_ts),
     
-    "simbench_lv_centralized": (create_large_lv_simbench(0.2, central=True), create_large_lv_simbench_ts),
-    "simbench_lv_centralized_same_cap": (create_large_lv_simbench(0.3, central=True, cp_capacity_invariant=True), create_large_lv_simbench_ts),
 
     "simbench_lv_low_same_cap": (create_large_lv_simbench(0.1, cp_capacity_invariant=True), create_large_lv_simbench_ts),
     "simbench_lv_same_cap": (create_large_lv_simbench(0.2, cp_capacity_invariant=True), create_large_lv_simbench_ts),
     "simbench_lv_high_same_cap": (create_large_lv_simbench(0.3, cp_capacity_invariant=True), create_large_lv_simbench_ts),
+    "simbench_lv_xl_same_cap": (create_large_lv_simbench(0.4, cp_capacity_invariant=True), create_large_lv_simbench_ts),
+    "simbench_lv_xxl_same_cap": (create_large_lv_simbench(0.5, cp_capacity_invariant=True), create_large_lv_simbench_ts),
 }
 
 def print_demands(net: mm.Network) -> None:
