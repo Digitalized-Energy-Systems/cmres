@@ -303,9 +303,9 @@ def create_large_lv_simbench(density, central=False, cp_capacity_invariant=False
             coupling_kwargs={
                 "seed": 1,
                 "use_hg_variants": True,
-                "chp_p_share": 2.0,
-                "p2g_p_share": 0.3,
-                "p2h_p_share": 0.5,
+                "chp_p_share": 1.6,
+                "p2g_p_share": 1,
+                "p2h_p_share": 0.2,
                 "cp_size_multiplier": 3.0,
                 "replace_primary_generation": cp_capacity_invariant,
             },
@@ -348,18 +348,18 @@ def create_large_lv_simbench_ts(
 ALL_GRIDS = {
     "simbench_lv_no": (create_large_lv_simbench(0), create_large_lv_simbench_ts),
     
-    "simbench_lv_low": (create_large_lv_simbench(0.1), create_large_lv_simbench_ts),
-    "simbench_lv": (create_large_lv_simbench(0.2), create_large_lv_simbench_ts),
-    "simbench_lv_high": (create_large_lv_simbench(0.3), create_large_lv_simbench_ts),
-    "simbench_lv_xl": (create_large_lv_simbench(0.4), create_large_lv_simbench_ts),
-    "simbench_lv_xxl": (create_large_lv_simbench(0.5), create_large_lv_simbench_ts),
+    "simbench_lv_low": (create_large_lv_simbench(0.05), create_large_lv_simbench_ts),
+    "simbench_lv": (create_large_lv_simbench(0.1), create_large_lv_simbench_ts),
+    "simbench_lv_high": (create_large_lv_simbench(0.15), create_large_lv_simbench_ts),
+    "simbench_lv_xl": (create_large_lv_simbench(0.2), create_large_lv_simbench_ts),
+    "simbench_lv_xxl": (create_large_lv_simbench(0.25), create_large_lv_simbench_ts),
     
 
-    "simbench_lv_low_same_cap": (create_large_lv_simbench(0.1, cp_capacity_invariant=True), create_large_lv_simbench_ts),
-    "simbench_lv_same_cap": (create_large_lv_simbench(0.2, cp_capacity_invariant=True), create_large_lv_simbench_ts),
-    "simbench_lv_high_same_cap": (create_large_lv_simbench(0.3, cp_capacity_invariant=True), create_large_lv_simbench_ts),
-    "simbench_lv_xl_same_cap": (create_large_lv_simbench(0.4, cp_capacity_invariant=True), create_large_lv_simbench_ts),
-    "simbench_lv_xxl_same_cap": (create_large_lv_simbench(0.5, cp_capacity_invariant=True), create_large_lv_simbench_ts),
+    "simbench_lv_low_same_cap": (create_large_lv_simbench(0.05, cp_capacity_invariant=True), create_large_lv_simbench_ts),
+    "simbench_lv_same_cap": (create_large_lv_simbench(0.1, cp_capacity_invariant=True), create_large_lv_simbench_ts),
+    "simbench_lv_high_same_cap": (create_large_lv_simbench(0.15, cp_capacity_invariant=True), create_large_lv_simbench_ts),
+    "simbench_lv_xl_same_cap": (create_large_lv_simbench(0.2, cp_capacity_invariant=True), create_large_lv_simbench_ts),
+    "simbench_lv_xxl_same_cap": (create_large_lv_simbench(0.25, cp_capacity_invariant=True), create_large_lv_simbench_ts),
 }
 
 def print_demands(net: mm.Network) -> None:

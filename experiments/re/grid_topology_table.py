@@ -36,14 +36,18 @@ from test_grids import ALL_GRIDS
 
 SCENARIO_LABEL = {
     "simbench_lv_no":                       "LV-no",
-    "simbench_lv_low":                      "LV-low",
-    "simbench_lv":                          "LV-medium",
-    "simbench_lv_high":                     "LV-high",
-    "simbench_lv_centralized":              "LV-medium-c",
-    "simbench_lv_centralized_same_cap":     "LV-medium-eq-c",
-    "simbench_lv_low_same_cap":             "LV-low-eq",
-    "simbench_lv_same_cap":                 "LV-medium-eq",
-    "simbench_lv_high_same_cap":            "LV-high-eq",
+
+    "simbench_lv_low":                      "LV-s",
+    "simbench_lv":                          "LV-m",
+    "simbench_lv_high":                     "LV-l",
+    "simbench_lv_xl":                       "LV-xl",
+    "simbench_lv_xxl":                      "LV-xxl",
+
+    "simbench_lv_low_same_cap":             "LV-s-eq",
+    "simbench_lv_same_cap":                 "LV-m-eq",
+    "simbench_lv_high_same_cap":            "LV-l-eq",
+    "simbench_lv_xl_same_cap":              "LV-xl-eq",
+    "simbench_lv_xxl_same_cap":        "LV-xxl-eq",
 }
 
 
@@ -248,8 +252,11 @@ def row_for(name: str) -> str:
 
 def main(only=None):
     names = only or list(ALL_GRIDS)
+    rows = []
     for name in names:
-        print(row_for(name))
+        rows.append(row_for(name))
+    for row in rows:
+        print(row)
 
 
 if __name__ == "__main__":
