@@ -7,15 +7,21 @@
 #     bash submit_single_removal_shed.sh
 #     N_SHARDS=16 bash submit_single_removal_shed.sh
 #     SUBMIT_MERGE=0 bash submit_single_removal_shed.sh   # don't auto-submit merge
+#     SUBMIT_EVAL=0  bash submit_single_removal_shed.sh   # don't auto-submit eval
 #
-# Submits two SLURM jobs:
+# Submits up to three SLURM jobs:
 #   1. RUN array     N_GRIDS × N_SHARDS tasks; each runs one shard
 #                    of one grid via single_removal_shed.py --shard …
 #   2. MERGE array   N_GRIDS tasks; each merges one grid's shards
 #                    with --dependency=afterok:<RUN_JOBID>
+#   3. EVAL job      one task; renders the full plot/report battery
+#                    (per-grid + cross-grid pooled) via
+#                    slurm_single_removal_shed_eval.sh,
+#                    --dependency=afterok:<MERGE_JOBID>.
 #
-# Both jobs share the same worker (slurm_single_removal_shed.sh); the
-# phase is selected by env var CMRES_MERGE_PHASE.
+# RUN and MERGE share the worker (slurm_single_removal_shed.sh); the phase
+# is selected by env var CMRES_MERGE_PHASE. EVAL uses its own dedicated
+# worker (slurm_single_removal_shed_eval.sh).
 #
 # Usage notes
 # -----------
@@ -32,7 +38,14 @@ set -e
 N_GRIDS=${N_GRIDS:-9}
 N_SHARDS=${N_SHARDS:-8}
 SUBMIT_MERGE=${SUBMIT_MERGE:-1}
+SUBMIT_EVAL=${SUBMIT_EVAL:-1}
 OUTPUT_DIR=${OUTPUT_DIR:-data/out/single_removal_shed}
+# E16 (in the eval job) needs the MC-experiment outputs; default mirrors the
+# DEFAULT_INPUT_DIR baked into experiments/re/e16_plots.py. Override when the
+# MC data lives elsewhere.
+INPUT_DIR=${INPUT_DIR:-data/res}
+E16_OUT_DIR=${E16_OUT_DIR:-data/out/cmres}
+SKIP_E16=${SKIP_E16:-0}
 
 mkdir -p logs "$OUTPUT_DIR"
 
@@ -53,6 +66,7 @@ RUN_JID=$(
 echo "RUN array submitted: jobid=$RUN_JID"
 
 # ── MERGE phase (afterok) ────────────────────────────────────────────────────
+MERGE_JID=""
 if [[ "$SUBMIT_MERGE" == "1" ]]; then
     echo "Submitting MERGE: $N_GRIDS grids (afterok:$RUN_JID)"
     MERGE_JID=$(
@@ -65,6 +79,25 @@ if [[ "$SUBMIT_MERGE" == "1" ]]; then
             slurm_single_removal_shed.sh
     )
     echo "MERGE array submitted: jobid=$MERGE_JID"
+fi
+
+# ── EVAL phase (afterok) ─────────────────────────────────────────────────────
+# Plots run after the merge so every grid has a final
+# ``single_removal_shed_<grid>.csv`` to read. With SUBMIT_MERGE=0 we still
+# fall back to afterok:<RUN_JID> so the eval doesn't start mid-shard-write;
+# the plotter itself just skips any *_shard_*.csv it sees.
+if [[ "$SUBMIT_EVAL" == "1" ]]; then
+    DEP_JID="${MERGE_JID:-$RUN_JID}"
+    echo "Submitting EVAL: 1 task (afterok:$DEP_JID)"
+    EVAL_JID=$(
+        sbatch \
+            -p rosa.p \
+            --parsable \
+            --dependency=afterok:$DEP_JID \
+            --export=ALL,OUTPUT_DIR=$OUTPUT_DIR,INPUT_DIR=$INPUT_DIR,E16_OUT_DIR=$E16_OUT_DIR,SKIP_E16=$SKIP_E16 \
+            slurm_single_removal_shed_eval.sh
+    )
+    echo "EVAL job submitted: jobid=$EVAL_JID"
 fi
 
 echo "Done. Watch with: squeue -u \$USER"
