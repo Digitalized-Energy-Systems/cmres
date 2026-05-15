@@ -146,6 +146,45 @@ def _generation_capacity(net: mm.Network, hhv: float) -> Tuple[float, float, flo
     return p_e, p_g, p_h
 
 
+def _demand(net: mm.Network, hhv: float) -> Tuple[float, float, float]:
+    """Per-sector total demand in MW.
+
+    Mirrors :func:`_generation_capacity`: electricity from ``PowerLoad``,
+    gas from ``Sink`` on the gas grid (kg/s → MW via HHV), heat from
+    ``HeatLoad`` and the load-side heat-exchanger branches. Heat-exchanger
+    rated load lives in ``q_mw_set`` (stored as ``-q_mw`` by the
+    constructor), so we take the absolute value.
+    """
+    d_e = d_g = d_h = 0.0
+    for c in net.childs_by_type(mm.PowerLoad):
+        try:
+            d_e += abs(float(mm.value(c.model.p_mw)))
+        except Exception:
+            pass
+    for c in net.childs_by_type(mm.Sink):
+        if getattr(getattr(c, "grid", None), "name", "") != "gas":
+            continue
+        try:
+            d_g += abs(float(mm.value(c.model.mass_flow))) * 3.6 * hhv
+        except Exception:
+            pass
+    for c in net.childs_by_type(mm.HeatLoad):
+        try:
+            d_h += abs(float(mm.value(c.model.q_mw_heat)))
+        except Exception:
+            pass
+    for cls in (mm.HeatExchangerLoad, mm.PassiveHeatExchangerLoad):
+        try:
+            for b in net.branches_by_type(cls):
+                v = getattr(b.model, "q_mw_set", None)
+                if v is None:
+                    continue
+                d_h += abs(float(mm.value(v)))
+        except Exception:
+            pass
+    return d_e, d_g, d_h
+
+
 def _cp_capacity(net: mm.Network, hhv: float) -> Tuple[float, float, float]:
     """Per-sector CP **output** capacity in MW.
 
@@ -238,6 +277,7 @@ def row_for(name: str) -> str:
     hhv = _gas_hhv(net)
     gen_e, gen_g, gen_h = _generation_capacity(net, hhv)
     cp_e, cp_g, cp_h = _cp_capacity(net, hhv)
+    dem_e, dem_g, dem_h = _demand(net, hhv)
 
     cells = [
         _label(name),
@@ -246,6 +286,7 @@ def row_for(name: str) -> str:
         f"{n_cp}",
         _fmt(gen_e), _fmt(gen_g), _fmt(gen_h),
         _fmt(cp_e),  _fmt(cp_g),  _fmt(cp_h),
+        _fmt(dem_e), _fmt(dem_g), _fmt(dem_h),
     ]
     return " & ".join(cells) + r" \\"
 

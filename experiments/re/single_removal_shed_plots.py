@@ -461,6 +461,58 @@ def _pooled_kind_summary(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
     return ev.apply_cmres_style(fig, legend="right")
 
 
+def _pooled_mean_shed_by_carrier(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
+                                 grids: List[str]) -> go.Figure:
+    """Average per-component shed across all grids, grouped bars per carrier.
+
+    For each (grid, carrier) pair, plots the mean of the carrier's shed
+    column across all single-component removals. Reads "which sector tends
+    to lose load when an arbitrary component drops?" directly per grid.
+    """
+    carriers = ("electricity", "heat", "gas")
+    col_map = {"electricity": "power_shed", "heat": "heat_shed", "gas": "gas_shed"}
+    rows = []
+    for g in grids:
+        sweep, _ = records[g]
+        if sweep.empty:
+            continue
+        for c in carriers:
+            col = col_map[c]
+            if col not in sweep.columns:
+                continue
+            rows.append({
+                "grid": g,
+                "carrier": c,
+                "mean_shed": float(sweep[col].mean()),
+                "n": int(len(sweep)),
+            })
+    if not rows:
+        return go.Figure()
+    df = pd.DataFrame(rows)
+    fig = go.Figure()
+    for c in carriers:
+        sub = df[df["carrier"] == c]
+        if sub.empty:
+            continue
+        fig.add_trace(go.Bar(
+            name=c, x=[pretty_scenario(g) for g in sub["grid"]],
+            y=sub["mean_shed"],
+            marker_color=ev.NETWORK_COLOR_MAP[c],
+            hovertemplate=("<b>%{x}</b><br>" + c
+                           + ": mean = %{y:.4f} MW"
+                           "<br>n = %{customdata[0]}<extra></extra>"),
+            customdata=np.c_[sub["n"].values],
+        ))
+    fig.update_layout(
+        barmode="group",
+        title="Average per-component shed per grid, broken down by sector",
+        xaxis_title="Grid",
+        yaxis_title="Mean shed per component (MW)",
+        height=460, width=max(720, 110 * len(grids) + 200),
+    )
+    return ev.apply_cmres_style(fig, legend="right")
+
+
 def _pooled_solve_time(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
                        grids: List[str]) -> go.Figure:
     """One box per grid of per-component solve time. Helps spot grids where
@@ -550,6 +602,7 @@ def plot_pooled(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
         _pooled_excess_shed_box(records, grids),
         _pooled_pareto(records, grids),
         _pooled_carrier_box(records, grids),
+        _pooled_mean_shed_by_carrier(records, grids),
         _pooled_kind_summary(records, grids),
         _pooled_top_components(records, grids, top_n=10),
         _pooled_solve_time(records, grids),
@@ -560,6 +613,7 @@ def plot_pooled(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
         "Excess shed (delta over baseline) per grid",
         "Pareto curves overlaid",
         "Per-carrier shed by grid",
+        "Mean per-component shed by sector",
         "Mean total shed by kind, per grid",
         "Top-10 components per grid",
         "Solve-time per grid",
@@ -570,6 +624,7 @@ def plot_pooled(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
         "excess_shed_box",
         "pareto_overlay",
         "carrier_box",
+        "mean_shed_by_carrier",
         "kind_summary",
         "top10_components",
         "solve_time",

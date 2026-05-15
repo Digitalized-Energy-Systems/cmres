@@ -147,6 +147,7 @@ def _solve_load_shed(
         check_pressure=True,
         check_temperature=True,
         check_line_loading=True,
+        priority_safety_factor=1000.0,
     )
     try:
         return run_energy_flow_optimization(

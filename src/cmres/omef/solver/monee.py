@@ -29,6 +29,7 @@ def solve(
         check_pressure=True,
         check_temperature=True,
         check_line_loading=True,
+        priority_safety_factor=1000.0,
     )
 
     return run_energy_flow_optimization(

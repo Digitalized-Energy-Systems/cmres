@@ -314,7 +314,7 @@ def create_large_lv_simbench(density, central=False, cp_capacity_invariant=False
                 "node_heat_gen_share": 3.0,
             },
             gas_kwargs={
-                "gas_gen_share": 8.0,
+                "gas_gen_share": 3.0,
                 "mesh_seed": 42,
             },
         )
@@ -335,7 +335,7 @@ def create_large_lv_simbench(density, central=False, cp_capacity_invariant=False
         return MESContainer(
             network=mes,
             ext_grid_el_bounds=(-0.10, 0.10),
-            ext_grid_gas_bounds=(-0.02, 0.02),
+            ext_grid_gas_bounds=(-0.007, 0.007),
             ext_grid_heat_bounds=(-6, 6),
         )
     return create
@@ -429,6 +429,7 @@ def solve(
         check_pressure=True,
         check_temperature=True,
         check_line_loading=True,
+        priority_safety_factor=1000.0,
     )
 
     return run_energy_flow_optimization(

@@ -2287,6 +2287,7 @@ def evaluate(folder_id):
                 check_pressure=True,
                 check_temperature=True,
                 check_line_loading=True,
+                priority_safety_factor=1000.0,
             )
             try:
                 result = run_energy_flow_optimization(
