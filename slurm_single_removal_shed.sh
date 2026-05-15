@@ -30,7 +30,7 @@
 #SBATCH --error=logs/srs_%A_%a.err
 #SBATCH --mail-type=FAIL
 #SBATCH --mail-user=rico.schrage@uni-oldenburg.de
-#SBATCH --nodelist=mpcb003,mpcb002
+#SBATCH --nodelist=mpcs046,mpcs047
 
 # Tunable knobs — must match the launcher's defaults.
 N_GRIDS=${N_GRIDS:-11}
