@@ -71,7 +71,7 @@ if [[ "$SUBMIT_MERGE" == "1" ]]; then
     echo "Submitting MERGE: $N_GRIDS grids (afterok:$RUN_JID)"
     MERGE_JID=$(
         sbatch \
-        -p rosa.p \
+        -p rosa_express.p \
             --parsable \
             --dependency=afterok:$RUN_JID \
             --array=0-$((N_GRIDS - 1)) \
@@ -91,7 +91,7 @@ if [[ "$SUBMIT_EVAL" == "1" ]]; then
     echo "Submitting EVAL: 1 task (afterok:$DEP_JID)"
     EVAL_JID=$(
         sbatch \
-            -p rosa.p \
+            -p rosa_express.p \
             --parsable \
             --dependency=afterok:$DEP_JID \
             --export=ALL,OUTPUT_DIR=$OUTPUT_DIR,INPUT_DIR=$INPUT_DIR,E16_OUT_DIR=$E16_OUT_DIR,SKIP_E16=$SKIP_E16 \
