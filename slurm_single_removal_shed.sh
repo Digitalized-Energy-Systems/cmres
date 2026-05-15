@@ -33,7 +33,7 @@
 #SBATCH --nodelist=mpcb023,mpcb024
 
 # Tunable knobs — must match the launcher's defaults.
-N_GRIDS=${N_GRIDS:-9}
+N_GRIDS=${N_GRIDS:-11}
 N_SHARDS=${N_SHARDS:-8}
 
 # SLURM array index → (grid_idx, shard_idx) — both 0-based.
@@ -51,11 +51,13 @@ GRIDS=(
     "simbench_lv_low"
     "simbench_lv"
     "simbench_lv_high"
-    "simbench_lv_centralized"
-    "simbench_lv_centralized_same_cap"
+    "simbench_lv_xl"
+    "simbench_lv_xxl"
     "simbench_lv_low_same_cap"
     "simbench_lv_same_cap"
     "simbench_lv_high_same_cap"
+    "simbench_lv_xl_same_cap"
+    "simbench_lv_xxl_same_cap"
 )
 
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-1}
