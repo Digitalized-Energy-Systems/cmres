@@ -57,7 +57,7 @@ echo "Submitting RUN: $N_GRIDS grids × $N_SHARDS shards = $N_RUN_TASKS tasks"
 
 RUN_JID=$(
     sbatch \
-        -p rosa.p \
+        -p rosa_express.p \
         --parsable \
         --array=0-$((N_RUN_TASKS - 1)) \
         --export=ALL,N_GRIDS=$N_GRIDS,N_SHARDS=$N_SHARDS,OUTPUT_DIR=$OUTPUT_DIR \
