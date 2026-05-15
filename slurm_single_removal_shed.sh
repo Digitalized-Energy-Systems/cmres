@@ -25,12 +25,12 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
-#SBATCH --time=04:00:00
+#SBATCH --time=02:00:00
 #SBATCH --output=logs/srs_%A_%a.out
 #SBATCH --error=logs/srs_%A_%a.err
 #SBATCH --mail-type=FAIL
 #SBATCH --mail-user=rico.schrage@uni-oldenburg.de
-#SBATCH --nodelist=mpcb023,mpcb024
+#SBATCH --nodelist=mpcb003,mpcb002
 
 # Tunable knobs — must match the launcher's defaults.
 N_GRIDS=${N_GRIDS:-11}
