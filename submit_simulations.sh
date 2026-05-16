@@ -43,7 +43,7 @@ echo "  Auto-merge    : ${SUBMIT_MERGE}"
 echo "============================================================"
 
 # ── RUN phase ─────────────────────────────────────────────────────────────────
-RUN_OUT=$(sbatch -p rosa.p --parsable --array="1-${TOTAL_TASKS}" "${WORKER}" "$@")
+RUN_OUT=$(sbatch -p rosa_express.p --parsable --array="1-${TOTAL_TASKS}" "${WORKER}" "$@")
 RUN_JOBID=$(echo "${RUN_OUT}" | tr -d '\n')
 if [[ -z "${RUN_JOBID}" ]]; then
     echo "ERROR: RUN-phase sbatch failed.  See SLURM error above." >&2
@@ -62,7 +62,7 @@ if [[ "${SUBMIT_MERGE}" != "1" ]]; then
     exit 0
 fi
 
-MERGE_OUT=$(CMRES_MERGE_PHASE=1 sbatch -p rosa.p --parsable \
+MERGE_OUT=$(CMRES_MERGE_PHASE=1 sbatch -p rosa_express.p --parsable \
     --dependency=afterok:"${RUN_JOBID}" \
     --time=00:30:00 \
     --array="1-${N_GRIDS}" \
