@@ -18,16 +18,16 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
-#SBATCH --time=8:00:00
+#SBATCH --time=2:00:00
 #SBATCH --output=logs/slurm_%A_%a.out
 #SBATCH --error=logs/slurm_%A_%a.err
 #SBATCH --mail-type=FAIL
 #SBATCH --mail-user=rico.schrage@uni-oldenburg.de
-#SBATCH --nodelist=mpcb023,mpcb024
+#SBATCH --nodelist=mpcs046,mpcs047
 
 # Tunable knobs (must match the launcher's defaults).
 N_GRIDS=${N_GRIDS:-11}
-N_SHARDS=${N_SHARDS:-12}
+N_SHARDS=${N_SHARDS:-48}
 
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-1}
 export MKL_NUM_THREADS=${SLURM_CPUS_PER_TASK:-1}
