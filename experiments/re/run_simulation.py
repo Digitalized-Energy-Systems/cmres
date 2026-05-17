@@ -272,6 +272,23 @@ def run_experiment(grid_name: str, shard: int = 0, n_shards: int = 1):
     )
     log.info(result.summary())
 
+    # Zero-truncation bias diagnostic. ``SimpleResilienceModel`` guarantees
+    # ≥1 failure per scenario, so MC means are conditional on "≥1 failure"
+    # and biased upward by ~1/(1 − p_all_zero). ``forced_failure_count``
+    # is the empirical estimate of n × P(all-zero). Logged here and
+    # persisted in the saved artefacts so downstream eval can correct or
+    # at least disclose the bias.
+    sc = max(resilience_model.scenario_count, 1)
+    p_all_zero = resilience_model.forced_failure_count / sc
+    log.info(
+        "Zero-truncation bias: %d / %d scenarios needed a forced failure "
+        "(P_hat(all-zero)=%.4f, upward-bias factor ~ %.4f)",
+        resilience_model.forced_failure_count,
+        resilience_model.scenario_count,
+        p_all_zero,
+        1.0 / (1.0 - p_all_zero) if p_all_zero < 1.0 else float("inf"),
+    )
+
     # ── Save ──────────────────────────────────────────────────────────────────
     if is_shard:
         np.savez(
@@ -282,6 +299,11 @@ def run_experiment(grid_name: str, shard: int = 0, n_shards: int = 1):
             shard_n_runs=np.array([result.n_runs]),
             elapsed_s=np.array([elapsed]),
             run_id_offset=np.array([run_id_offset]),
+            # Bias / accumulator diagnostics per shard. ``merge_shards``
+            # sums these across shards before computing P_hat(all-zero).
+            n_skipped_nonfinite=np.array([result.n_skipped_nonfinite]),
+            forced_failure_count=np.array([resilience_model.forced_failure_count]),
+            scenario_count=np.array([resilience_model.scenario_count]),
         )
         log.info(
             "Shard %d/%d saved (%d runs, %.1f min).  "
@@ -300,6 +322,10 @@ def run_experiment(grid_name: str, shard: int = 0, n_shards: int = 1):
             n_runs=np.array([result.n_runs]),
             converged=np.array([result.converged]),
             per_run=result.per_run,
+            # Bias / accumulator diagnostics — see [run] log block above.
+            n_skipped_nonfinite=np.array([result.n_skipped_nonfinite]),
+            forced_failure_count=np.array([resilience_model.forced_failure_count]),
+            scenario_count=np.array([resilience_model.scenario_count]),
             # E7: convergence checkpoints (n, mean[3], rhw[3], ess) per row.
             # Empty array if MCEngine wasn't recording (very old code path).
             convergence=(
@@ -310,7 +336,12 @@ def run_experiment(grid_name: str, shard: int = 0, n_shards: int = 1):
         )
         (out_dir / "mc_summary.txt").write_text(
             f"grid={grid_name}\n"
-            f"elapsed={elapsed:.1f}s\n\n" + result.summary()
+            f"elapsed={elapsed:.1f}s\n"
+            f"forced_failure_count={resilience_model.forced_failure_count}\n"
+            f"scenario_count={resilience_model.scenario_count}\n"
+            f"p_all_zero={p_all_zero:.6f}\n"
+            f"n_skipped_nonfinite={result.n_skipped_nonfinite}\n\n"
+            + result.summary()
         )
 
     return result
@@ -338,10 +369,18 @@ def merge_shards(grid_name: str) -> None:
     log.info("Merging %d shard files for grid=%s", len(shard_files), grid_name)
     per_run_chunks = []
     total_elapsed = 0.0
+    forced_total = 0
+    scenario_total = 0
     for fp in shard_files:
         z = np.load(fp)
         per_run_chunks.append(z["per_run"])
         total_elapsed += float(z["elapsed_s"][0])
+        # Sum bias counters across shards. Older shard files predate this
+        # field — fall back to 0 so old runs still merge cleanly.
+        if "forced_failure_count" in z.files:
+            forced_total += int(z["forced_failure_count"][0])
+        if "scenario_count" in z.files:
+            scenario_total += int(z["scenario_count"][0])
         log.info(
             "  %s : n_runs=%d  elapsed=%.1f min",
             fp.name, len(z["per_run"]), float(z["elapsed_s"][0]) / 60,
@@ -356,6 +395,9 @@ def merge_shards(grid_name: str) -> None:
     lo, hi = acc.confidence_interval()
     rhw = acc.relative_half_width()
     converged = bool(np.all(rhw <= MC_REL_TOL))
+    p_all_zero = (
+        forced_total / scenario_total if scenario_total else 0.0
+    )
 
     np.savez(
         out_dir / "mc_result.npz",
@@ -368,6 +410,9 @@ def merge_shards(grid_name: str) -> None:
         n_runs=np.array([n_runs]),
         converged=np.array([converged]),
         per_run=per_run,
+        n_skipped_nonfinite=np.array([acc.n_skipped]),
+        forced_failure_count=np.array([forced_total]),
+        scenario_count=np.array([scenario_total]),
     )
     summary_lines = [
         f"grid={grid_name}",
@@ -376,6 +421,10 @@ def merge_shards(grid_name: str) -> None:
         f"n_runs={n_runs}",
         f"ess={acc.ess:.1f}",
         f"converged={converged}",
+        f"forced_failure_count={forced_total}",
+        f"scenario_count={scenario_total}",
+        f"p_all_zero={p_all_zero:.6f}",
+        f"n_skipped_nonfinite={acc.n_skipped}",
         "",
         f"{'Carrier':<8} {'Mean':>10} {'Std':>10} {'CI 95% lo':>12} "
         f"{'CI 95% hi':>12} {'RHW':>8}",

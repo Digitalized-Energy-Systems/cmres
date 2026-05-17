@@ -45,10 +45,6 @@ FAIL_BASE_PROBABILITY_MAP = {
 }
 
 
-def FAILURE_PROBABILITY_MODEL(base_prob):
-    return max(0.0, min(1.0, base_prob * np.random.normal(1, scale=0.1)))
-
-
 # Discrete probability per timestep: CDF difference with bell centred at midpoint of
 # incident window, scale = window/4 so ±2σ covers the incident span.  Sums to ≈1 over
 # the incident window and auto-scales when incident_timesteps changes.
@@ -62,10 +58,6 @@ def FAILURE_TIME_MODEL(incident_time_steps, time):
         loc=incident_time_steps / 2,
         scale=max(incident_time_steps / 4.0, 1.0),
     )
-
-
-def FAILURE_SPATIAL_MODEL(coords):
-    return 1
 
 
 # Numeric guard: clip uniform inputs away from 0/1 before norm.ppf
@@ -83,22 +75,25 @@ class SimpleResilienceModel(ResilienceModel):
         incident_shift=5,
         incident_timesteps=10,
         base_fail_probability_map=FAIL_BASE_PROBABILITY_MAP,
-        fail_probability_model=FAILURE_PROBABILITY_MODEL,
         time_model=FAILURE_TIME_MODEL,
-        spatial_model=FAILURE_SPATIAL_MODEL,
         base_fail=0.3,
     ) -> None:
         self._base_fail = base_fail
         self._incident_shift = incident_shift
         self._incident_timesteps = incident_timesteps
         self._base_fail_probability_map = base_fail_probability_map
-        self._fail_probability_model = fail_probability_model
         self._time_model = lambda time: time_model(
             self._incident_timesteps + incident_shift, time
         )
-        self._spatial_model = lambda coords: (
-            spatial_model(coords) if coords is not None else 1
-        )
+        # Zero-truncation diagnostics. ``generate_failures`` always returns
+        # at least one Failure: if no component triggers spontaneously the
+        # highest-probability candidate is forced. The MC estimator that
+        # consumes these scenarios is therefore conditional on "≥1 failure"
+        # and biased upward by ~1/(1 − P(all-zero)). Tracking the fraction
+        # of scenarios that needed the forced-failure path lets downstream
+        # reporting surface this bias instead of hiding it.
+        self.scenario_count: int = 0
+        self.forced_failure_count: int = 0
 
     # ── Scenario-aware failure generation ─────────────────────────────────────
 
@@ -259,6 +254,7 @@ class SimpleResilienceModel(ResilienceModel):
                     best_candidate = (fail_prob, compound, time)
 
         # Guarantee at least one failure per scenario.
+        self.scenario_count += 1
         if not failures and best_candidate is not None:
             fp, comp, time = best_candidate
             log.debug(
@@ -268,6 +264,7 @@ class SimpleResilienceModel(ResilienceModel):
                 fp,
             )
             failures.append(Failure(time, comp, fp, Effect.DEAD))
+            self.forced_failure_count += 1
 
         return failures
 

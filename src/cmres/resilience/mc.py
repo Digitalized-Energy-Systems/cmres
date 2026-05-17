@@ -290,6 +290,11 @@ class WeightedAccumulator:
 
     def __init__(self, n_carriers: int = 3):
         self.n = 0
+        # ``n_skipped`` counts samples rejected by ``update`` because they
+        # contained non-finite values (NaN / Inf). Surfaced on ``MCResult``
+        # so a silent solver-instability tail can't masquerade as
+        # convergence on a tiny effective sample.
+        self.n_skipped = 0
         self._sum_w = 0.0
         self._sum_w2 = 0.0
         self._mean = np.zeros(n_carriers)
@@ -306,6 +311,7 @@ class WeightedAccumulator:
                 RuntimeWarning,
                 stacklevel=2,
             )
+            self.n_skipped += 1
             return
         w = math.exp(log_weight)
         self.n += 1
@@ -414,6 +420,7 @@ class CIStoppingCriterion:
         lo, hi = self._acc.confidence_interval()
         return {
             "n": self._acc.n,
+            "n_skipped": self._acc.n_skipped,
             "ess": self._acc.ess,
             "mean": self._acc.mean,
             "std": self._acc.std,
@@ -450,6 +457,14 @@ class MCResult:
     # Per-run raw carrier vectors, shape (n_runs, 3)
     per_run: np.ndarray
 
+    # Number of attempted scenarios whose per-carrier loss vector contained
+    # non-finite values and was dropped by ``WeightedAccumulator``. The MC
+    # loop's iteration counter ``n_runs`` includes these — only the
+    # accumulator excludes them — so a non-zero value here means the
+    # convergence diagnostics above were computed from
+    # ``n_runs − n_skipped_nonfinite`` valid samples.
+    n_skipped_nonfinite: int = 0
+
     # E7: convergence trace. Each entry is a snapshot at a checkpoint:
     # (n_runs, mean[3], rel_half_width[3], ess). Populated per
     # CHECKPOINT_EVERY runs by the engine so downstream eval can plot
@@ -461,9 +476,14 @@ class MCResult:
     )
 
     def summary(self) -> str:
+        skip_note = (
+            f"  skipped_nonfinite={self.n_skipped_nonfinite}"
+            if self.n_skipped_nonfinite
+            else ""
+        )
         hdr = (
             f"MCResult  n={self.n_runs}  ess={self.ess:.1f}"
-            f"  converged={self.converged}\n"
+            f"  converged={self.converged}{skip_note}\n"
             f"{'Carrier':<8} {'Mean':>10} {'Std':>10} "
             f"{'CI 95% lo':>12} {'CI 95% hi':>12} {'RHW':>8}\n" + "-" * 62
         )
@@ -621,6 +641,14 @@ class MCEngine:
                 ]
             )
         )
+        n_skipped = int(final_diag.get("n_skipped", 0))
+        if n_skipped:
+            log.warning(
+                "MCEngine: %d non-finite sample(s) skipped by the accumulator "
+                "(out of %d attempted runs). Convergence diagnostics are "
+                "based on %d valid samples; investigate solver instability.",
+                n_skipped, i, i - n_skipped,
+            )
         return MCResult(
             n_runs=i,
             converged=converged,
@@ -631,5 +659,6 @@ class MCEngine:
             rel_half_width=final_diag["rel_half_width"],
             ess=final_diag.get("ess", float(i)),
             per_run=np.array(per_run),
+            n_skipped_nonfinite=n_skipped,
             convergence=np.asarray(trace) if trace else None,
         )

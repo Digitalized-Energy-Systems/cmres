@@ -417,19 +417,24 @@ CARRIER_REPLACE_MAP = {"0": "electricity", "1": "heat", "2": "gas"}
 
 # Maps the technical scenario / network-type identifiers used on disk (and as
 # the suffix in folder names of the form ``<EXPERIMENT_NAME>-<grid>``) to
-# human-readable labels for plots. Unknown keys are returned unchanged so the
-# pipeline does not crash if a new grid is registered without an entry here.
+# human-readable labels for plots. The mapping mirrors ``ALL_GRIDS`` in
+# ``test_grids.py`` — keep both in sync when a new grid is added.
+# Unknown keys are returned unchanged so the pipeline does not crash if a
+# new grid is registered without an entry here.
 SCENARIO_NAME_MAP = {
+    # Distributed-CP family (cp_capacity_invariant=False)
     "simbench_lv_no": "No CPs",
     "simbench_lv_low": "Low CP density",
     "simbench_lv": "Medium CP density",
-    "simbench_lv_centralized": "Centralized",
     "simbench_lv_high": "High CP density",
-    "simbench_lv_max": "Max CP density",
-    "large_urban_balanced": "Balanced urban",
-    "urban_district": "Urban district",
-    "industrial_hub": "Industrial hub",
-    "regional_mes": "Regional MES",
+    "simbench_lv_xl": "XL CP density",
+    "simbench_lv_xxl": "XXL CP density",
+    # Capacity-invariant family (cp_capacity_invariant=True)
+    "simbench_lv_low_same_cap": "Low CP density (same cap.)",
+    "simbench_lv_same_cap": "Medium CP density (same cap.)",
+    "simbench_lv_high_same_cap": "High CP density (same cap.)",
+    "simbench_lv_xl_same_cap": "XL CP density (same cap.)",
+    "simbench_lv_xxl_same_cap": "XXL CP density (same cap.)",
 }
 
 
@@ -442,6 +447,37 @@ def pretty_scenario(name) -> str:
     if name is None:
         return ""
     return SCENARIO_NAME_MAP.get(str(name), str(name))
+
+
+def _all_grids_order():
+    """Canonical scenario ordering from ``test_grids.ALL_GRIDS``.
+
+    Returns a ``{grid_name: position}`` map. Imported lazily so this module
+    works in environments where ``test_grids`` (and its heavy simbench /
+    monee deps) hasn't been put on the path.
+    """
+    try:
+        from test_grids import ALL_GRIDS  # type: ignore
+        return {k: i for i, k in enumerate(ALL_GRIDS.keys())}
+    except Exception:
+        # Fallback: derive from SCENARIO_NAME_MAP insertion order. Same
+        # ordering as long as the map is kept in sync with ALL_GRIDS.
+        return {k: i for i, k in enumerate(SCENARIO_NAME_MAP.keys())}
+
+
+def scenario_sort_key(name) -> tuple:
+    """Sort key that orders network-type ids by their position in
+    ``ALL_GRIDS`` (i.e. matching ``test_grids.py``). Unknown ids land at
+    the end in lexicographic order, so a stray scenario name doesn't
+    crash the figure pipeline."""
+    order = _all_grids_order()
+    s = str(name)
+    return (order.get(s, len(order)), s)
+
+
+def sort_scenarios(names):
+    """Return ``names`` sorted by :func:`scenario_sort_key`."""
+    return sorted(names, key=scenario_sort_key)
 
 
 def resilience_per_scenario(perf_df: pandas.DataFrame, folder_id):
@@ -495,11 +531,23 @@ def resilience_per_scenario(perf_df: pandas.DataFrame, folder_id):
         width=1200,
         height=450,
     )
-    unique_network_types = sorted(pandas.unique(
-        resilience_per_carrier_per_scenario["network_type"]
-    ))
+    unique_network_types = sort_scenarios(
+        pandas.unique(resilience_per_carrier_per_scenario["network_type"])
+    )
     unique_experiments = list(
         pandas.unique(resilience_per_carrier_per_scenario["experiment"])
+    )
+
+    # Sort the inner per-carrier rows by the canonical grid order so the
+    # values line up with ``unique_network_types`` when zipped into the
+    # grouped-bar chart.
+    _sort_keys = (
+        resilience_per_carrier_per_scenario["network_type"].map(scenario_sort_key)
+    )
+    resilience_per_carrier_per_scenario = (
+        resilience_per_carrier_per_scenario.assign(_sort_key=_sort_keys)
+        .sort_values(by=["_sort_key", "experiment"])
+        .drop(columns="_sort_key")
     )
 
     resilience_per_carrier_per_scenario_hist_2 = (
@@ -508,7 +556,7 @@ def resilience_per_scenario(perf_df: pandas.DataFrame, folder_id):
                 list(
                     resilience_per_carrier_per_scenario[
                         resilience_per_carrier_per_scenario["carrier"] == carrier
-                    ].sort_values(by=["network_type", "experiment"])["resilience_mean"]
+                    ]["resilience_mean"]
                 )
                 for carrier in ["electricity", "heat", "gas"]
             ],
@@ -1826,7 +1874,16 @@ def pooled_resilience_per_scenario(perf_df: pandas.DataFrame, output_dir: str):
     )
     pooled["carrier"] = pooled["carrier"].map(CARRIER_REPLACE_MAP)
     pooled["scenario"] = pooled["network_type"].map(pretty_scenario)
-    pooled = pooled.sort_values(["network_type", "experiment", "carrier"]).reset_index(drop=True)
+    # Order rows (and therefore the x-axis categories below) by the
+    # canonical ALL_GRIDS scheme so figures are consistent across runs.
+    pooled = (
+        pooled.assign(
+            _sort_key=pooled["network_type"].map(scenario_sort_key)
+        )
+        .sort_values(["_sort_key", "experiment", "carrier"])
+        .drop(columns="_sort_key")
+        .reset_index(drop=True)
+    )
 
     fig = eval.create_bar(
         pooled,
@@ -1861,6 +1918,138 @@ def pooled_resilience_per_scenario(perf_df: pandas.DataFrame, output_dir: str):
         f"Pooled resilience plot: "
         f"{pooled['scenario'].nunique()} scenarios across "
         f"{pooled['network_type'].nunique()} network types → {output_dir}"
+    )
+
+
+def cross_carrier_impact_per_scenario(
+    impact_df: pandas.DataFrame, output_dir: str
+):
+    """Cross-sector impact figure: one panel per scenario, no averaging.
+
+    For each scenario (= grid in ``test_grids.ALL_GRIDS``), shows the total
+    |impact| (MW) attributable to failures originating in each source
+    carrier (electricity / heat / gas / multi-carrier CPs), broken down
+    by the impacted target carrier (electricity / heat / gas).
+
+    Reading the figure:
+      * x-axis of each subplot = **source** carrier (where the failed
+        component lives).
+      * grouped bars (color) = **target/impacted** carrier (where the
+        load-shed shows up).
+      * each subplot keeps the scenario's raw cross-sector pattern intact
+        — nothing is pooled across scenarios.
+
+    Source classification uses ``TYPE_TO_CARRIER``. Components mapped to
+    ``"multi"`` (CHP / P2G / G2P / P2H / GasToHeatHG / their control
+    nodes) get their own ``multi`` source bucket so cross-carrier
+    coupling-point impacts don't disappear into the three plain sectors.
+    Components mapped to ``"heat/gas"`` (generic junctions) are dropped
+    because the static type→carrier map cannot disambiguate them without
+    the grid object.
+    """
+    if impact_df is None or impact_df.empty:
+        print("Cross-carrier impact: empty impact_df — skipping.")
+        return
+
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
+    df = impact_df.copy()
+    df["source_carrier"] = df["type"].astype(str).map(TYPE_TO_CARRIER)
+    df = df[df["source_carrier"].notna()]
+    # Drop the ambiguous "heat/gas" source bucket (generic Junction); the
+    # static map can't say which grid the junction lives on.
+    df = df[df["source_carrier"] != "heat/gas"]
+    df["impact_abs"] = df["impact"].abs()
+
+    source_order = ["electricity", "heat", "gas", "multi"]
+    target_order = ["electricity", "heat", "gas"]
+    color_map = eval.NETWORK_COLOR_MAP  # {"heat": .., "gas": .., "electricity": ..}
+
+    agg = (
+        df.groupby(["network_type", "source_carrier", "carrier"], as_index=False)[
+            "impact_abs"
+        ]
+        .sum()
+    )
+
+    nets = sort_scenarios(agg["network_type"].unique())
+    if not nets:
+        print("Cross-carrier impact: no scenarios after filtering — skipping.")
+        return
+
+    n = len(nets)
+    n_cols = min(3, n)
+    n_rows = (n + n_cols - 1) // n_cols
+    fig = make_subplots(
+        rows=n_rows, cols=n_cols,
+        subplot_titles=[pretty_scenario(nt) for nt in nets],
+        shared_yaxes=False,
+        horizontal_spacing=0.07, vertical_spacing=0.18,
+    )
+
+    # Find a global y-range so subplots are comparable at a glance.
+    y_max = float(agg["impact_abs"].max() or 0.0) * 1.10
+    if y_max <= 0:
+        y_max = 1.0
+
+    legend_seen: set = set()
+    for idx, nt in enumerate(nets):
+        r = idx // n_cols + 1
+        c = idx % n_cols + 1
+        sub = agg[agg["network_type"] == nt]
+        for target in target_order:
+            sub_t = sub[sub["carrier"] == target]
+            # Reindex over source_order so empty buckets render as zero
+            # and the x-axis is identical across every subplot.
+            ys = [
+                float(sub_t.loc[sub_t["source_carrier"] == s, "impact_abs"].sum())
+                for s in source_order
+            ]
+            show_legend = target not in legend_seen
+            legend_seen.add(target)
+            fig.add_trace(
+                go.Bar(
+                    x=source_order, y=ys,
+                    name=f"→ {target}",
+                    marker_color=color_map.get(target, "#888888"),
+                    legendgroup=target,
+                    showlegend=show_legend,
+                    hovertemplate=(
+                        f"scenario={pretty_scenario(nt)}<br>"
+                        "source=%{x}<br>"
+                        f"target={target}<br>"
+                        "Σ |impact|=%{y:.4f} MW<extra></extra>"
+                    ),
+                ),
+                row=r, col=c,
+            )
+        fig.update_xaxes(title_text="Source carrier", row=r, col=c)
+        fig.update_yaxes(
+            title_text="Σ |impact| (MW)", range=[0, y_max], row=r, col=c,
+        )
+
+    fig.update_layout(
+        barmode="group",
+        height=300 * n_rows + 80,
+        width=420 * n_cols,
+        template=eval.CMRES_TEMPLATE,
+        legend=dict(title="Impacted carrier"),
+        margin={"l": 70, "b": 60, "r": 30, "t": 70},
+    )
+
+    Path(output_dir).mkdir(exist_ok=True, parents=True)
+    eval.write_all_in_one(
+        [fig], "Figure", Path("."),
+        output_dir + "/cross_carrier_impact_per_scenario.html",
+        titles=[
+            f"Cross-carrier impact per scenario "
+            f"(n_scenarios={n}, source × target, no averaging)"
+        ],
+    )
+    print(
+        f"Cross-carrier impact: {n} scenarios → "
+        f"{output_dir}/cross_carrier_impact_per_scenario.html"
     )
 
 
@@ -1911,7 +2100,7 @@ def pooled_metric_comparison(pooled_df, output_dir):
         valid = valid_mc
 
     n_total = len(valid)
-    net_types = sorted(valid["network_type"].unique())
+    net_types = sort_scenarios(valid["network_type"].unique())
     print(
         f"Pooled analysis: {n_total} components (MC-sampled, of {n_all} matched) "
         f"across {len(net_types)} network types: {net_types}"
@@ -1975,6 +2164,57 @@ def pooled_metric_comparison(pooled_df, output_dir):
     )
     figures.append(scatter_fig)
     titles.append(f"Pooled metric scatter (n={n_total} across {len(net_types)} networks)")
+
+    # ── 1b. Pairwise Spearman ρ heatmap across all metrics + actual ──────────
+    # Companion to the per-metric scatter panels above: shows pairwise
+    # rank correlation between every predicted score and the MC actual
+    # impact, so redundant / co-linear scores stand out at a glance.
+    heat_cols = [col for col, _ in METRICS]
+    heat_labels = [label for _, label in METRICS]
+    n_h = len(heat_cols)
+    rho_matrix = _np.zeros((n_h, n_h), dtype=float)
+    for i, ci in enumerate(heat_cols):
+        x_i = valid[ci].values
+        for j, cj in enumerate(heat_cols):
+            x_j = valid[cj].values
+            try:
+                rho_matrix[i, j] = float(scipy.stats.spearmanr(x_i, x_j).statistic)
+            except Exception:
+                rho_matrix[i, j] = float("nan")
+    corr_fig = go.Figure(go.Heatmap(
+        z=rho_matrix,
+        x=heat_labels,
+        y=heat_labels,
+        zmin=-1.0, zmax=1.0,
+        colorscale="RdBu_r",
+        reversescale=False,
+        colorbar=dict(title="Spearman ρ", tickvals=[-1, -0.5, 0, 0.5, 1]),
+        hovertemplate="x=%{x}<br>y=%{y}<br>ρ=%{z:.2f}<extra></extra>",
+    ))
+    # Cell annotations (small numeric labels) for quick visual scanning.
+    annotations = []
+    for i in range(n_h):
+        for j in range(n_h):
+            v = rho_matrix[i, j]
+            text_color = "white" if abs(v) > 0.55 else "black"
+            annotations.append(dict(
+                x=heat_labels[j], y=heat_labels[i],
+                text=("—" if v != v else f"{v:.2f}"),
+                xref="x", yref="y", showarrow=False,
+                font=dict(size=10, color=text_color),
+            ))
+    corr_fig.update_layout(
+        height=80 + 38 * n_h, width=140 + 38 * n_h + 260,
+        template=eval.CMRES_TEMPLATE,
+        margin={"l": 200, "b": 180, "r": 60, "t": 50},
+        annotations=annotations,
+        xaxis=dict(tickangle=-35, automargin=True),
+        yaxis=dict(autorange="reversed", automargin=True),
+    )
+    figures.append(corr_fig)
+    titles.append(
+        f"Pairwise Spearman ρ across metrics and the MC actual (n={n_total})"
+    )
 
     # ── 2. ρ bar chart with 95% CI ─────────────────────────────────────────
     rho_rows = []
@@ -2341,6 +2581,7 @@ def evaluate(folder_id):
             )
 
     pooled_resilience_per_scenario(perf_df, OUTPUT + "/pooled")
+    cross_carrier_impact_per_scenario(impact_df, OUTPUT + "/pooled")
 
     if len(per_network_dfs) > 1:
         pooled_df = pandas.concat(per_network_dfs, ignore_index=True)

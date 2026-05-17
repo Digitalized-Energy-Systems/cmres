@@ -25,7 +25,6 @@ dependencies = [
   "numpy",
   "peext",
   "torch",
-  "overrides",
   "networkx",
   "numba",
   "jax[cpu]",
@@ -33,8 +32,6 @@ dependencies = [
   "scipy",
   "plotly==6.3.0",
   "kaleido==0.2.1",
-  "pykalman-py311-update",
-  "python-interface",
   "gurobipy",
   "monee @ git+https://github.com/Digitalized-Energy-Systems/monee@development"
 ]

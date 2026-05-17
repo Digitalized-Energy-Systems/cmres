@@ -42,7 +42,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-import pickle
 import sys
 import time
 import traceback
@@ -88,12 +87,29 @@ def _enumerate_targets(monee_net) -> List[Tuple[str, str, object]]:
             targets.append((f"compound:{cp.id}", "compound", cp))
 
     # Branch CPs (PowerToGas / GasToPower / PowerToHeatHG / GasToHeatHG)
-    # → cp_id "from→to" (matches mes_cp_metric's branch CP rows)
+    # → cp_id "from→to" (matches mes_cp_metric's branch CP rows).
+    # Different branch-CP classes have different (from-grid, to-grid)
+    # topologies in current factories, so endpoint pairs are unique.
+    # Downstream consumers in ``eval_common`` and ``cp_metric_structural``
+    # parse cp_id by splitting on "→" and rely on this uniqueness — guard
+    # it explicitly so a future grid factory placing two branch CPs
+    # between the same nodes fails here rather than silently producing
+    # duplicate cp_id rows that collapse on merge.
+    branch_cp_seen: dict = {}
     for cls in (mm.PowerToGas, mm.GasToPower, mm.PowerToHeatHG, mm.GasToHeatHG):
         for b in monee_net.branches_by_type(cls):
-            targets.append(
-                (f"{b.from_node_id}→{b.to_node_id}", "branch_cp", b)
-            )
+            cp_id = f"{b.from_node_id}→{b.to_node_id}"
+            if cp_id in branch_cp_seen:
+                raise AssertionError(
+                    f"Duplicate branch-CP cp_id {cp_id!r}: both "
+                    f"{branch_cp_seen[cp_id]} and {type(b.model).__name__} "
+                    "share this endpoint pair. Downstream cp_id-keyed "
+                    "merges (df_eval / structural metric joins) would "
+                    "silently collapse these rows. Disambiguate the cp_id "
+                    "scheme before re-running."
+                )
+            branch_cp_seen[cp_id] = type(b.model).__name__
+            targets.append((cp_id, "branch_cp", b))
 
     # Non-CP branches → cp_id is the str of the branch id (e.g. "(5, 134, 0)")
     cp_branch_ids = set()
@@ -260,24 +276,23 @@ def compute_single_removal_shed(
 ) -> pd.DataFrame:
     """Run deactivate-solve for each target on a *factory-fresh* network.
 
-    Why a factory (callable) instead of a single Network object + ``.copy()``:
+    Why a factory (callable) instead of solving the same Network repeatedly:
     monee's Pyomo solver mutates the network's Var state in place. A single
     successful solve replaces every per-component Var with its solved float
-    value, after which ``optimization_problem._apply(network)`` crashes
-    with ::
+    value, after which ``optimization_problem._apply(network)`` on the SAME
+    network crashes with ::
 
         AttributeError: 'float' object has no attribute 'max'
 
     because ``_apply`` expects each variable it sets bounds on to still be
-    a Pyomo Var. ``Network.copy()`` doesn't reliably reconstitute every
-    Var — the copied network's Vars sometimes survive as floats. Calling
-    ``net_factory()`` (typically ``pickle.loads(cached_bytes)`` over an
-    in-memory snapshot of a ``test_grids.ALL_GRIDS`` build) returns a
-    guaranteed-fresh formulated-but-unsolved network for every iteration.
+    a Pyomo Var. ``Network.copy()`` of a **pristine** (unsolved) network is
+    safe and is the recommended factory; ``Network.copy()`` of an
+    **already-solved** network inherits the same crystallised floats and
+    will fail the same way.
 
-    ``net_factory`` is also accepted as a Network instance for backwards
-    compat — that path uses ``net.copy()`` and inherits the brittleness
-    above.
+    ``net_factory`` may also be passed as a Network instance for backwards
+    compat — that path wraps it in ``net.copy`` and assumes the network
+    is pristine.
 
     Returns a DataFrame with ``cp_id, kind, power_shed, heat_shed, gas_shed,
     total_shed, solve_status, elapsed_s``.
@@ -388,12 +403,11 @@ def _resolve_grid(grid_name: str):
     formulated network, the ext-grid bounds matching the resilience MC, and
     one freshly built network for target enumeration / logging.
 
-    The factory route mirrors the previous pickle-file design (deserialise
-    per iteration to dodge in-place Pyomo Var mutation) but the bytes come
-    from a single in-memory ``pickle.dumps`` over the
-    ``test_grids``-constructed network rather than from a disk artefact —
-    so a run depends only on the grid name and the source-of-truth in
-    ``test_grids.py``, not on a pickled MC run.
+    The factory hands out fresh ``pristine.copy()`` instances. Building the
+    grid once and copying per iteration avoids re-loading simbench and
+    re-applying the MISOCP / McCormick formulations on every solve.
+    Copying a pristine (unsolved) network is safe; the prior pickle
+    round-trip was a defensive measure that is no longer required.
     """
     from test_grids import ALL_GRIDS  # local import keeps CLI startup cheap
 
@@ -404,20 +418,17 @@ def _resolve_grid(grid_name: str):
         )
     create_fn, _ = ALL_GRIDS[grid_name]
     container = create_fn()
-    # Snapshot the formulated network once — re-running the factory per
-    # iteration would re-load simbench and reapply the MISOCP / McCormick
-    # formulations, which is much more expensive than a pickle round-trip.
-    net_bytes = pickle.dumps(container.network)
+    pristine = container.network
 
     def net_factory():
-        return pickle.loads(net_bytes)
+        return pristine.copy()
 
     bounds = {
         "ext_grid_el_bounds": container.ext_grid_el_bounds,
         "ext_grid_gas_bounds": container.ext_grid_gas_bounds,
         "ext_grid_heat_bounds": container.ext_grid_heat_bounds,
     }
-    return net_factory, bounds, container.network
+    return net_factory, bounds, pristine
 
 
 def main():

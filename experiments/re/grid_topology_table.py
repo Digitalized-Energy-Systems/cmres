@@ -2,15 +2,12 @@
 
 Reports per row (in column order):
     1.  scenario id
-    2.  # buses                    (electricity nodes)
-    3.  # gas junctions            (gas-grid junctions, CP control nodes excluded)
-    4.  # heat junctions           (water-grid junctions, idem)
-    5.  # branches (electricity)   (GenericPowerBranch / PowerLine / Trafo)
-    6.  # branches (gas)           (GasPipe / GasCompressor)
-    7.  # branches (heat)          (WaterPipe)
-    8.  # CPs                      (size of net.cps)
-    9. – 11. rated generation capacity per sector  (electricity / gas / heat) in MW
-   12. – 14. rated CP capacity per sector          (electricity / gas / heat) in MW
+    2.  total # nodes              (buses + gas + heat junctions)
+    3.  total # branches           (electricity + gas + heat)
+    4.  # CPs                      (size of net.cps)
+    5. – 7. rated capacity / demand per sector (electricity / gas / heat) in
+              MW, each cell formatted as ``gen/CP/demand``
+              (primary generation / CP output / load).
 
 CP capacity per sector = sum of CP throughput on that carrier side, e.g.
 electricity = Σ |p_in| (P2H, P2G) + Σ |p_out| (G2P, CHP). Gas capacities
@@ -284,9 +281,9 @@ def row_for(name: str) -> str:
         f"{n_bus + n_gj + n_hj}",
         f"{nb_e + nb_g + nb_h}",
         f"{n_cp}",
-        _fmt(gen_e), _fmt(gen_g), _fmt(gen_h),
-        _fmt(cp_e),  _fmt(cp_g),  _fmt(cp_h),
-        _fmt(dem_e), _fmt(dem_g), _fmt(dem_h),
+        f"{_fmt(gen_e)}/{_fmt(cp_e)}/{_fmt(dem_e)}",
+        f"{_fmt(gen_g)}/{_fmt(cp_g)}/{_fmt(dem_g)}",
+        f"{_fmt(gen_h)}/{_fmt(cp_h)}/{_fmt(dem_h)}",
     ]
     return " & ".join(cells) + r" \\"
 

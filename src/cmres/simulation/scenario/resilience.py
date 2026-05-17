@@ -11,6 +11,7 @@ from cmres.resilience.core import ResilienceMetric, ResilienceModel
 from cmres.resilience.model import CascadingModel
 
 import cmres.data.observer as observer
+from cmres.data.observer import Observer
 
 from monee import Network, TimeseriesData
 import pandas
@@ -122,8 +123,16 @@ def write_in_one_html(figures, name):
             file.write(fig.to_html(full_html=False, include_plotlyjs=False))
 
 
-def flush_observed_data(experiment_name, id):
-    for key, value_list in observer.data().items():
+def flush_observed_data(experiment_name, id, obs=None):
+    """Flush gathered events to per-key CSVs.
+
+    ``obs`` selects which Observer to read. Defaults to the current
+    thread-local observer (legacy global behavior); explicit-pass an
+    Observer instance to flush a specific run's state regardless of
+    which context happens to be active.
+    """
+    source = obs if obs is not None else observer
+    for key, value_list in source.data().items():
         out_path = Path(experiment_name)
         out_path.mkdir(parents=True, exist_ok=True)
         out_file = out_path / Path(f"{key}.csv")
@@ -188,47 +197,55 @@ def start_resilience_simulation(
         fault_generator=fault_gen,
     )
     sim.add_step_hook(cascading_model.step)
-    try:
+    # Per-run observer context: any ``observer.gather`` call inside the
+    # ``with`` block targets THIS Observer only — never the shared default
+    # or another concurrent run's state. Replaces the prior global-dict +
+    # ``observer.clear()``-in-finally pattern.
+    with Observer() as obs:
         try:
-            sim.prepare()
-            cascading_model._faults = sim.faults
-            log.debug("Starting simulation  faults=%s", [str(f) for f in sim.faults])
-            sim.run()
-        finally:
-            # Capture incidents BEFORE flush_observed_data, since that path is
-            # CSV-friendly but discards rich per-incident structure (active fault
-            # list, solver report).  flush still runs afterwards so the CSV
-            # ``infeasibility.csv`` artefact is preserved alongside the dump.
-            incidents = list(observer.data().get("infeasibility", []))
-            if incidents:
-                try:
-                    _dump_infeasibility_incident(
-                        out_name=out_name,
-                        run_id=id,
-                        name=name,
-                        scenario=scenario,
-                        faults=getattr(sim, "faults", None),
-                        incidents=incidents,
-                    )
-                except Exception:
-                    log.exception(
-                        "Failed to dump infeasibility incident packet for run id=%s",
-                        id,
-                    )
-            log.debug("Flushing observer data  id=%s", id)
-            flush_observed_data(out_name, id)
+            try:
+                sim.prepare()
+                cascading_model._faults = sim.faults
+                log.debug("Starting simulation  faults=%s", [str(f) for f in sim.faults])
+                sim.run()
+            finally:
+                # Capture incidents BEFORE flush_observed_data, since that
+                # path is CSV-friendly but discards rich per-incident
+                # structure (active fault list, solver report). flush still
+                # runs afterwards so the CSV ``infeasibility.csv`` artefact
+                # is preserved alongside the dump.
+                incidents = list(obs.data().get("infeasibility", []))
+                if incidents:
+                    try:
+                        _dump_infeasibility_incident(
+                            out_name=out_name,
+                            run_id=id,
+                            name=name,
+                            scenario=scenario,
+                            faults=getattr(sim, "faults", None),
+                            incidents=incidents,
+                        )
+                    except Exception:
+                        log.exception(
+                            "Failed to dump infeasibility incident packet for run id=%s",
+                            id,
+                        )
+                log.debug("Flushing observer data  id=%s", id)
+                flush_observed_data(out_name, id, obs=obs)
 
-        # Per-carrier performance sums: index 0=power, 1=heat, 2=gas.
-        # Each entry in observer.data()["performance"] is a 3-tuple (or scalar).
-        raw_perfs = observer.data().get("performance", [])
-        per_carrier = pandas.DataFrame(
-            [t if isinstance(t, (list, tuple)) else [t, 0.0, 0.0] for t in raw_perfs],
-            columns=["power", "heat", "gas"],
-        )
-        carrier_sums = per_carrier.sum().to_numpy()  # shape (3,): [power, heat, gas]
-        performance_sum = float(carrier_sums.sum())  # scalar total
-        return performance_sum, carrier_sums
-    finally:
-        # Always clear the global observer state, even if post-processing
-        # raised — otherwise stale per-run data leaks into the next call.
-        observer.clear()
+            # Per-carrier performance sums: index 0=power, 1=heat, 2=gas.
+            # Each entry in obs.data()["performance"] is a 3-tuple (or scalar).
+            raw_perfs = obs.data().get("performance", [])
+            per_carrier = pandas.DataFrame(
+                [t if isinstance(t, (list, tuple)) else [t, 0.0, 0.0] for t in raw_perfs],
+                columns=["power", "heat", "gas"],
+            )
+            carrier_sums = per_carrier.sum().to_numpy()  # shape (3,): [power, heat, gas]
+            performance_sum = float(carrier_sums.sum())  # scalar total
+            return performance_sum, carrier_sums
+        finally:
+            # Observer state goes out of scope with the ``with`` block —
+            # no global clear required. The legacy ``observer`` module
+            # still gets cleared defensively in case any hook captured the
+            # free function from outside the context.
+            observer.clear()
