@@ -1281,7 +1281,9 @@ def cp_metric_vs_actual_impact(monee_net, impact_df_nt, network_type):
     rho_bar.data[0].marker.color = list(_palette)
 
     rho_bar.update_layout(
-        height=450, width=800,
+        # Match E16 vertical-bar dim: ~460h × (120 + 110·N)w so per-metric
+        # bar width is the same as in cmres_eval_plots' E16 sector bars.
+        height=460, width=120 + 110 * max(len(rho_df), 1),
         template=eval.CMRES_TEMPLATE,
         yaxis=dict(title="Spearman ρ vs Actual (95% CI)", range=[-1.15, 1.15],
                    gridcolor="#e5e5e5",
@@ -1463,7 +1465,10 @@ def cp_metric_vs_actual_impact(monee_net, impact_df_nt, network_type):
                              row=1, col=col_idx)
 
     acc_fig.update_layout(
-        height=80 + 40 * len(acc_df), width=1700,
+        # 4 horizontal-bar panels side by side. Per-panel width matches
+        # the E16 single-bar figure (~460 px); per-bar height bumped to
+        # 60 px so individual bars are visually similar to E16's bars.
+        height=120 + 60 * len(acc_df), width=460 * len(panels) + 60,
         template=eval.CMRES_TEMPLATE,
         margin={"l": 160, "b": 50, "r": 80, "t": 60},
     )
@@ -1568,7 +1573,8 @@ def cp_metric_vs_actual_impact(monee_net, impact_df_nt, network_type):
         ))
         cmp_fig.update_layout(
             barmode="group",
-            height=500, width=900,
+            # Match E16 grouped-bar dim: 460h × (120 + 110·N)w.
+            height=460, width=120 + 110 * max(len(cmp_df), 1),
             template=eval.CMRES_TEMPLATE,
             yaxis=dict(title="Spearman ρ vs Actual (95% CI)", range=[-1.15, 1.15],
                        gridcolor="#e5e5e5",
@@ -1793,7 +1799,9 @@ def _cp_only_metric_comparison_core(
         marker=outlined_marker(eval.PALETTE_QUAL[0]),
     ))
     rho_fig.update_layout(
-        height=80 + 40 * len(rho_df), width=900,
+        # Horizontal-bar equivalent of the E16 vertical-bar dim — bar
+        # thickness 60 px so individual bars match E16 visual weight.
+        height=120 + 60 * max(len(rho_df), 1), width=900,
         template=eval.CMRES_TEMPLATE,
         xaxis=dict(title="Spearman ρ vs Actual (95% CI)", range=[-1.05, 1.05],
                    gridcolor="#e5e5e5",
@@ -1876,7 +1884,9 @@ def _cp_only_metric_comparison_core(
                 row=1, col=col_idx,
             )
         acc_fig.update_layout(
-            height=80 + 40 * len(acc_df), width=1800,
+            # 4 horizontal-bar panels; per-panel sized to match the E16
+            # bar figure (~460 px each in the value direction).
+            height=120 + 60 * len(acc_df), width=460 * len(panels) + 100,
             template=eval.CMRES_TEMPLATE,
             margin={"l": 200, "b": 50, "r": 80, "t": 60},
         )
@@ -2591,7 +2601,9 @@ def pooled_metric_comparison(pooled_df, output_dir):
         textposition="outside",
     ))
     rho_bar.update_layout(
-        height=80 + 40 * len(rho_df), width=750,
+        # Same horizontal-bar dim as the per-network rho_fig — 60 px per
+        # bar so each bar is visually comparable to an E16 bar.
+        height=120 + 60 * max(len(rho_df), 1), width=900,
         template=eval.CMRES_TEMPLATE,
         xaxis=dict(title="Spearman ρ", range=[-1.05, 1.05],
                    gridcolor="#e5e5e5",
@@ -2627,7 +2639,9 @@ def pooled_metric_comparison(pooled_df, output_dir):
             ))
         nt_rho_fig.update_layout(
             barmode="group",
-            height=450, width=200 + 160 * len(net_types),
+            # Match E16 grouped-bar dim: 460h × (120 + 110·N)w where the
+            # x-axis category is the network here.
+            height=460, width=120 + 110 * max(len(net_types), 1),
             template=eval.CMRES_TEMPLATE,
             xaxis=dict(title="Network type"),
             yaxis=dict(title="Spearman ρ", range=[-1.05, 1.05],
@@ -2709,7 +2723,9 @@ def pooled_metric_comparison(pooled_df, output_dir):
         acc_fig.update_yaxes(title_text="Metric" if col_idx == 1 else "",
                              row=1, col=col_idx)
     acc_fig.update_layout(
-        height=80 + 40 * len(acc_df), width=1800,
+        # 4 horizontal-bar panels; per-panel width matches the E16 single
+        # bar plot (~460 px), per-bar height bumped to 60 px.
+        height=120 + 60 * len(acc_df), width=460 * len(panels) + 100,
         template=eval.CMRES_TEMPLATE,
         margin={"l": 160, "b": 50, "r": 80, "t": 60},
     )
@@ -2790,7 +2806,8 @@ def pooled_metric_comparison(pooled_df, output_dir):
         ))
         cmp_fig.update_layout(
             barmode="group",
-            height=500, width=1000,
+            # E16 grouped-bar dim: 460h × (120 + 110·N)w.
+            height=460, width=120 + 110 * max(len(cmp_df), 1),
             template=eval.CMRES_TEMPLATE,
             yaxis=dict(title="Spearman ρ vs Actual (95% CI)", range=[-1.15, 1.15],
                        gridcolor="#e5e5e5",
