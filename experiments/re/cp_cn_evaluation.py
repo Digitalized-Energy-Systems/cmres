@@ -415,27 +415,32 @@ COLUMN_EXPERIMENT_NAME = "experiment"
 
 CARRIER_REPLACE_MAP = {"0": "electricity", "1": "heat", "2": "gas"}
 
-# Maps the technical scenario / network-type identifiers used on disk (and as
-# the suffix in folder names of the form ``<EXPERIMENT_NAME>-<grid>``) to
-# human-readable labels for plots. The mapping mirrors ``ALL_GRIDS`` in
-# ``test_grids.py`` — keep both in sync when a new grid is added.
-# Unknown keys are returned unchanged so the pipeline does not crash if a
-# new grid is registered without an entry here.
-SCENARIO_NAME_MAP = {
-    # Distributed-CP family (cp_capacity_invariant=False)
-    "simbench_lv_no": "No CPs",
-    "simbench_lv_low": "Low CP density",
-    "simbench_lv": "Medium CP density",
-    "simbench_lv_high": "High CP density",
-    "simbench_lv_xl": "XL CP density",
-    "simbench_lv_xxl": "XXL CP density",
-    # Capacity-invariant family (cp_capacity_invariant=True)
-    "simbench_lv_low_same_cap": "Low CP density (same cap.)",
-    "simbench_lv_same_cap": "Medium CP density (same cap.)",
-    "simbench_lv_high_same_cap": "High CP density (same cap.)",
-    "simbench_lv_xl_same_cap": "XL CP density (same cap.)",
-    "simbench_lv_xxl_same_cap": "XXL CP density (same cap.)",
-}
+# Single source of truth for human-readable scenario labels is
+# ``grid_topology_table.SCENARIO_LABEL`` — the same short tags used in
+# the dissertation LaTeX table ("LV-no", "LV-s", "LV-m-eq", …). The
+# import is lazy / guarded so this module stays importable in headless
+# / minimal environments that don't pull in ``test_grids``.
+try:
+    from grid_topology_table import SCENARIO_LABEL as _GTT_SCENARIO_LABEL  # noqa: E402
+except Exception:  # pragma: no cover
+    _GTT_SCENARIO_LABEL = {
+        "simbench_lv_no":                "LV-no",
+        "simbench_lv_low":               "LV-s",
+        "simbench_lv":                   "LV-m",
+        "simbench_lv_high":              "LV-l",
+        "simbench_lv_xl":                "LV-xl",
+        "simbench_lv_xxl":               "LV-xxl",
+        "simbench_lv_low_same_cap":      "LV-s-eq",
+        "simbench_lv_same_cap":          "LV-m-eq",
+        "simbench_lv_high_same_cap":     "LV-l-eq",
+        "simbench_lv_xl_same_cap":       "LV-xl-eq",
+        "simbench_lv_xxl_same_cap":      "LV-xxl-eq",
+    }
+
+# Public alias kept for backwards compatibility — downstream modules
+# (cmres_eval_plots, single_removal_shed_plots) import this name to derive
+# the canonical scenario ordering and to map scenario keys → labels.
+SCENARIO_NAME_MAP = dict(_GTT_SCENARIO_LABEL)
 
 
 def pretty_scenario(name) -> str:
@@ -1160,20 +1165,11 @@ def cp_metric_vs_actual_impact(monee_net, impact_df_nt, network_type):
     # ── Metric comparison figures ──────────────────────────────────────────
     import numpy as _np
 
-    # Comments below show the actual formula after the p_fail removal and the
-    # input-adequacy gate (the gate is multiplied into predicted_score for CPs
-    # only; non-CPs have input_adequacy=1.0 so their formula is unchanged).
-    METRICS = [
-        ("predicted_score",  "PTDF stress + phys. BC"),   # τ·PTDF·(1+α·BC_phys)·input_adequacy
-        ("score_no_topo",    "PTDF stress only"),          # carrier-weighted PTDF stress (= predicted_stress)
-        ("score_topo_only",  "Phys. BC only"),             # raw betweenness centrality, no stress
-        ("stress_bc",        "Stress BC only"),            # raw stress-weighted betweenness centrality, no PTDF
-        ("local_score",      "1-hop local"),               # loading·(1+crit.nbrs)·n_carriers
-        ("self_score",       "0-hop self"),                # loading·n_carriers
-        ("katz_score",       "Katz BC only"),              # raw Katz centrality (phys. graph), no stress
-        ("vitality_score",   "Closeness vitality"),        # W(G) - W(G\v), phys. weights
-        ("actual_total",     "Actual (MC)"),               # ground truth
-    ]
+    # Canonical 10-metric set shared with E16 (cmres_eval) — see
+    # eval_common.CORE_METRICS for the single source of truth. ``actual_total``
+    # is appended here as the MC ground truth referenced by the rank-accuracy
+    # plots below.
+    METRICS = list(_ec.CORE_METRICS) + [("actual_total", "Actual (MC)")]
     # network_type is already set on df_all (and inherited by this filtered
     # df) right after build_matched_df. ``df.copy()`` here keeps the original
     # safe from the inplace ``df[metric_cols] = df[metric_cols].replace(...)``
@@ -1330,41 +1326,75 @@ def cp_metric_vs_actual_impact(monee_net, impact_df_nt, network_type):
     # ── Ranking accuracy figures ───────────────────────────────────────────
     # Aliased re-exports so the call sites stay short.
     _ndcg = _ec.ndcg
+    _rndcg = _ec.random_normalized_ndcg
+    _default_k = _ec.default_ndcg_k
     _precision_at_k = _ec.precision_at_k
     _bootstrap_ci = _ec.bootstrap_ci
 
     pred_metrics = [(col, label) for col, label in METRICS if col != "actual_total"]
     actual_vals  = valid["actual_total"].values
+    # NDCG@k cutoff scales with the per-network component count so the
+    # top-quintile rule applies consistently (clamped 5..20 — see
+    # eval_common.default_ndcg_k for the rationale).
+    _k_cut = _default_k(len(actual_vals))
 
-    # 4a. Summary bar chart: Kendall τ and NDCG per metric, with bootstrap 95% CIs
+    # 4a. Summary bar chart: Kendall τ, NDCG@k, and rNDCG per metric (the
+    # full-list NDCG saturates on heavy-tailed ``actual_total`` and is
+    # kept only for backwards compatibility — see eval_common.ndcg docs).
     _rng = _np.random.default_rng(42)
     acc_rows = []
     for col, label in pred_metrics:
         scores = valid[col].values
         tau  = float(scipy.stats.kendalltau(scores, actual_vals).statistic)
         ndcg = _ndcg(actual_vals, scores)
-        tau_lo, tau_hi   = _bootstrap_ci(
+        ndcg_at_k = _ndcg(actual_vals, scores, k=_k_cut)
+        rndcg = _rndcg(actual_vals, scores, k=_k_cut, rng=_rng)
+        tau_lo, tau_hi = _bootstrap_ci(
             lambda a, p: float(scipy.stats.kendalltau(p, a).statistic),
             actual_vals, scores, rng=_rng)
         ndcg_lo, ndcg_hi = _bootstrap_ci(
             lambda a, p: _ndcg(a, p),
             actual_vals, scores, rng=_rng)
+        ndcgk_lo, ndcgk_hi = _bootstrap_ci(
+            lambda a, p, kk=_k_cut: _ndcg(a, p, k=kk),
+            actual_vals, scores, rng=_rng)
+        rndcg_lo, rndcg_hi = _bootstrap_ci(
+            lambda a, p, kk=_k_cut, rrng=_rng: _rndcg(a, p, k=kk, n_random=80, rng=rrng),
+            actual_vals, scores, rng=_rng)
         acc_rows.append({
             "Metric": label,
-            "Kendall τ": tau,  "τ_lo": tau_lo,  "τ_hi": tau_hi,
-            "NDCG":      ndcg, "ndcg_lo": ndcg_lo, "ndcg_hi": ndcg_hi,
+            "Kendall τ": tau, "τ_lo": tau_lo, "τ_hi": tau_hi,
+            "NDCG": ndcg, "ndcg_lo": ndcg_lo, "ndcg_hi": ndcg_hi,
+            "NDCG@k": ndcg_at_k, "ndcgk_lo": ndcgk_lo, "ndcgk_hi": ndcgk_hi,
+            "rNDCG@k": rndcg, "rndcg_lo": rndcg_lo, "rndcg_hi": rndcg_hi,
         })
 
-    acc_df = pandas.DataFrame(acc_rows).sort_values("NDCG", ascending=True)
+    # Sort by rNDCG@k (the most discriminating of the three NDCG variants
+    # — strips out the random-baseline inflation that masks differences
+    # between metrics on heavy-tailed actual_total).
+    acc_df = pandas.DataFrame(acc_rows).sort_values("rNDCG@k", ascending=True)
 
-    acc_fig = make_subplots(rows=1, cols=2, subplot_titles=["Kendall τ (95% CI)", "NDCG (95% CI)"])
+    panels = [
+        ("Kendall τ",       "τ_lo",     "τ_hi",     [-1.05, 1.05]),
+        (f"NDCG@{_k_cut}",  "ndcgk_lo", "ndcgk_hi", [-0.05, 1.05]),
+        (f"rNDCG@{_k_cut}", "rndcg_lo", "rndcg_hi", [-1.05, 1.05]),
+        ("NDCG",            "ndcg_lo",  "ndcg_hi",  [-0.05, 1.05]),
+    ]
+    measure_to_col = {
+        "Kendall τ": "Kendall τ",
+        f"NDCG@{_k_cut}": "NDCG@k",
+        f"rNDCG@{_k_cut}": "rNDCG@k",
+        "NDCG": "NDCG",
+    }
+    acc_fig = make_subplots(
+        rows=1, cols=len(panels),
+        subplot_titles=[f"{m} (95% CI)" for m, *_ in panels],
+    )
     metric_colors = {row["Metric"]: eval.PALETTE_QUAL[i % 10]
                      for i, row in acc_df.iterrows()}
-
-    for col_idx, (measure, lo_col, hi_col) in enumerate(
-        [("Kendall τ", "τ_lo", "τ_hi"), ("NDCG", "ndcg_lo", "ndcg_hi")], start=1
-    ):
-        vals   = acc_df[measure].values
+    for col_idx, (measure, lo_col, hi_col, ref_range) in enumerate(panels, start=1):
+        data_col = measure_to_col[measure]
+        vals   = acc_df[data_col].values
         err_lo = (vals - acc_df[lo_col].values).clip(0)
         err_hi = (acc_df[hi_col].values - vals).clip(0)
         acc_fig.add_trace(go.Bar(
@@ -1379,20 +1409,23 @@ def cp_metric_vs_actual_impact(monee_net, impact_df_nt, network_type):
             textposition="outside",
             showlegend=False,
         ), row=1, col=col_idx)
-        ref_range = [-1.05, 1.05] if measure == "Kendall τ" else [-0.05, 1.05]
         acc_fig.update_xaxes(title_text=measure, range=ref_range,
                              zeroline=True, zerolinecolor="black", zerolinewidth=1,
                              row=1, col=col_idx)
-        acc_fig.update_yaxes(title_text="Metric", row=1, col=col_idx)
+        acc_fig.update_yaxes(title_text="Metric" if col_idx == 1 else "",
+                             row=1, col=col_idx)
 
     acc_fig.update_layout(
-        height=80 + 40 * len(acc_df), width=1000,
+        height=80 + 40 * len(acc_df), width=1700,
         template=eval.CMRES_TEMPLATE,
-        margin={"l": 160, "b": 50, "r": 120, "t": 50},
+        margin={"l": 160, "b": 50, "r": 80, "t": 60},
     )
     figures.append(acc_fig)
     best = acc_df.iloc[-1]["Metric"]
-    titles.append(f"Ranking Accuracy: Kendall τ and NDCG with Bootstrap 95% CI (best NDCG: {best})")
+    titles.append(
+        f"Ranking Accuracy: Kendall τ, NDCG@{_k_cut}, rNDCG@{_k_cut}, NDCG "
+        f"with Bootstrap 95% CI (best rNDCG@{_k_cut}: {best})"
+    )
 
     # 4b. Precision@k curve: how well does each metric identify the true top-k?
     n_comp = len(valid)
@@ -1547,19 +1580,19 @@ def _cp_only_metric_comparison_core(
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
 
-    METRICS = [
-        ("predicted_score",     "PTDF + BC + input-adequacy"),
-        ("score_no_adequacy",   "PTDF + BC (no input gate)"),
-        ("input_adequacy",      "Input adequacy alone"),
-        ("score_no_topo",       "PTDF stress only"),
-        ("score_topo_only",     "Phys. BC only"),
-        ("stress_bc",           "Stress BC only"),
-        ("local_score",         "1-hop local"),
-        ("self_score",          "0-hop self"),
-        ("katz_score",          "Katz BC only"),
-        ("vitality_score",      "Closeness vitality"),
-        ("actual_total",        "Actual (MC)"),
-    ]
+    # CP-only view uses the same canonical 10 metrics as cp_metric_vs_actual_impact
+    # / pooled_metric_comparison / E16 (eval_common.CORE_METRICS), plus the
+    # ``actual_total`` MC ground truth and two CP-only diagnostics — the
+    # input-adequacy gate (which only fires on CPs) and the no-gate variant
+    # of the composite, so the gate's effect can be read off the bar chart.
+    METRICS = (
+        list(_ec.CORE_METRICS)
+        + [
+            ("score_no_adequacy", "PTDF + BC (no input gate)"),
+            ("input_adequacy",    "Input adequacy alone"),
+            ("actual_total",      "Actual (MC)"),
+        ]
+    )
 
     df = df_all.copy()
     # "score_no_topo" = pure PTDF stress (carrier-weighted total_stress) —
@@ -1725,8 +1758,10 @@ def _cp_only_metric_comparison_core(
     figures.append(rho_fig)
     titles.append(f"CP-only [{label}] combined Spearman ρ (n={len(primary)})")
 
-    # ── 4. Kendall τ + NDCG with bootstrap 95 % CI (combined) ─────────────
+    # ── 4. Kendall τ + NDCG@k + rNDCG@k (+ legacy NDCG) with bootstrap CI ─
     _bootstrap_ci = _ec.bootstrap_ci
+    _rndcg = _ec.random_normalized_ndcg
+    _k_cut = _ec.default_ndcg_k(len(actual_vals))
 
     rng = _np.random.default_rng(42)
     acc_rows = []
@@ -1736,30 +1771,47 @@ def _cp_only_metric_comparison_core(
             continue
         tau = float(scipy.stats.kendalltau(scores, actual_vals).statistic)
         ndcg = _ndcg(actual_vals, scores)
+        ndcgk = _ndcg(actual_vals, scores, k=_k_cut)
+        rndcg = _rndcg(actual_vals, scores, k=_k_cut, rng=rng)
         tau_lo, tau_hi = _bootstrap_ci(
             lambda a, p: float(scipy.stats.kendalltau(p, a).statistic),
             actual_vals, scores, rng=rng,
         )
         ndcg_lo, ndcg_hi = _bootstrap_ci(
-            lambda a, p: _ndcg(a, p),
+            lambda a, p: _ndcg(a, p), actual_vals, scores, rng=rng,
+        )
+        ndcgk_lo, ndcgk_hi = _bootstrap_ci(
+            lambda a, p, kk=_k_cut: _ndcg(a, p, k=kk),
+            actual_vals, scores, rng=rng,
+        )
+        rndcg_lo, rndcg_hi = _bootstrap_ci(
+            lambda a, p, kk=_k_cut, rrng=rng: _rndcg(a, p, k=kk, n_random=80, rng=rrng),
             actual_vals, scores, rng=rng,
         )
         acc_rows.append({
             "Metric": lab,
             "tau": tau, "tau_lo": tau_lo, "tau_hi": tau_hi,
             "ndcg": ndcg, "ndcg_lo": ndcg_lo, "ndcg_hi": ndcg_hi,
+            "ndcgk": ndcgk, "ndcgk_lo": ndcgk_lo, "ndcgk_hi": ndcgk_hi,
+            "rndcg": rndcg, "rndcg_lo": rndcg_lo, "rndcg_hi": rndcg_hi,
         })
 
     if acc_rows:
-        acc_df = pandas.DataFrame(acc_rows).sort_values("ndcg", ascending=True)
+        acc_df = pandas.DataFrame(acc_rows).sort_values("rndcg", ascending=True)
+        panels = [
+            ("Kendall τ",       "tau",   "tau_lo",   "tau_hi",   [-1.05, 1.05]),
+            (f"NDCG@{_k_cut}",  "ndcgk", "ndcgk_lo", "ndcgk_hi", [-0.05, 1.05]),
+            (f"rNDCG@{_k_cut}", "rndcg", "rndcg_lo", "rndcg_hi", [-1.05, 1.05]),
+            ("NDCG",            "ndcg",  "ndcg_lo",  "ndcg_hi",  [-0.05, 1.05]),
+        ]
         acc_fig = make_subplots(
-            rows=1, cols=2,
-            subplot_titles=["Kendall τ (95% CI)", "NDCG (95% CI)"],
+            rows=1, cols=len(panels),
+            subplot_titles=[f"{m} (95% CI)" for m, *_ in panels],
         )
-        for col_idx, (measure, lo_col, hi_col) in enumerate(
-            [("tau", "tau_lo", "tau_hi"), ("ndcg", "ndcg_lo", "ndcg_hi")], start=1
+        for col_idx, (title_, data_col, lo_col, hi_col, ref_range) in enumerate(
+            panels, start=1,
         ):
-            vals   = acc_df[measure].values
+            vals   = acc_df[data_col].values
             err_lo = (vals - acc_df[lo_col].values).clip(0)
             err_hi = (acc_df[hi_col].values - vals).clip(0)
             acc_fig.add_trace(go.Bar(
@@ -1771,19 +1823,21 @@ def _cp_only_metric_comparison_core(
                 textposition="outside",
                 showlegend=False,
             ), row=1, col=col_idx)
-            ref_range = [-1.05, 1.05] if measure == "tau" else [-0.05, 1.05]
             acc_fig.update_xaxes(
-                title_text=("Kendall τ" if measure == "tau" else "NDCG"),
+                title_text=title_,
                 range=ref_range, zeroline=True, zerolinecolor="black",
                 row=1, col=col_idx,
             )
         acc_fig.update_layout(
-            height=80 + 40 * len(acc_df), width=1100,
+            height=80 + 40 * len(acc_df), width=1800,
             template=eval.CMRES_TEMPLATE,
-            margin={"l": 200, "b": 50, "r": 120, "t": 50},
+            margin={"l": 200, "b": 50, "r": 80, "t": 60},
         )
         figures.append(acc_fig)
-        titles.append(f"CP-only [{label}] Kendall τ + NDCG (combined, n={len(primary)})")
+        titles.append(
+            f"CP-only [{label}] Kendall τ + NDCG@{_k_cut} + rNDCG@{_k_cut} "
+            f"+ NDCG (n={len(primary)})"
+        )
 
     # ── 5. Precision@k (combined) ─────────────────────────────────────────
     n_comp = len(primary)
@@ -2063,17 +2117,9 @@ def pooled_metric_comparison(pooled_df, output_dir):
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
 
-    METRICS = [
-        ("predicted_score",  "PTDF stress + phys. BC"),
-        ("score_no_topo",    "PTDF stress only"),
-        ("score_topo_only",  "Phys. BC only"),
-        ("stress_bc",        "Stress BC only"),
-        ("local_score",      "1-hop local"),
-        ("self_score",       "0-hop self"),
-        ("katz_score",       "Katz BC only"),
-        ("vitality_score",   "Closeness vitality"),
-        ("actual_total",     "Actual (MC)"),
-    ]
+    # Same canonical 10-metric set as cp_metric_vs_actual_impact and E16;
+    # see eval_common.CORE_METRICS for the single source of truth.
+    METRICS = list(_ec.CORE_METRICS) + [("actual_total", "Actual (MC)")]
 
     df_all_full = pooled_df.copy()
     # score_no_topo = pure PTDF stress. See cp_metric_vs_actual_impact for why
@@ -2126,18 +2172,31 @@ def pooled_metric_comparison(pooled_df, output_dir):
                   for i, nt in enumerate(net_types)}
 
     # ── 1. Scatter panels (one per metric, colored by network type) ────────
+    # Per-metric x-axis formula annotations — falls back to the metric
+    # label when no special formula has been registered.
+    _METRIC_FORMULAS = {
+        "predicted_score":          "τ · PTDF_stress · (1 + α·BC_phys) · adequacy",
+        "predicted_score_cp_aware": "CP-aware variant of predicted_score",
+        "predicted_score_balanced": "Balanced S1 + C1 + C2 + C3 composite",
+        "predicted_stress":         "PTDF stress (carrier-weighted)",
+        "topo_bc":                  "Phys. betweenness centrality",
+        "stress_bc":                "Stress-weighted betweenness centrality",
+        "katz_score":               "Katz centrality (phys. graph)",
+        "vitality_score":           "W(G) − W(G\\v) (phys. graph)",
+        "local_score":              "loading · (1 + crit.nbrs) · n_carriers",
+        "self_score":               "loading · n_carriers",
+    }
     panels = [
-        ("predicted_score",  "PTDF stress + phys. BC",  "τ · PTDF_stress · (1 + α·BC_phys) · adequacy"),
-        ("score_no_topo",    "PTDF stress only",         "PTDF_stress (carrier-weighted)"),
-        ("score_topo_only",  "Phys. BC only",            "Phys. betweenness centrality"),
-        ("stress_bc",        "Stress BC only",           "Stress-weighted betweenness centrality"),
-        ("local_score",      "1-hop local",              "loading · (1 + crit.nbrs) · n_carriers"),
-        ("self_score",       "0-hop self",               "loading · n_carriers"),
-        ("katz_score",       "Katz BC only",             "Katz centrality (phys. graph)"),
-        ("vitality_score",   "Closeness vitality",       "W(G) − W(G\\v) (phys. graph)"),
+        (col, label, _METRIC_FORMULAS.get(col, label))
+        for col, label in pred_metrics
     ]
+    # Plotly subplot grid auto-sized to the canonical metric count
+    # (10 metrics → 2 rows × 5 cols; auto-adjusts if CORE_METRICS shrinks).
+    n_panels = len(panels)
+    n_cols = max(1, (n_panels + 1) // 2)
+    n_rows = (n_panels + n_cols - 1) // n_cols
     scatter_fig = make_subplots(
-        rows=2, cols=4,
+        rows=n_rows, cols=n_cols,
         subplot_titles=[
             f"{label}<br>{_rho_label(*_spearman_with_ci(valid[col], valid['actual_total']))}"
             for col, label, _ in panels
@@ -2145,7 +2204,7 @@ def pooled_metric_comparison(pooled_df, output_dir):
         shared_yaxes=False,
     )
     for idx, (x_col, _label, x_axis_label) in enumerate(panels):
-        r, c = divmod(idx, 4)
+        r, c = divmod(idx, n_cols)
         for nt in net_types:
             sub = valid[valid["network_type"] == nt]
             scatter_fig.add_trace(go.Scatter(
@@ -2157,7 +2216,7 @@ def pooled_metric_comparison(pooled_df, output_dir):
         scatter_fig.update_xaxes(title_text=x_axis_label, row=r + 1, col=c + 1)
         scatter_fig.update_yaxes(title_text="Actual Impact (MW)", row=r + 1, col=c + 1)
     scatter_fig.update_layout(
-        height=700, width=1800,
+        height=380 * n_rows + 80, width=420 * n_cols,
         template=eval.CMRES_TEMPLATE,
         margin={"l": 60, "b": 60, "r": 20, "t": 80},
         legend={"title": "Network type"},
@@ -2286,34 +2345,53 @@ def pooled_metric_comparison(pooled_df, output_dir):
         figures.append(nt_rho_fig)
         titles.append("Spearman ρ per network type — check for heterogeneity")
 
-    # ── 4. Kendall τ and NDCG with bootstrap CI ───────────────────────────
+    # ── 4. Kendall τ + NDCG@k + rNDCG@k (+ legacy NDCG) with bootstrap CI ─
+    _rndcg = _ec.random_normalized_ndcg
+    _k_cut = _ec.default_ndcg_k(len(actual_vals))
     _rng = _np.random.default_rng(42)
     acc_rows = []
     for col, label in pred_metrics:
         scores = valid[col].values
         tau  = float(scipy.stats.kendalltau(scores, actual_vals).statistic)
         ndcg = _ndcg(actual_vals, scores)
-        tau_lo,  tau_hi  = _bootstrap_ci(
+        ndcgk = _ndcg(actual_vals, scores, k=_k_cut)
+        rndcg = _rndcg(actual_vals, scores, k=_k_cut, rng=_rng)
+        tau_lo, tau_hi = _bootstrap_ci(
             lambda a, p: float(scipy.stats.kendalltau(p, a).statistic),
             actual_vals, scores, rng=_rng)
         ndcg_lo, ndcg_hi = _bootstrap_ci(
-            lambda a, p: _ndcg(a, p),
+            lambda a, p: _ndcg(a, p), actual_vals, scores, rng=_rng)
+        ndcgk_lo, ndcgk_hi = _bootstrap_ci(
+            lambda a, p, kk=_k_cut: _ndcg(a, p, k=kk),
+            actual_vals, scores, rng=_rng)
+        rndcg_lo, rndcg_hi = _bootstrap_ci(
+            lambda a, p, kk=_k_cut, rrng=_rng: _rndcg(a, p, k=kk, n_random=80, rng=rrng),
             actual_vals, scores, rng=_rng)
         acc_rows.append({
             "Metric": label,
-            "Kendall τ": tau,  "τ_lo": tau_lo,  "τ_hi": tau_hi,
-            "NDCG":      ndcg, "ndcg_lo": ndcg_lo, "ndcg_hi": ndcg_hi,
+            "Kendall τ": tau, "τ_lo": tau_lo, "τ_hi": tau_hi,
+            "NDCG": ndcg, "ndcg_lo": ndcg_lo, "ndcg_hi": ndcg_hi,
+            "NDCG@k": ndcgk, "ndcgk_lo": ndcgk_lo, "ndcgk_hi": ndcgk_hi,
+            "rNDCG@k": rndcg, "rndcg_lo": rndcg_lo, "rndcg_hi": rndcg_hi,
         })
-    acc_df = pandas.DataFrame(acc_rows).sort_values("NDCG", ascending=True)
+    acc_df = pandas.DataFrame(acc_rows).sort_values("rNDCG@k", ascending=True)
     metric_colors = {row["Metric"]: eval.PALETTE_QUAL[i % 10]
                      for i, row in acc_df.iterrows()}
 
-    acc_fig = make_subplots(rows=1, cols=2,
-                            subplot_titles=["Kendall τ (95% CI)", "NDCG (95% CI)"])
-    for col_idx, (measure, lo_col, hi_col) in enumerate(
-        [("Kendall τ", "τ_lo", "τ_hi"), ("NDCG", "ndcg_lo", "ndcg_hi")], start=1
+    panels = [
+        ("Kendall τ",       "Kendall τ", "τ_lo",     "τ_hi",     [-1.05, 1.05]),
+        (f"NDCG@{_k_cut}",  "NDCG@k",    "ndcgk_lo", "ndcgk_hi", [-0.05, 1.05]),
+        (f"rNDCG@{_k_cut}", "rNDCG@k",   "rndcg_lo", "rndcg_hi", [-1.05, 1.05]),
+        ("NDCG",            "NDCG",      "ndcg_lo",  "ndcg_hi",  [-0.05, 1.05]),
+    ]
+    acc_fig = make_subplots(
+        rows=1, cols=len(panels),
+        subplot_titles=[f"{m} (95% CI)" for m, *_ in panels],
+    )
+    for col_idx, (title_, data_col, lo_col, hi_col, ref_range) in enumerate(
+        panels, start=1,
     ):
-        vals   = acc_df[measure].values
+        vals   = acc_df[data_col].values
         err_lo = (vals - acc_df[lo_col].values).clip(0)
         err_hi = (acc_df[hi_col].values - vals).clip(0)
         acc_fig.add_trace(go.Bar(
@@ -2326,20 +2404,20 @@ def pooled_metric_comparison(pooled_df, output_dir):
             textposition="outside",
             showlegend=False,
         ), row=1, col=col_idx)
-        ref_range = [-1.05, 1.05] if measure == "Kendall τ" else [-0.05, 1.05]
-        acc_fig.update_xaxes(title_text=measure, range=ref_range,
+        acc_fig.update_xaxes(title_text=title_, range=ref_range,
                              zeroline=True, zerolinecolor="black", row=1, col=col_idx)
-        acc_fig.update_yaxes(title_text="Metric", row=1, col=col_idx)
+        acc_fig.update_yaxes(title_text="Metric" if col_idx == 1 else "",
+                             row=1, col=col_idx)
     acc_fig.update_layout(
-        height=80 + 40 * len(acc_df), width=1000,
+        height=80 + 40 * len(acc_df), width=1800,
         template=eval.CMRES_TEMPLATE,
-        margin={"l": 160, "b": 50, "r": 120, "t": 50},
+        margin={"l": 160, "b": 50, "r": 80, "t": 60},
     )
     figures.append(acc_fig)
     best = acc_df.iloc[-1]["Metric"]
     titles.append(
-        f"Pooled Ranking Accuracy: Kendall τ and NDCG with Bootstrap 95% CI "
-        f"(n={n_total}, best NDCG: {best})"
+        f"Pooled Ranking Accuracy: Kendall τ + NDCG@{_k_cut} + rNDCG@{_k_cut} "
+        f"+ NDCG with Bootstrap 95% CI (n={n_total}, best rNDCG@{_k_cut}: {best})"
     )
 
     # ── 5. Precision@k ─────────────────────────────────────────────────────

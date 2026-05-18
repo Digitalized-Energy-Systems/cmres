@@ -51,6 +51,34 @@ _COMPOUND_CP_TYPES = ("CHP", "CHPHG", "PowerToHeat")
 _NON_CP_BRANCH_TYPES = ("PowerLine", "GasPipe", "WaterPipe", "HeatExchanger")
 
 
+# Canonical 10-metric line-up used by both ``cp_cn_evaluation`` (scatter /
+# correlation / NDCG figures) and ``cmres_eval.experiment_e16`` (per-sector
+# Spearman ρ vs analytical shed). Single source of truth so the two
+# pipelines stay in sync. Order = how the metrics will appear on plots
+# whose category axis isn't explicitly sorted.
+#
+# Category coverage:
+#   • 3 composite predictors (main / CP-aware / balanced)
+#   • 1 bare PTDF stress
+#   • 3 centrality-based references (phys. BC / stress BC / Katz)
+#   • 1 closeness vitality
+#   • 2 simple local baselines (1-hop / 0-hop)
+CORE_METRICS: List[Tuple[str, str]] = [
+    ("predicted_score",          "PTDF stress + phys. BC"),
+    ("predicted_score_cp_aware", "CP-aware composite"),
+    ("predicted_score_balanced", "Balanced composite"),
+    ("predicted_stress",         "PTDF stress only"),
+    ("topo_bc",                  "Phys. BC only"),
+    ("stress_bc",                "Stress BC only"),
+    ("katz_score",               "Katz BC only"),
+    ("vitality_score",           "Closeness vitality"),
+    ("local_score",              "1-hop local"),
+    ("self_score",               "0-hop self"),
+]
+CORE_METRIC_COLS: List[str] = [c for c, _ in CORE_METRICS]
+CORE_METRIC_LABELS: Dict[str, str] = {c: lab for c, lab in CORE_METRICS}
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 2. Statistical helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -150,24 +178,94 @@ def bootstrap_ci(
     )
 
 
-def ndcg(actual_vals, predicted_scores) -> float:
-    """Normalised Discounted Cumulative Gain.
+def ndcg(actual_vals, predicted_scores, k: Optional[int] = None) -> float:
+    """Normalised Discounted Cumulative Gain (optionally @k).
 
     Relevance = ``max(actual, 0)`` so components with zero/negative impact
     get relevance 0 — they are not "relevant" to identify as critical.
     Using ``actual − min()`` would inflate all scores when the range is
     wide and arbitrarily reward metrics that rank the least-harmful
     component last.
+
+    ``k`` cuts the discounted sum to the top ``k`` positions of each
+    ranking (predicted **and** ideal). When ``k`` is ``None`` (default)
+    the full list is used — same behaviour as the original definition,
+    kept for backwards compatibility. Use a small ``k`` (e.g. ``10``)
+    to avoid the saturation that heavy-tailed ``actual`` distributions
+    induce on full-list NDCG: a single top-item hit can dominate the
+    score, making the metric near-1 even for predictors that disagree
+    completely on the rest of the ranking.
     """
     actual_arr = np.asarray(actual_vals, dtype=float)
     if actual_arr.size == 0:
         return 0.0
-    pred_order = np.argsort(predicted_scores)[::-1]
-    ideal_order = np.argsort(actual_arr)[::-1]
+    n = len(actual_arr)
+    cutoff = n if k is None else min(int(k), n)
+    if cutoff <= 0:
+        return 0.0
+    pred_order = np.argsort(predicted_scores)[::-1][:cutoff]
+    ideal_order = np.argsort(actual_arr)[::-1][:cutoff]
     gains = np.maximum(actual_arr, 0.0)
-    dcg = sum(gains[pred_order[i]] / np.log2(i + 2) for i in range(len(gains)))
-    idcg = sum(gains[ideal_order[i]] / np.log2(i + 2) for i in range(len(gains)))
+    discounts = 1.0 / np.log2(np.arange(cutoff) + 2)
+    dcg = float(np.sum(gains[pred_order] * discounts))
+    idcg = float(np.sum(gains[ideal_order] * discounts))
     return float(dcg / idcg) if idcg > 0 else 0.0
+
+
+def random_normalized_ndcg(
+    actual_vals,
+    predicted_scores,
+    k: Optional[int] = None,
+    n_random: int = 200,
+    rng=None,
+) -> float:
+    """Random-baseline-normalised NDCG (rNDCG).
+
+    ``rNDCG = (NDCG − E[NDCG_random]) / (1 − E[NDCG_random])``
+
+    - ``0`` means the predicted ranking is no better than a uniform random
+      permutation of the same items;
+    - ``1`` is the ideal ranking;
+    - negative values mean the predicted ranking is *worse* than random
+      (anti-correlated with ``actual``).
+
+    Strips out the chance baseline that inflates raw NDCG on heavy-tailed
+    relevance distributions. The random baseline is estimated by Monte
+    Carlo with ``n_random`` permutations and a fixed ``rng``; for the MC
+    sample sizes we use (~30-150 components) ``n_random=200`` is enough
+    to make the Monte Carlo std on ``E[NDCG_random]`` smaller than the
+    rNDCG resolution we plot at (~0.01).
+    """
+    actual_arr = np.asarray(actual_vals, dtype=float)
+    n = actual_arr.size
+    if n == 0:
+        return 0.0
+    obs = ndcg(actual_arr, predicted_scores, k=k)
+    if rng is None:
+        rng = np.random.default_rng(0)
+    rand_scores = np.empty(int(n_random), dtype=float)
+    perm = np.arange(n)
+    for i in range(int(n_random)):
+        rng.shuffle(perm)
+        rand_scores[i] = ndcg(actual_arr, perm.astype(float), k=k)
+    e_random = float(np.mean(rand_scores))
+    denom = 1.0 - e_random
+    if denom <= 0:
+        return 0.0
+    return float((obs - e_random) / denom)
+
+
+def default_ndcg_k(n: int) -> int:
+    """Heuristic default for ``k`` in NDCG@k.
+
+    Returns ``max(5, min(20, ceil(n × 0.2)))`` — the top quintile, capped
+    to a 5..20 range. Below 5 the discount weighting barely matters; above
+    20 saturation on heavy-tailed relevance becomes visible again.
+    """
+    if n <= 0:
+        return 0
+    import math
+    return max(5, min(20, int(math.ceil(n * 0.2))))
 
 
 def precision_at_k(actual_vals, predicted_scores, k: int) -> float:

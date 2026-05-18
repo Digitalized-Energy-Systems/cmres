@@ -947,33 +947,10 @@ def experiment_e16_single_removal_validation(
     out_dir.mkdir(exist_ok=True, parents=True)
     if shed_dir is None:
         shed_dir = out_dir.parent / "single_removal_shed"
-    metrics = metrics or [
-        "predicted_score", "predicted_stress",
-        "topo_factor", "topo_bc",
-        # CP-aware (energy-η) topology variant — w_cp = (2−η)/Φ_rated.
-        # See docs/cp_edge_weight_theory.tex.
-        "predicted_score_cp_aware", "topo_factor_cp_aware", "topo_bc_cp_aware",
-        # Exergy-aware variant — w_cp = (2−η_ex)/Φ_rated with carrier
-        # quality factors. See docs/new_edge_weight_theory.tex.
-        "predicted_score_exergy", "topo_factor_exergy", "topo_bc_exergy",
-        # Balanced composite (S1+C1+C2+C3) — per-carrier stress normalisation,
-        # ext-grid headroom, demand coupling, substitutability multipliers.
-        # See cp_metric.attach_balanced_score.
-        "predicted_score_balanced", "total_stress_balanced",
-        "ext_headroom_mult", "demand_coupling_mult", "substitutability_mult",
-        # Per-carrier atomic predictors (option 3). Each is rank-evaluated
-        # against its OWN carrier's shed via the per-sector ρ block, so
-        # the within-carrier signal isn't drowned out by other carriers.
-        # See cp_metric.attach_per_carrier_scores.
-        "predicted_power", "predicted_gas", "predicted_heat",
-        "predicted_power_cp_aware", "predicted_gas_cp_aware", "predicted_heat_cp_aware",
-        "predicted_power_exergy",   "predicted_gas_exergy",   "predicted_heat_exergy",
-        "predicted_power_balanced", "predicted_gas_balanced", "predicted_heat_balanced",
-        "input_adequacy", "local_score", "self_score",
-        "katz_score", "vitality_score",
-        "ddar_mw_total", "ss_bc_total", "kshortest_redundancy_total",
-        "substitutability", "ml_bc",
-    ]
+    # Default to the canonical 10-metric set so E16 stays in sync with the
+    # cp_cn_evaluation scatter / correlation / NDCG figures. Override
+    # with the ``metrics`` argument when probing a one-off subset.
+    metrics = metrics or list(_ec.CORE_METRIC_COLS)
 
     rows: List[dict] = []
     ceiling_rows: List[dict] = []
