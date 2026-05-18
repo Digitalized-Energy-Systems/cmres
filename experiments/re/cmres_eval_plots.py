@@ -60,6 +60,126 @@ def _layout(**overrides) -> dict:
     return out
 
 
+# Single-column dissertation typography. A 1-column figure is roughly
+# 84 mm / 3.3 in wide on the printed page, so plotly figures rendered at
+# ~800-1200 px get scaled down by ~3-4×. The base cmres template uses
+# 12-14 pt fonts, which become 3-4 pt on the page — unreadable. Bumping
+# every text element to 18-22 pt keeps the smallest tick label at
+# ≳ 5-6 pt after scaling, which is the conventional minimum for printed
+# dissertation figures.
+_E16_FONT_SIZES = dict(
+    base=18,        # default text everywhere
+    title=22,       # figure title
+    axis_title=20,  # x/y axis titles
+    axis_tick=18,   # x/y tick labels
+    legend=18,      # legend body
+    legend_title=18,
+    annotation=16,  # in-plot ρ/p stat boxes
+    subplot_title=20,
+    colorbar=18,
+)
+
+
+def _e16_layout(**overrides) -> dict:
+    """``_layout`` variant with 1-column-dissertation-sized fonts.
+
+    Use for every E16 figure so the published version stays legible when
+    scaled down to a single dissertation column. Sizes can be overridden
+    per-figure by passing standard layout kwargs (e.g.
+    ``font=dict(size=24)``).
+    """
+    font_size = _E16_FONT_SIZES["base"]
+    base = dict(
+        template=TEMPLATE,
+        font=dict(size=font_size),
+        title=dict(font=dict(size=_E16_FONT_SIZES["title"])),
+        legend=dict(
+            font=dict(size=_E16_FONT_SIZES["legend"]),
+            title=dict(font=dict(size=_E16_FONT_SIZES["legend_title"])),
+        ),
+    )
+    # Recursive merge for the dict-of-dicts so callers can pass
+    # ``legend=dict(title="…")`` without dropping the font sizes above.
+    # Special-case Plotly shorthands ``title="…"`` and
+    # ``xaxis_title=…``/``yaxis_title=…`` so the title-font override
+    # above can still attach.
+    overrides = dict(overrides)
+    if "title" in overrides and isinstance(overrides["title"], str):
+        overrides["title"] = {"text": overrides["title"]}
+    for shorthand_key in list(overrides.keys()):
+        if shorthand_key.endswith("_title") and not shorthand_key.startswith("legend"):
+            ax_name = shorthand_key[: -len("_title")]  # "xaxis", "yaxis", "xaxis2", ...
+            title_val = overrides.pop(shorthand_key)
+            title_dict = (
+                {"text": title_val} if isinstance(title_val, str) else dict(title_val)
+            )
+            existing = overrides.get(ax_name)
+            if isinstance(existing, dict):
+                merged_ax = dict(existing)
+                merged_ax.setdefault("title", title_dict)
+                if isinstance(merged_ax["title"], str):
+                    merged_ax["title"] = {"text": merged_ax["title"]}
+                overrides[ax_name] = merged_ax
+            else:
+                overrides[ax_name] = {"title": title_dict}
+    for k, v in overrides.items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            merged = dict(base[k])
+            for vk, vv in v.items():
+                if isinstance(vv, dict) and isinstance(merged.get(vk), dict):
+                    sub = dict(merged[vk])
+                    sub.update(vv)
+                    merged[vk] = sub
+                else:
+                    merged[vk] = vv
+            base[k] = merged
+        else:
+            base[k] = v
+    # Axis titles / tick fonts: apply a default to every named axis the
+    # caller mentioned; the template's per-axis defaults can't carry font
+    # sizes through ``update_layout`` reliably.
+    for ax_key in list(base.keys()):
+        if not (ax_key.startswith("xaxis") or ax_key.startswith("yaxis")):
+            continue
+        ax_val = base[ax_key]
+        if not isinstance(ax_val, dict):
+            continue
+        ax_val = dict(ax_val)
+        ax_val.setdefault(
+            "title",
+            {"font": {"size": _E16_FONT_SIZES["axis_title"]}},
+        )
+        if isinstance(ax_val["title"], str):
+            ax_val["title"] = {
+                "text": ax_val["title"],
+                "font": {"size": _E16_FONT_SIZES["axis_title"]},
+            }
+        elif isinstance(ax_val["title"], dict):
+            t = dict(ax_val["title"])
+            tf = dict(t.get("font") or {})
+            tf.setdefault("size", _E16_FONT_SIZES["axis_title"])
+            t["font"] = tf
+            ax_val["title"] = t
+        tf = dict(ax_val.get("tickfont") or {})
+        tf.setdefault("size", _E16_FONT_SIZES["axis_tick"])
+        ax_val["tickfont"] = tf
+        base[ax_key] = ax_val
+    return base
+
+
+def _e16_bump_subplot_titles(fig: "go.Figure") -> None:
+    """Bump the auto-created ``subplot_titles`` annotation font sizes."""
+    for ann in (fig.layout.annotations or ()):
+        # Subplot titles are annotations with ``xref`` ending in 'paper'
+        # (added by ``make_subplots``). Don't touch in-plot annotations
+        # (which use 'x domain' / 'y domain').
+        xref = getattr(ann, "xref", "") or ""
+        if xref.endswith("paper"):
+            font = dict(ann.font.to_plotly_json()) if ann.font else {}
+            font["size"] = _E16_FONT_SIZES["subplot_title"]
+            ann.font = font
+
+
 def _scenario_order(values: Sequence[str]) -> List[str]:
     """Stable display order: known scenarios first (in NAME_MAP order),
     then unknown alphabetically."""
@@ -1147,7 +1267,7 @@ def _e16_scatter(merged: pd.DataFrame, metric: str, scenario: str) -> go.Figure:
                 text=f"ρ = {rho:+.3f}<br>p = {p:.2e}<br>n = {len(df)}",
                 bgcolor="rgba(255,255,255,0.88)",
                 bordercolor="#888", borderwidth=1,
-                font=dict(size=10),
+                font=dict(size=_E16_FONT_SIZES["annotation"]),
                 row=row, col=col,
             )
         fig.update_yaxes(type="log", row=row, col=col, title_text=f"{sector_col} (MW, log)")
@@ -1156,11 +1276,22 @@ def _e16_scatter(merged: pd.DataFrame, metric: str, scenario: str) -> go.Figure:
     if not any_data:
         return go.Figure()
 
-    fig.update_layout(**_layout(
+    fig.update_layout(**_e16_layout(
         title=f"E16 — {pretty_scenario(scenario)}: {metric} vs analytical shed (per sector)",
         height=720, width=1080,
         legend=dict(title="cp_type"),
     ))
+    # Bump axis-title and tick fonts on every sub-axis (update_layout above
+    # only set fonts on the ``xaxis``/``yaxis`` keys it received).
+    fig.update_xaxes(
+        title_font=dict(size=_E16_FONT_SIZES["axis_title"]),
+        tickfont=dict(size=_E16_FONT_SIZES["axis_tick"]),
+    )
+    fig.update_yaxes(
+        title_font=dict(size=_E16_FONT_SIZES["axis_title"]),
+        tickfont=dict(size=_E16_FONT_SIZES["axis_tick"]),
+    )
+    _e16_bump_subplot_titles(fig)
     return fig
 
 
@@ -1235,7 +1366,7 @@ def _e16_rho_per_sector_bar(df: pd.DataFrame, scenario: str) -> go.Figure:
     if not any_trace:
         return go.Figure()
     bar.add_hline(y=0, line=dict(color="#444", width=1, dash="dot"))
-    bar.update_layout(**_layout(
+    bar.update_layout(**_e16_layout(
         title=f"E16 — {pretty_scenario(scenario)}: Spearman ρ vs analytical shed, per sector",
         barmode="group",
         xaxis=dict(title="Metric", tickangle=-25),
@@ -1272,7 +1403,7 @@ def _e16_top_overlap(merged: pd.DataFrame, scenario: str,
         df, x="k", y="overlap", color="metric", markers=True,
         color_discrete_sequence=QUAL,
     )
-    fig.update_layout(**_layout(
+    fig.update_layout(**_e16_layout(
         title=f"E16 — {pretty_scenario(scenario)}: top-K overlap (metric vs analytical shed)",
         xaxis_title="K", yaxis_title="|top_K(metric) ∩ top_K(shed)| / K",
         yaxis=dict(range=[0, 1.05], tickformat=".0%"),
@@ -1446,7 +1577,7 @@ def _e16_rho_per_sector_bar_aggregated(
         return go.Figure()
     bar.add_hline(y=0, line=dict(color="#444", width=1, dash="dot"))
     n_total_row = int(rho_df["n_total"].max()) if "n_total" in rho_df.columns else 0
-    bar.update_layout(**_layout(
+    bar.update_layout(**_e16_layout(
         title=(
             f"E16 — Pooled across all scenarios (n={n_total_row}): "
             "Spearman ρ vs analytical shed, per sector"
@@ -1535,9 +1666,16 @@ def _e16_per_sector_heatmap(df: pd.DataFrame) -> go.Figure:
     heat = go.Figure(go.Heatmap(
         z=z, x=metrics, y=row_labels,
         colorscale="RdBu", zmid=0, zmin=-1, zmax=1,
-        colorbar=dict(title=dict(text="ρ vs shed", side="right"),
-                      thickness=14, len=0.9),
+        colorbar=dict(
+            title=dict(
+                text="ρ vs shed", side="right",
+                font=dict(size=_E16_FONT_SIZES["colorbar"]),
+            ),
+            tickfont=dict(size=_E16_FONT_SIZES["colorbar"]),
+            thickness=14, len=0.9,
+        ),
         text=text, texttemplate="%{text}",
+        textfont=dict(size=_E16_FONT_SIZES["annotation"]),
         xgap=1, ygap=1,
         hovertemplate="<b>%{y}</b><br>%{x}: ρ = %{z:.3f}<extra></extra>",
     ))
@@ -1560,7 +1698,7 @@ def _e16_per_sector_heatmap(df: pd.DataFrame) -> go.Figure:
                 ))
                 prev_scenario = s
 
-    heat.update_layout(**_layout(
+    heat.update_layout(**_e16_layout(
         title=(
             "E16 — Spearman ρ between metric and analytical shed, "
             "per scenario × sector"
@@ -1569,13 +1707,12 @@ def _e16_per_sector_heatmap(df: pd.DataFrame) -> go.Figure:
         yaxis=dict(
             title="Scenario — Sector",
             autorange="reversed",
-            tickfont=dict(size=11),
             # Gridlines between every category for per-sector resolution
             # (in addition to the heavier scenario-boundary separators).
             showgrid=True, gridcolor="#eeeeee", gridwidth=1,
         ),
-        height=max(320, 60 + 22 * len(row_labels)),
-        width=180 + 90 * max(len(metrics), 1),
+        height=max(360, 80 + 28 * len(row_labels)),
+        width=240 + 110 * max(len(metrics), 1),
         shapes=shapes,
     ))
     return heat
@@ -1627,16 +1764,23 @@ def plot_e16_single_removal(input_dir: Path, output_dir: Path) -> Optional[Path]
                 z=z, x=list(pivot_shed.columns),
                 y=[pretty_scenario(s) for s in pivot_shed.index],
                 colorscale="RdBu", zmid=0, zmin=-1, zmax=1,
-                colorbar=dict(title=dict(text="ρ vs shed", side="right"),
-                              thickness=14, len=0.9),
+                colorbar=dict(
+                    title=dict(
+                        text="ρ vs shed", side="right",
+                        font=dict(size=_E16_FONT_SIZES["colorbar"]),
+                    ),
+                    tickfont=dict(size=_E16_FONT_SIZES["colorbar"]),
+                    thickness=14, len=0.9,
+                ),
                 text=text, texttemplate="%{text}",
+                textfont=dict(size=_E16_FONT_SIZES["annotation"]),
                 hovertemplate="<b>%{y}</b><br>%{x}: ρ = %{z:.3f}<extra></extra>",
             ))
-            heat.update_layout(**_layout(
+            heat.update_layout(**_e16_layout(
                 title="E16 — Spearman ρ between metric and analytical single-removal shed",
                 xaxis=dict(title="Metric", tickangle=30), yaxis=dict(title=""),
-                height=max(280, 80 + 56 * len(pivot_shed.index)),
-                width=120 + 90 * len(pivot_shed.columns),
+                height=max(320, 80 + 64 * len(pivot_shed.index)),
+                width=180 + 110 * len(pivot_shed.columns),
             ))
             figs.append(heat)
             titles.append("E16 ρ vs analytical shed")
@@ -1683,7 +1827,7 @@ def plot_e16_single_removal(input_dir: Path, output_dir: Path) -> Optional[Path]
                   line=dict(color="#888", dash="dash", width=1.2))
     fig.add_hline(y=0, line=dict(color="#bbb", width=1, dash="dot"))
     fig.add_vline(x=0, line=dict(color="#bbb", width=1, dash="dot"))
-    fig.update_layout(**_layout(
+    fig.update_layout(**_e16_layout(
         title="E16 — ρ vs analytical shed (x) vs ρ vs MC actual (y)",
         xaxis=dict(title="Spearman ρ vs shed", range=[-1.05, 1.05],
                    gridcolor="#e5e5e5"),
@@ -1716,12 +1860,12 @@ def plot_e16_single_removal(input_dir: Path, output_dir: Path) -> Optional[Path]
             showlegend=False,
         ))
         fig2.add_vline(x=0, line=dict(color="#444", width=1, dash="dot"))
-        fig2.update_layout(**_layout(
+        fig2.update_layout(**_e16_layout(
             title="E16 — Ceiling: ρ between analytical shed and MC actual_total",
             xaxis=dict(title="Spearman ρ", range=[-1.05, 1.10],
                        gridcolor="#e5e5e5"),
             yaxis=dict(title=""),
-            height=80 + 36 * len(ceil), width=820,
+            height=max(220, 80 + 44 * len(ceil)), width=900,
         ))
         figs.append(fig2)
         titles.append("E16 ceiling ρ")

@@ -38,6 +38,104 @@ except Exception:  # pragma: no cover
 
 DEFAULT_DIR = Path("data/out/single_removal_shed")
 
+
+# Single-column dissertation typography. Same sizing convention as the
+# E16 plots in cmres_eval_plots: figures are rendered at ~750-1200 px
+# then scaled down to a ~84 mm column, so every text element is bumped
+# enough to stay legible at the printed size.
+_SRS_FONT_SIZES = dict(
+    base=18,
+    title=22,
+    axis_title=20,
+    axis_tick=18,
+    legend=18,
+    legend_title=18,
+    annotation=16,
+    subplot_title=20,
+    colorbar=18,
+)
+
+
+def _srs_bump_fonts(fig: go.Figure) -> None:
+    """Apply the dissertation-column font sizes to a figure in place.
+
+    Walks every named ``xaxis*``/``yaxis*`` layout block so subplots
+    inherit the same axis-title / tick sizes as the primary axes,
+    bumps the cmres-template legend / title fonts, and pushes the
+    subplot-title annotations from ``make_subplots`` up to the same
+    level as the figure title (otherwise auto-generated subplot
+    headers get lost beside the bigger axis labels)."""
+    sz = _SRS_FONT_SIZES
+
+    # Layout-level font (catches every text element with no explicit override).
+    layout = fig.layout
+    if layout.font:
+        layout.font.size = sz["base"]
+    else:
+        layout.font = dict(size=sz["base"])
+
+    # Title font (idempotent — only touches the size).
+    if layout.title and layout.title.text:
+        font = layout.title.font
+        if font:
+            font.size = sz["title"]
+        else:
+            layout.title.font = dict(size=sz["title"])
+
+    # Legend body + legend-title fonts.
+    if layout.legend:
+        if layout.legend.font:
+            layout.legend.font.size = sz["legend"]
+        else:
+            layout.legend.font = dict(size=sz["legend"])
+        if layout.legend.title:
+            tf = layout.legend.title.font
+            if tf:
+                tf.size = sz["legend_title"]
+            else:
+                layout.legend.title.font = dict(size=sz["legend_title"])
+
+    # Bump every axis (xaxis, yaxis, xaxis2, yaxis2, …).
+    for ax_attr in dir(layout):
+        if not (ax_attr.startswith("xaxis") or ax_attr.startswith("yaxis")):
+            continue
+        ax = getattr(layout, ax_attr, None)
+        if ax is None or not hasattr(ax, "tickfont"):
+            continue
+        # Title font
+        if ax.title:
+            if ax.title.font:
+                ax.title.font.size = sz["axis_title"]
+            else:
+                ax.title.font = dict(size=sz["axis_title"])
+        # Tick font
+        if ax.tickfont:
+            ax.tickfont.size = sz["axis_tick"]
+        else:
+            ax.tickfont = dict(size=sz["axis_tick"])
+
+    # Subplot titles + any in-plot annotation that didn't set its own size.
+    for ann in (layout.annotations or ()):
+        xref = getattr(ann, "xref", "") or ""
+        font = ann.font
+        if xref.endswith("paper") and (ann.text or ""):
+            # Auto-generated subplot title.
+            if font:
+                font.size = sz["subplot_title"]
+            else:
+                ann.font = dict(size=sz["subplot_title"])
+        else:
+            # In-plot annotation: leave explicit sizes alone, otherwise bump.
+            if font and (font.size or 0) < sz["annotation"]:
+                font.size = sz["annotation"]
+
+
+def _srs_finalize(fig: go.Figure, legend: str = "right") -> go.Figure:
+    """Apply the cmres style and bump fonts for dissertation 1-column use."""
+    fig = ev.apply_cmres_style(fig, legend=legend)
+    _srs_bump_fonts(fig)
+    return fig
+
 # Canonical kind→colour pinning so the legend stays consistent across grids:
 # a grid without CPs (no ``compound`` / ``branch_cp`` rows) must still leave
 # the ``branch`` colour unchanged, otherwise the visual reading flips
@@ -95,7 +193,7 @@ def _hist_total(sweep: pd.DataFrame, grid: str, baseline_total: float) -> go.Fig
         yaxis_title="Components (count)",
         height=420, width=900,
     )
-    return ev.apply_cmres_style(fig, legend="right")
+    return _srs_finalize(fig, legend="right")
 
 
 def _top_components(sweep: pd.DataFrame, grid: str, top_n: int = 20) -> go.Figure:
@@ -120,7 +218,7 @@ def _top_components(sweep: pd.DataFrame, grid: str, top_n: int = 20) -> go.Figur
         height=600, width=950,
         margin=dict(l=200),
     )
-    return ev.apply_cmres_style(fig, legend="right")
+    return _srs_finalize(fig, legend="right")
 
 
 def _pareto(sweep: pd.DataFrame, grid: str) -> go.Figure:
@@ -146,7 +244,7 @@ def _pareto(sweep: pd.DataFrame, grid: str) -> go.Figure:
                     range=[0, 1.05], tickformat=".0%"),
         height=440, width=950,
     )
-    return ev.apply_cmres_style(fig, legend="right")
+    return _srs_finalize(fig, legend="right")
 
 
 def _carrier_breakdown(sweep: pd.DataFrame, grid: str) -> go.Figure:
@@ -164,7 +262,7 @@ def _carrier_breakdown(sweep: pd.DataFrame, grid: str) -> go.Figure:
         title=f"{grid}: per-carrier shed distribution across all single removals",
     )
     fig.update_layout(yaxis_type="log", yaxis_title="Shed (MW, log)", height=420, width=750)
-    return ev.apply_cmres_style(fig, legend="right")
+    return _srs_finalize(fig, legend="right")
 
 
 def _kind_summary(sweep: pd.DataFrame, grid: str) -> go.Figure:
@@ -187,7 +285,7 @@ def _kind_summary(sweep: pd.DataFrame, grid: str) -> go.Figure:
         yaxis_title="Total shed (MW)",
         height=400, width=750,
     )
-    return ev.apply_cmres_style(fig, legend="right")
+    return _srs_finalize(fig, legend="right")
 
 
 def _solve_time(sweep: pd.DataFrame, grid: str) -> go.Figure:
@@ -201,7 +299,7 @@ def _solve_time(sweep: pd.DataFrame, grid: str) -> go.Figure:
         yaxis_title="Components (count)",
         height=380, width=750, showlegend=False,
     )
-    return ev.apply_cmres_style(fig, legend="none")
+    return _srs_finalize(fig, legend="none")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -263,7 +361,7 @@ def _pooled_baseline(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
         xaxis_title="Baseline load shed (MW)", yaxis_title="",
         height=80 + 36 * max(1, len(df)), width=900,
     )
-    return ev.apply_cmres_style(fig, legend="right")
+    return _srs_finalize(fig, legend="right")
 
 
 def _pooled_total_shed_box(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
@@ -300,7 +398,7 @@ def _pooled_total_shed_box(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
         yaxis_type="log",
         height=520, width=max(720, 90 * len(grids) + 180),
     )
-    return ev.apply_cmres_style(fig, legend="right")
+    return _srs_finalize(fig, legend="right")
 
 
 def _pooled_excess_shed_box(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
@@ -339,11 +437,12 @@ def _pooled_excess_shed_box(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
     # boxes of wildly different sample size as if they were equivalent.
     annotations = [
         dict(x=pretty_scenario(g), y=1.02, xref="x", yref="paper",
-             text=f"{n}/{tot}", showarrow=False, font=dict(size=10, color="#444"))
+             text=f"{n}/{tot}", showarrow=False,
+             font=dict(size=_SRS_FONT_SIZES["annotation"], color="#444"))
         for g, n, tot in n_total
     ]
     fig.update_layout(annotations=annotations)
-    return ev.apply_cmres_style(fig, legend="right")
+    return _srs_finalize(fig, legend="right")
 
 
 def _pooled_pareto(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
@@ -375,7 +474,7 @@ def _pooled_pareto(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
                    range=[0, 1.02], tickformat=".0%"),
         height=480, width=900,
     )
-    return ev.apply_cmres_style(fig, legend="right")
+    return _srs_finalize(fig, legend="right")
 
 
 def _pooled_carrier_box(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
@@ -415,7 +514,7 @@ def _pooled_carrier_box(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
         xaxis_title="Carrier", yaxis_title="Shed (MW, log)",
         height=520, width=max(820, 100 * len(grids) + 240),
     )
-    return ev.apply_cmres_style(fig, legend="right")
+    return _srs_finalize(fig, legend="right")
 
 
 def _pooled_kind_summary(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
@@ -458,7 +557,7 @@ def _pooled_kind_summary(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
         yaxis_title="Mean total shed (MW)",
         height=460, width=max(640, 90 * max(1, len(kinds_present) * len(grids)) + 200),
     )
-    return ev.apply_cmres_style(fig, legend="right")
+    return _srs_finalize(fig, legend="right")
 
 
 def _pooled_mean_shed_by_carrier(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
@@ -510,7 +609,7 @@ def _pooled_mean_shed_by_carrier(records: Dict[str, Tuple[pd.DataFrame, pd.Serie
         yaxis_title="Mean shed per component (MW)",
         height=460, width=max(720, 110 * len(grids) + 200),
     )
-    return ev.apply_cmres_style(fig, legend="right")
+    return _srs_finalize(fig, legend="right")
 
 
 def _pooled_solve_time(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
@@ -536,7 +635,7 @@ def _pooled_solve_time(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
         xaxis_title="Grid", yaxis_title="Elapsed (s)",
         height=440, width=max(720, 90 * len(grids) + 180),
     )
-    return ev.apply_cmres_style(fig, legend="right")
+    return _srs_finalize(fig, legend="right")
 
 
 def _pooled_top_components(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
@@ -584,7 +683,7 @@ def _pooled_top_components(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
         height=80 + 22 * max(1, len(df)), width=950,
         margin=dict(l=240),
     )
-    return ev.apply_cmres_style(fig, legend="right")
+    return _srs_finalize(fig, legend="right")
 
 
 def plot_pooled(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
