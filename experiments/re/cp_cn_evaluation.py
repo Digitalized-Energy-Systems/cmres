@@ -2221,70 +2221,133 @@ def cross_carrier_impact_aggregated(
         )
         return
 
+    # Per-source component count per scenario — needed for the
+    # per-component figure below. Each component has one impact_df row
+    # per impacted carrier (3 rows / component), so we de-dup by unique
+    # ``id`` rather than counting rows.
+    comp_count = (
+        df.groupby(["network_type", "source_carrier"])["id"]
+        .nunique()
+        .rename("n_components")
+        .reset_index()
+    )
+    per_scenario_sum = per_scenario_sum.merge(
+        comp_count, on=["network_type", "source_carrier"], how="left"
+    )
+    per_scenario_sum["impact_per_component"] = (
+        per_scenario_sum["impact_abs"] / per_scenario_sum["n_components"].clip(lower=1)
+    )
+
     # Build a (source × target) DataFrame per scenario and stack into a
-    # 3-D array (n_scenarios, |source|, |target|) for mean/std.
+    # 3-D array (n_scenarios, |source|, |target|) for mean/std. We stack
+    # both the totals and the per-component normalised values so the two
+    # figures below share the same scenario-axis ordering.
     full_index = pandas.MultiIndex.from_product(
         [source_order, target_order], names=["source_carrier", "carrier"],
     )
-    layer_arrays = []
-    for nt in nets:
-        sub = (
-            per_scenario_sum[per_scenario_sum["network_type"] == nt]
-            .set_index(["source_carrier", "carrier"])["impact_abs"]
-            .reindex(full_index, fill_value=0.0)
-            .unstack("carrier")
-            .reindex(index=source_order, columns=target_order)
-            .fillna(0.0)
+
+    def _stack_value(value_col):
+        layers = []
+        for nt in nets:
+            sub = (
+                per_scenario_sum[per_scenario_sum["network_type"] == nt]
+                .set_index(["source_carrier", "carrier"])[value_col]
+                .reindex(full_index, fill_value=0.0)
+                .unstack("carrier")
+                .reindex(index=source_order, columns=target_order)
+                .fillna(0.0)
+            )
+            layers.append(sub.to_numpy(dtype=float))
+        return _np.stack(layers, axis=0)
+
+    total_stack = _stack_value("impact_abs")
+    per_comp_stack = _stack_value("impact_per_component")
+
+    def _mean_std(stack):
+        mean = stack.mean(axis=0)
+        std = (
+            stack.std(axis=0, ddof=1) if stack.shape[0] > 1 else _np.zeros_like(mean)
         )
-        layer_arrays.append(sub.to_numpy(dtype=float))
-    stack = _np.stack(layer_arrays, axis=0)  # (n_scenarios, n_sources, n_targets)
-    mean_arr = stack.mean(axis=0)
-    std_arr = stack.std(axis=0, ddof=1) if stack.shape[0] > 1 else _np.zeros_like(mean_arr)
+        return mean, std
 
-    fig = go.Figure()
-    for j, target in enumerate(target_order):
-        fig.add_trace(go.Bar(
-            x=source_order,
-            y=mean_arr[:, j],
-            name=f"→ {target}",
-            marker_color=color_map.get(target, "#888888"),
-            error_y=dict(
-                type="data",
-                array=std_arr[:, j].tolist(),
-                thickness=1.5, width=4, color="#333",
-                visible=bool(stack.shape[0] > 1),
-            ),
-            hovertemplate=(
-                "source=%{x}<br>"
-                f"target={target}<br>"
-                "mean Σ |impact|=%{y:.4f} MW<br>"
-                f"n_scenarios={stack.shape[0]}<extra></extra>"
-            ),
-        ))
+    total_mean, total_std = _mean_std(total_stack)
+    per_comp_mean, per_comp_std = _mean_std(per_comp_stack)
 
-    fig.update_layout(
-        barmode="group",
-        height=520,
-        width=820,
-        template=eval.CMRES_TEMPLATE,
-        legend=dict(title="Impacted carrier"),
-        xaxis=dict(title="Source carrier"),
-        yaxis=dict(title="Mean Σ |impact| across scenarios (MW)"),
-        margin={"l": 70, "b": 60, "r": 30, "t": 70},
+    # Component counts averaged across scenarios so the per-component
+    # figure's hover can disclose what we normalised by.
+    n_comp_per_source = (
+        comp_count.groupby("source_carrier")["n_components"]
+        .mean()
+        .reindex(source_order, fill_value=0)
+        .to_numpy(dtype=float)
+    )
+
+    def _build_fig(mean_arr, std_arr, y_title, unit, show_n_components):
+        fig = go.Figure()
+        for j, target in enumerate(target_order):
+            extra_hover = ""
+            if show_n_components:
+                extra_hover = "<br>mean n_components=%{customdata:.1f}"
+            fig.add_trace(go.Bar(
+                x=source_order,
+                y=mean_arr[:, j],
+                name=f"→ {target}",
+                marker_color=color_map.get(target, "#888888"),
+                customdata=n_comp_per_source if show_n_components else None,
+                error_y=dict(
+                    type="data",
+                    array=std_arr[:, j].tolist(),
+                    thickness=1.5, width=4, color="#333",
+                    visible=bool(total_stack.shape[0] > 1),
+                ),
+                hovertemplate=(
+                    "source=%{x}<br>"
+                    f"target={target}<br>"
+                    "%{y:.4f}" + f" {unit}"
+                    + extra_hover
+                    + f"<br>n_scenarios={total_stack.shape[0]}<extra></extra>"
+                ),
+            ))
+        fig.update_layout(
+            barmode="group",
+            height=520,
+            width=820,
+            template=eval.CMRES_TEMPLATE,
+            legend=dict(title="Impacted carrier"),
+            xaxis=dict(title="Source carrier"),
+            yaxis=dict(title=y_title),
+            margin={"l": 70, "b": 60, "r": 30, "t": 70},
+        )
+        return fig
+
+    fig_total = _build_fig(
+        total_mean, total_std,
+        y_title="Mean Σ |impact| across scenarios (MW)",
+        unit="MW",
+        show_n_components=False,
+    )
+    fig_per_comp = _build_fig(
+        per_comp_mean, per_comp_std,
+        y_title="Mean |impact| per source-side component (MW)",
+        unit="MW / component",
+        show_n_components=True,
     )
 
     Path(output_dir).mkdir(exist_ok=True, parents=True)
     eval.write_all_in_one(
-        [fig], "Figure", Path("."),
+        [fig_total, fig_per_comp], "Figure", Path("."),
         output_dir + "/cross_carrier_impact_aggregated.html",
         titles=[
             f"Cross-carrier impact aggregated across all scenarios "
-            f"(n_scenarios={stack.shape[0]}, mean ± std)"
+            f"(n_scenarios={total_stack.shape[0]}, mean ± std)",
+            f"Cross-carrier impact per source-side component "
+            f"(n_scenarios={total_stack.shape[0]}, "
+            "Σ |impact| ÷ n_components in that source bucket)",
         ],
     )
     print(
-        f"Cross-carrier impact (aggregated): {stack.shape[0]} scenarios → "
-        f"{output_dir}/cross_carrier_impact_aggregated.html"
+        f"Cross-carrier impact (aggregated): {total_stack.shape[0]} scenarios → "
+        f"{output_dir}/cross_carrier_impact_aggregated.html (total + per-component)"
     )
 
 
