@@ -77,6 +77,35 @@ def get_id_type(id_str: str):
     return "node"
 
 
+def _type_name(t) -> str:
+    """Normalise an ``impact_df.type`` value to a bare class name.
+
+    ``create_metrics_df`` populates ``type`` with the actual Python
+    ``type`` object — but ``impact_df`` is round-tripped through CSV
+    by ``create_or_load_impact_df``, so on subsequent runs the same
+    column comes back as ``"<class 'monee.model.child.PowerLine'>"``.
+    Neither form equals the bare ``"PowerLine"`` key in ``TYPE_TO_CARRIER``.
+    This helper accepts both and returns the bare class name. NaN /
+    ``None`` (e.g. the rows ``extend_impact_df`` appends without a
+    ``type``) return an empty string so they map to ``NaN`` in
+    ``TYPE_TO_CARRIER`` lookups and get filtered out cleanly.
+    """
+    if t is None:
+        return ""
+    # NaN floats from pandas concat.
+    try:
+        if isinstance(t, float) and t != t:  # NaN check w/o numpy import
+            return ""
+    except Exception:
+        pass
+    if isinstance(t, type):
+        return t.__name__
+    s = str(t)
+    if s.startswith("<class '") and s.endswith("'>"):
+        return s[len("<class '"):-len("'>")].rsplit(".", 1)[-1]
+    return s
+
+
 def extend_impact_df(net_type_to_net: Dict[str, Network], metrics_df, impact_df):
     impact_df = impact_df.reset_index(drop=True)
     impact_id_str = impact_df["id"].astype(str)
@@ -2009,7 +2038,13 @@ def cross_carrier_impact_per_scenario(
     from plotly.subplots import make_subplots
 
     df = impact_df.copy()
-    df["source_carrier"] = df["type"].astype(str).map(TYPE_TO_CARRIER)
+    # ``impact_df.type`` is a Python ``type`` object on fresh builds and a
+    # ``"<class '…PowerLine'>"`` string on CSV round-trips — neither equals
+    # the bare ``"PowerLine"`` key in ``TYPE_TO_CARRIER``. Normalise both
+    # forms to the bare class name before the lookup, otherwise every row
+    # drops out and ``nets`` ends up empty even though impact_df is populated.
+    df["_type_name"] = df["type"].map(_type_name)
+    df["source_carrier"] = df["_type_name"].map(TYPE_TO_CARRIER)
     df = df[df["source_carrier"].notna()]
     # Drop the ambiguous "heat/gas" source bucket (generic Junction); the
     # static map can't say which grid the junction lives on.
@@ -2029,7 +2064,18 @@ def cross_carrier_impact_per_scenario(
 
     nets = sort_scenarios(agg["network_type"].unique())
     if not nets:
-        print("Cross-carrier impact: no scenarios after filtering — skipping.")
+        # Diagnostic for the empty-after-filter case so the next person
+        # doesn't have to repeat this debugging session.
+        n_in = len(impact_df)
+        unmapped_types = (
+            impact_df["type"].map(_type_name).value_counts().head(5)
+            if "type" in impact_df.columns else "<no type column>"
+        )
+        print(
+            f"Cross-carrier impact: 0 scenarios after filtering "
+            f"(impact_df had {n_in} rows). Top unmapped types: "
+            f"{unmapped_types.to_dict() if hasattr(unmapped_types, 'to_dict') else unmapped_types}"
+        )
         return
 
     n = len(nets)
@@ -2137,7 +2183,12 @@ def cross_carrier_impact_aggregated(
     import plotly.graph_objects as go
 
     df = impact_df.copy()
-    df["source_carrier"] = df["type"].astype(str).map(TYPE_TO_CARRIER)
+    # See `_type_name` rationale in cross_carrier_impact_per_scenario:
+    # impact_df.type is the Python type object on fresh builds and the
+    # ``"<class '…'>"`` string on CSV round-trips; normalise to the bare
+    # class name before the TYPE_TO_CARRIER lookup.
+    df["_type_name"] = df["type"].map(_type_name)
+    df["source_carrier"] = df["_type_name"].map(TYPE_TO_CARRIER)
     df = df[df["source_carrier"].notna()]
     df = df[df["source_carrier"] != "heat/gas"]
     df["impact_abs"] = df["impact"].abs()
@@ -2158,7 +2209,16 @@ def cross_carrier_impact_aggregated(
     )
     nets = sort_scenarios(per_scenario_sum["network_type"].unique())
     if not nets:
-        print("Cross-carrier impact (aggregated): no scenarios after filtering — skipping.")
+        n_in = len(impact_df)
+        unmapped_types = (
+            impact_df["type"].map(_type_name).value_counts().head(5)
+            if "type" in impact_df.columns else "<no type column>"
+        )
+        print(
+            f"Cross-carrier impact (aggregated): 0 scenarios after filtering "
+            f"(impact_df had {n_in} rows). Top unmapped types: "
+            f"{unmapped_types.to_dict() if hasattr(unmapped_types, 'to_dict') else unmapped_types}"
+        )
         return
 
     # Build a (source × target) DataFrame per scenario and stack into a
