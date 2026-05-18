@@ -136,6 +136,72 @@ def _srs_finalize(fig: go.Figure, legend: str = "right") -> go.Figure:
     _srs_bump_fonts(fig)
     return fig
 
+
+def _srs_bump_all_fonts_by(fig: go.Figure, delta: int) -> None:
+    """Increment every text-element font size on *fig* by ``delta`` (pt).
+
+    For one-off per-figure overrides on top of ``_srs_finalize``. Touches
+    the layout font, title font, legend body / title font, every
+    ``xaxis*``/``yaxis*`` title and tickfont, and every annotation
+    (subplot titles + in-plot)."""
+    if delta == 0:
+        return
+    layout = fig.layout
+
+    def _bump(font_holder, default_size: int) -> None:
+        """Bump ``font_holder.font.size`` (creating the font dict if absent)."""
+        if font_holder is None:
+            return
+        font = getattr(font_holder, "font", None)
+        if font is not None and font.size is not None:
+            font.size = font.size + delta
+        else:
+            # No prior size — assume the base default and bump it.
+            setattr(font_holder, "font", dict(size=default_size + delta))
+
+    # Layout-level font.
+    if layout.font and layout.font.size is not None:
+        layout.font.size = layout.font.size + delta
+    else:
+        layout.font = dict(size=_SRS_FONT_SIZES["base"] + delta)
+
+    # Title.
+    if layout.title and layout.title.text:
+        _bump(layout.title, _SRS_FONT_SIZES["title"])
+
+    # Legend body + legend title.
+    if layout.legend:
+        _bump(layout.legend, _SRS_FONT_SIZES["legend"])
+        if layout.legend.title:
+            _bump(layout.legend.title, _SRS_FONT_SIZES["legend_title"])
+
+    # Axes.
+    for ax_attr in dir(layout):
+        if not (ax_attr.startswith("xaxis") or ax_attr.startswith("yaxis")):
+            continue
+        ax = getattr(layout, ax_attr, None)
+        if ax is None or not hasattr(ax, "tickfont"):
+            continue
+        if ax.title:
+            _bump(ax.title, _SRS_FONT_SIZES["axis_title"])
+        if ax.tickfont and ax.tickfont.size is not None:
+            ax.tickfont.size = ax.tickfont.size + delta
+        else:
+            ax.tickfont = dict(size=_SRS_FONT_SIZES["axis_tick"] + delta)
+
+    # Annotations (subplot titles + in-plot).
+    for ann in (layout.annotations or ()):
+        font = ann.font
+        if font is not None and font.size is not None:
+            font.size = font.size + delta
+        else:
+            # Pick a sensible default depending on the annotation kind.
+            xref = getattr(ann, "xref", "") or ""
+            default = (_SRS_FONT_SIZES["subplot_title"]
+                       if xref.endswith("paper")
+                       else _SRS_FONT_SIZES["annotation"])
+            ann.font = dict(size=default + delta)
+
 # Canonical kind→colour pinning so the legend stays consistent across grids:
 # a grid without CPs (no ``compound`` / ``branch_cp`` rows) must still leave
 # the ``branch`` colour unchanged, otherwise the visual reading flips
@@ -427,21 +493,20 @@ def _pooled_excess_shed_box(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
                            + "</b><br>Δ shed = %{y:.4f} MW<extra></extra>"),
         ))
     fig.update_layout(
-        title=("Excess shed under fault: total_shed − baseline per component "
-               "(grids with no positive delta are blank)"),
+        title=("Excess shed under fault: total_shed − baseline per component"),
         xaxis_title="Grid", yaxis_title="Excess shed Δ (MW, log)",
         yaxis_type="log",
         height=520, width=max(720, 90 * len(grids) + 180),
     )
     # Annotate per-grid n_positive/n_total so the reader doesn't compare
     # boxes of wildly different sample size as if they were equivalent.
-    annotations = [
-        dict(x=pretty_scenario(g), y=1.02, xref="x", yref="paper",
-             text=f"{n}/{tot}", showarrow=False,
-             font=dict(size=_SRS_FONT_SIZES["annotation"], color="#444"))
-        for g, n, tot in n_total
-    ]
-    fig.update_layout(annotations=annotations)
+    # annotations = [
+    #     dict(x=pretty_scenario(g), y=1.02, xref="x", yref="paper",
+    #          text=f"{n}/{tot}", showarrow=False,
+    #          font=dict(size=_SRS_FONT_SIZES["annotation"], color="#444"))
+    #     for g, n, tot in n_total
+    # ]
+    # fig.update_layout(annotations=annotations)
     return _srs_finalize(fig, legend="right")
 
 
@@ -514,7 +579,11 @@ def _pooled_carrier_box(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
         xaxis_title="Carrier", yaxis_title="Shed (MW, log)",
         height=520, width=max(820, 100 * len(grids) + 240),
     )
-    return _srs_finalize(fig, legend="right")
+    fig = _srs_finalize(fig, legend="right")
+    # Per-figure-only +2 pt bump on every text element (dissertation-print
+    # requirement specific to this carrier-by-grid box plot).
+    _srs_bump_all_fonts_by(fig, 2)
+    return fig
 
 
 def _pooled_kind_summary(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
