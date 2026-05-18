@@ -1630,24 +1630,33 @@ def _e16_per_sector_heatmap(df: pd.DataFrame) -> go.Figure:
             row_labels.append(f"{pretty_scenario(s)} — {sector_short[tag]}")
             row_keys.append((s, tag))
 
+    # Vectorised build of the (rows × metrics) ρ matrix: one pivot per
+    # sector column (5), each indexed/reindexed to the canonical row /
+    # column order. Replaces a triple-nested Python loop over
+    # ``df_idx.loc[(s, m), col]`` that did ~scenarios × sectors × metrics
+    # individual MultiIndex lookups.
+    sector_rho_cols = [f"rho_vs_{t}_shed" for t in sector_tags]
+    sector_rho_cols = [c for c in sector_rho_cols if c in df.columns]
     z = np.full((len(row_labels), len(metrics)), np.nan, dtype=float)
-    df_idx = df.set_index(["scenario", "metric"], drop=False)
-    for i, (s, tag) in enumerate(row_keys):
-        col_name = f"rho_vs_{tag}_shed"
-        if col_name not in df.columns:
-            continue
-        for j, m in enumerate(metrics):
+    # ``scenario`` ordered against the resolved ``scenarios`` list so
+    # ``row_keys`` and the matrix rows stay aligned 1-to-1.
+    for col_name in sector_rho_cols:
+        tag = col_name[len("rho_vs_"):-len("_shed")]
+        pivot = (
+            df.pivot_table(
+                index="scenario", columns="metric",
+                values=col_name, aggfunc="first",
+            )
+            .reindex(index=scenarios, columns=metrics)
+        )
+        # Place pivot rows into the corresponding scenario block.
+        for scen_i, s in enumerate(scenarios):
             try:
-                v = df_idx.loc[(s, m), col_name]
-            except KeyError:
+                row_i = scen_i * len(sector_tags) + sector_tags.index(tag)
+            except ValueError:
                 continue
-            if hasattr(v, "iloc"):
-                # Duplicate (scenario, metric) rows would yield a Series.
-                v = v.iloc[0]
-            try:
-                z[i, j] = float(v)
-            except (TypeError, ValueError):
-                continue
+            row_vals = pivot.loc[s].to_numpy(dtype=float, na_value=np.nan)
+            z[row_i, :] = row_vals
 
     # Drop fully-NaN columns / rows so Kaleido can scale the axes.
     finite_cols = ~np.all(np.isnan(z), axis=0)

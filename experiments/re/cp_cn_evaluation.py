@@ -1330,6 +1330,7 @@ def cp_metric_vs_actual_impact(monee_net, impact_df_nt, network_type):
     _default_k = _ec.default_ndcg_k
     _precision_at_k = _ec.precision_at_k
     _bootstrap_ci = _ec.bootstrap_ci
+    _bootstrap_ndcg_ci = _ec.bootstrap_ndcg_ci
 
     pred_metrics = [(col, label) for col, label in METRICS if col != "actual_total"]
     actual_vals  = valid["actual_total"].values
@@ -1341,6 +1342,9 @@ def cp_metric_vs_actual_impact(monee_net, impact_df_nt, network_type):
     # 4a. Summary bar chart: Kendall τ, NDCG@k, and rNDCG per metric (the
     # full-list NDCG saturates on heavy-tailed ``actual_total`` and is
     # kept only for backwards compatibility — see eval_common.ndcg docs).
+    # NDCG / rNDCG CIs use the vectorised ``bootstrap_ndcg_ci`` — the
+    # earlier Python-loop bootstrap with an inner 80-permutation MC was
+    # the dominant cost of this block.
     _rng = _np.random.default_rng(42)
     acc_rows = []
     for col, label in pred_metrics:
@@ -1348,19 +1352,17 @@ def cp_metric_vs_actual_impact(monee_net, impact_df_nt, network_type):
         tau  = float(scipy.stats.kendalltau(scores, actual_vals).statistic)
         ndcg = _ndcg(actual_vals, scores)
         ndcg_at_k = _ndcg(actual_vals, scores, k=_k_cut)
-        rndcg = _rndcg(actual_vals, scores, k=_k_cut, rng=_rng)
+        rndcg = _rndcg(actual_vals, scores, k=_k_cut)
         tau_lo, tau_hi = _bootstrap_ci(
             lambda a, p: float(scipy.stats.kendalltau(p, a).statistic),
             actual_vals, scores, rng=_rng)
-        ndcg_lo, ndcg_hi = _bootstrap_ci(
-            lambda a, p: _ndcg(a, p),
-            actual_vals, scores, rng=_rng)
-        ndcgk_lo, ndcgk_hi = _bootstrap_ci(
-            lambda a, p, kk=_k_cut: _ndcg(a, p, k=kk),
-            actual_vals, scores, rng=_rng)
-        rndcg_lo, rndcg_hi = _bootstrap_ci(
-            lambda a, p, kk=_k_cut, rrng=_rng: _rndcg(a, p, k=kk, n_random=80, rng=rrng),
-            actual_vals, scores, rng=_rng)
+        ndcg_lo, ndcg_hi = _bootstrap_ndcg_ci(actual_vals, scores, rng=_rng)
+        ndcgk_lo, ndcgk_hi = _bootstrap_ndcg_ci(
+            actual_vals, scores, k=_k_cut, rng=_rng,
+        )
+        rndcg_lo, rndcg_hi = _bootstrap_ndcg_ci(
+            actual_vals, scores, k=_k_cut, normalize_random=True, rng=_rng,
+        )
         acc_rows.append({
             "Metric": label,
             "Kendall τ": tau, "τ_lo": tau_lo, "τ_hi": tau_hi,
@@ -1759,7 +1761,9 @@ def _cp_only_metric_comparison_core(
     titles.append(f"CP-only [{label}] combined Spearman ρ (n={len(primary)})")
 
     # ── 4. Kendall τ + NDCG@k + rNDCG@k (+ legacy NDCG) with bootstrap CI ─
+    # NDCG / rNDCG CIs use the vectorised ``bootstrap_ndcg_ci``.
     _bootstrap_ci = _ec.bootstrap_ci
+    _bootstrap_ndcg_ci = _ec.bootstrap_ndcg_ci
     _rndcg = _ec.random_normalized_ndcg
     _k_cut = _ec.default_ndcg_k(len(actual_vals))
 
@@ -1772,21 +1776,17 @@ def _cp_only_metric_comparison_core(
         tau = float(scipy.stats.kendalltau(scores, actual_vals).statistic)
         ndcg = _ndcg(actual_vals, scores)
         ndcgk = _ndcg(actual_vals, scores, k=_k_cut)
-        rndcg = _rndcg(actual_vals, scores, k=_k_cut, rng=rng)
+        rndcg = _rndcg(actual_vals, scores, k=_k_cut)
         tau_lo, tau_hi = _bootstrap_ci(
             lambda a, p: float(scipy.stats.kendalltau(p, a).statistic),
             actual_vals, scores, rng=rng,
         )
-        ndcg_lo, ndcg_hi = _bootstrap_ci(
-            lambda a, p: _ndcg(a, p), actual_vals, scores, rng=rng,
+        ndcg_lo, ndcg_hi = _bootstrap_ndcg_ci(actual_vals, scores, rng=rng)
+        ndcgk_lo, ndcgk_hi = _bootstrap_ndcg_ci(
+            actual_vals, scores, k=_k_cut, rng=rng,
         )
-        ndcgk_lo, ndcgk_hi = _bootstrap_ci(
-            lambda a, p, kk=_k_cut: _ndcg(a, p, k=kk),
-            actual_vals, scores, rng=rng,
-        )
-        rndcg_lo, rndcg_hi = _bootstrap_ci(
-            lambda a, p, kk=_k_cut, rrng=rng: _rndcg(a, p, k=kk, n_random=80, rng=rrng),
-            actual_vals, scores, rng=rng,
+        rndcg_lo, rndcg_hi = _bootstrap_ndcg_ci(
+            actual_vals, scores, k=_k_cut, normalize_random=True, rng=rng,
         )
         acc_rows.append({
             "Metric": lab,
@@ -2228,18 +2228,15 @@ def pooled_metric_comparison(pooled_df, output_dir):
     # Companion to the per-metric scatter panels above: shows pairwise
     # rank correlation between every predicted score and the MC actual
     # impact, so redundant / co-linear scores stand out at a glance.
+    # One C call to ``DataFrame.corr(method='spearman')`` replaces the
+    # earlier nested Python loop over ``scipy.stats.spearmanr``.
     heat_cols = [col for col, _ in METRICS]
     heat_labels = [label for _, label in METRICS]
     n_h = len(heat_cols)
-    rho_matrix = _np.zeros((n_h, n_h), dtype=float)
-    for i, ci in enumerate(heat_cols):
-        x_i = valid[ci].values
-        for j, cj in enumerate(heat_cols):
-            x_j = valid[cj].values
-            try:
-                rho_matrix[i, j] = float(scipy.stats.spearmanr(x_i, x_j).statistic)
-            except Exception:
-                rho_matrix[i, j] = float("nan")
+    corr_df = valid[heat_cols].corr(method="spearman")
+    rho_matrix = corr_df.reindex(index=heat_cols, columns=heat_cols).to_numpy(
+        dtype=float, na_value=_np.nan
+    )
     corr_fig = go.Figure(go.Heatmap(
         z=rho_matrix,
         x=heat_labels,
@@ -2346,7 +2343,9 @@ def pooled_metric_comparison(pooled_df, output_dir):
         titles.append("Spearman ρ per network type — check for heterogeneity")
 
     # ── 4. Kendall τ + NDCG@k + rNDCG@k (+ legacy NDCG) with bootstrap CI ─
+    # NDCG / rNDCG CIs use the vectorised ``bootstrap_ndcg_ci``.
     _rndcg = _ec.random_normalized_ndcg
+    _bootstrap_ndcg_ci = _ec.bootstrap_ndcg_ci
     _k_cut = _ec.default_ndcg_k(len(actual_vals))
     _rng = _np.random.default_rng(42)
     acc_rows = []
@@ -2355,18 +2354,17 @@ def pooled_metric_comparison(pooled_df, output_dir):
         tau  = float(scipy.stats.kendalltau(scores, actual_vals).statistic)
         ndcg = _ndcg(actual_vals, scores)
         ndcgk = _ndcg(actual_vals, scores, k=_k_cut)
-        rndcg = _rndcg(actual_vals, scores, k=_k_cut, rng=_rng)
+        rndcg = _rndcg(actual_vals, scores, k=_k_cut)
         tau_lo, tau_hi = _bootstrap_ci(
             lambda a, p: float(scipy.stats.kendalltau(p, a).statistic),
             actual_vals, scores, rng=_rng)
-        ndcg_lo, ndcg_hi = _bootstrap_ci(
-            lambda a, p: _ndcg(a, p), actual_vals, scores, rng=_rng)
-        ndcgk_lo, ndcgk_hi = _bootstrap_ci(
-            lambda a, p, kk=_k_cut: _ndcg(a, p, k=kk),
-            actual_vals, scores, rng=_rng)
-        rndcg_lo, rndcg_hi = _bootstrap_ci(
-            lambda a, p, kk=_k_cut, rrng=_rng: _rndcg(a, p, k=kk, n_random=80, rng=rrng),
-            actual_vals, scores, rng=_rng)
+        ndcg_lo, ndcg_hi = _bootstrap_ndcg_ci(actual_vals, scores, rng=_rng)
+        ndcgk_lo, ndcgk_hi = _bootstrap_ndcg_ci(
+            actual_vals, scores, k=_k_cut, rng=_rng,
+        )
+        rndcg_lo, rndcg_hi = _bootstrap_ndcg_ci(
+            actual_vals, scores, k=_k_cut, normalize_random=True, rng=_rng,
+        )
         acc_rows.append({
             "Metric": label,
             "Kendall τ": tau, "τ_lo": tau_lo, "τ_hi": tau_hi,

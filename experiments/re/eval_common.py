@@ -178,6 +178,20 @@ def bootstrap_ci(
     )
 
 
+def _discounts(cutoff: int) -> np.ndarray:
+    """``1/log2(i+2)`` for i = 0..cutoff-1. Cached per-call (cheap to recompute)."""
+    return 1.0 / np.log2(np.arange(int(cutoff)) + 2.0)
+
+
+def _idcg(gains: np.ndarray, cutoff: int) -> float:
+    """Ideal DCG: sort ``gains`` descending, take top ``cutoff``, weight by discounts."""
+    if cutoff <= 0 or gains.size == 0:
+        return 0.0
+    top = np.partition(gains, -cutoff)[-cutoff:] if cutoff < gains.size else gains
+    top = np.sort(top)[::-1]
+    return float(np.sum(top * _discounts(cutoff)))
+
+
 def ndcg(actual_vals, predicted_scores, k: Optional[int] = None) -> float:
     """Normalised Discounted Cumulative Gain (optionally @k).
 
@@ -204,20 +218,55 @@ def ndcg(actual_vals, predicted_scores, k: Optional[int] = None) -> float:
     if cutoff <= 0:
         return 0.0
     pred_order = np.argsort(predicted_scores)[::-1][:cutoff]
-    ideal_order = np.argsort(actual_arr)[::-1][:cutoff]
     gains = np.maximum(actual_arr, 0.0)
-    discounts = 1.0 / np.log2(np.arange(cutoff) + 2)
+    discounts = _discounts(cutoff)
     dcg = float(np.sum(gains[pred_order] * discounts))
-    idcg = float(np.sum(gains[ideal_order] * discounts))
+    idcg = _idcg(gains, cutoff)
     return float(dcg / idcg) if idcg > 0 else 0.0
+
+
+def ndcg_batch(
+    actual_batch: np.ndarray,
+    pred_batch: np.ndarray,
+    k: Optional[int] = None,
+) -> np.ndarray:
+    """Vectorised NDCG over a leading batch axis.
+
+    ``actual_batch`` / ``pred_batch`` have shape ``(B, n)``; returns a
+    ``(B,)`` array of NDCG values. ~50× faster than calling ``ndcg`` in
+    a Python loop because the argsorts and gathers run as single C
+    operations across the whole batch — the workhorse of the vectorised
+    bootstrap below.
+    """
+    a = np.asarray(actual_batch, dtype=float)
+    p = np.asarray(pred_batch, dtype=float)
+    if a.ndim != 2 or p.ndim != 2 or a.shape != p.shape:
+        raise ValueError(
+            f"ndcg_batch expects matching (B,n) shapes, got {a.shape} / {p.shape}"
+        )
+    B, n = a.shape
+    cutoff = n if k is None else min(int(k), n)
+    if cutoff <= 0 or n == 0:
+        return np.zeros(B, dtype=float)
+    gains = np.maximum(a, 0.0)
+    discounts = _discounts(cutoff)
+    # argsort in descending order: negate to reuse default ascending sort.
+    pred_idx = np.argsort(-p, axis=1)[:, :cutoff]
+    ideal_idx = np.argsort(-a, axis=1)[:, :cutoff]
+    dcg = (np.take_along_axis(gains, pred_idx, axis=1) * discounts).sum(axis=1)
+    idcg = (np.take_along_axis(gains, ideal_idx, axis=1) * discounts).sum(axis=1)
+    out = np.zeros(B, dtype=float)
+    mask = idcg > 0
+    out[mask] = dcg[mask] / idcg[mask]
+    return out
 
 
 def random_normalized_ndcg(
     actual_vals,
     predicted_scores,
     k: Optional[int] = None,
-    n_random: int = 200,
-    rng=None,
+    n_random: int = 200,  # ignored, kept for API compat
+    rng=None,             # ignored, kept for API compat
 ) -> float:
     """Random-baseline-normalised NDCG (rNDCG).
 
@@ -229,30 +278,107 @@ def random_normalized_ndcg(
     - negative values mean the predicted ranking is *worse* than random
       (anti-correlated with ``actual``).
 
-    Strips out the chance baseline that inflates raw NDCG on heavy-tailed
-    relevance distributions. The random baseline is estimated by Monte
-    Carlo with ``n_random`` permutations and a fixed ``rng``; for the MC
-    sample sizes we use (~30-150 components) ``n_random=200`` is enough
-    to make the Monte Carlo std on ``E[NDCG_random]`` smaller than the
-    rNDCG resolution we plot at (~0.01).
+    The random-permutation expectation has a **closed form**: for a
+    uniform random permutation of ``n`` items, every item lands in each
+    of the top-``k`` slots with probability ``1/n``, so the expected
+    gain at every slot equals ``mean(gains)`` and
+
+        E[DCG@k] = mean(gains) × Σ_{i=0..k-1} 1/log2(i+2)
+
+    which we divide by IDCG@k to get ``E[NDCG_random]``. Replaces the
+    earlier Monte-Carlo estimate (which dominated bootstrap-CI cost) —
+    same numerics to within MC noise, but O(n + k) per call instead of
+    O(n_random × n log n).
     """
     actual_arr = np.asarray(actual_vals, dtype=float)
     n = actual_arr.size
     if n == 0:
         return 0.0
+    cutoff = n if k is None else min(int(k), n)
+    if cutoff <= 0:
+        return 0.0
+    gains = np.maximum(actual_arr, 0.0)
+    idcg = _idcg(gains, cutoff)
+    if idcg <= 0:
+        return 0.0
+    mean_gain = float(gains.mean())
+    e_random = (mean_gain * float(_discounts(cutoff).sum())) / idcg
     obs = ndcg(actual_arr, predicted_scores, k=k)
-    if rng is None:
-        rng = np.random.default_rng(0)
-    rand_scores = np.empty(int(n_random), dtype=float)
-    perm = np.arange(n)
-    for i in range(int(n_random)):
-        rng.shuffle(perm)
-        rand_scores[i] = ndcg(actual_arr, perm.astype(float), k=k)
-    e_random = float(np.mean(rand_scores))
     denom = 1.0 - e_random
     if denom <= 0:
         return 0.0
     return float((obs - e_random) / denom)
+
+
+def bootstrap_ndcg_ci(
+    actual_arr,
+    pred_arr,
+    *,
+    k: Optional[int] = None,
+    n_boot: int = 1000,
+    alpha: float = 0.05,
+    rng: Optional[np.random.Generator] = None,
+    normalize_random: bool = False,
+) -> Tuple[float, float]:
+    """Vectorised percentile-bootstrap CI for NDCG (or rNDCG when
+    ``normalize_random=True``).
+
+    Generates the full ``(n_boot, n)`` resample-index matrix in one C
+    call, gathers actual/predicted values into a batch, and runs
+    :func:`ndcg_batch` to score all bootstrap samples at once — replaces
+    a Python loop that called ``ndcg`` 1000× per CI. For
+    ``normalize_random=True`` the per-sample random baseline is computed
+    in closed form (no inner MC), so an rNDCG bootstrap is now the same
+    cost as a plain NDCG bootstrap.
+    """
+    if rng is None:
+        rng = np.random.default_rng(42)
+    a = np.asarray(actual_arr, dtype=float)
+    p = np.asarray(pred_arr, dtype=float)
+    n = a.size
+    if n == 0:
+        return float("nan"), float("nan")
+    cutoff = n if k is None else min(int(k), n)
+    if cutoff <= 0:
+        return float("nan"), float("nan")
+
+    idx = rng.integers(0, n, size=(int(n_boot), n))
+    a_b = a[idx]                # (B, n)
+    p_b = p[idx]                # (B, n)
+    raw = ndcg_batch(a_b, p_b, k=cutoff)
+
+    if not normalize_random:
+        return (
+            float(np.percentile(raw, 100 * alpha / 2)),
+            float(np.percentile(raw, 100 * (1 - alpha / 2))),
+        )
+
+    # Closed-form rNDCG per bootstrap sample: each row b uses the
+    # resampled gains' mean and own IDCG.
+    gains_b = np.maximum(a_b, 0.0)
+    discounts = _discounts(cutoff)
+    sum_discounts = float(discounts.sum())
+    # Per-row IDCG: top-k of gains_b.
+    if cutoff < n:
+        top_idx = np.argpartition(-gains_b, cutoff, axis=1)[:, :cutoff]
+        top_b = np.take_along_axis(gains_b, top_idx, axis=1)
+    else:
+        top_b = gains_b
+    # Sort each row's top-k descending so the discount weighting is correct.
+    top_b = -np.sort(-top_b, axis=1)
+    idcg_b = (top_b * discounts).sum(axis=1)
+    mean_gain_b = gains_b.mean(axis=1)
+    safe = idcg_b > 0
+    e_rand = np.zeros_like(idcg_b)
+    e_rand[safe] = (mean_gain_b[safe] * sum_discounts) / idcg_b[safe]
+    denom = 1.0 - e_rand
+    rndcg = np.zeros_like(raw)
+    keep = denom > 0
+    rndcg[keep] = (raw[keep] - e_rand[keep]) / denom[keep]
+    return (
+        float(np.percentile(rndcg, 100 * alpha / 2)),
+        float(np.percentile(rndcg, 100 * (1 - alpha / 2))),
+    )
 
 
 def default_ndcg_k(n: int) -> int:
