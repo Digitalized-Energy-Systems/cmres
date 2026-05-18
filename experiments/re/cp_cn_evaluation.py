@@ -2107,6 +2107,127 @@ def cross_carrier_impact_per_scenario(
     )
 
 
+def cross_carrier_impact_aggregated(
+    impact_df: pandas.DataFrame, output_dir: str
+):
+    """Cross-sector impact, averaged across all scenarios.
+
+    Companion to :func:`cross_carrier_impact_per_scenario` that collapses
+    the per-scenario small-multiples into a single bar chart. For each
+    (source carrier, target carrier) cell we first compute the
+    per-scenario Σ |impact| (same partitioning as the per-scenario plot),
+    then take the **mean across scenarios** as the bar height and the
+    **std across scenarios** as the error bar.
+
+    Reading the figure:
+      * x-axis = **source** carrier (where the failed component lives).
+      * grouped bars (color) = **target/impacted** carrier (load-shed).
+      * bar height = mean over scenarios of Σ |impact|.
+      * error bar = std over scenarios of Σ |impact|.
+
+    Same source classification rules as the per-scenario variant
+    (``TYPE_TO_CARRIER``; ``"heat/gas"`` Junctions dropped;
+    coupling-point components in their own ``"multi"`` source bucket).
+    """
+    if impact_df is None or impact_df.empty:
+        print("Cross-carrier impact (aggregated): empty impact_df — skipping.")
+        return
+
+    import numpy as _np
+    import plotly.graph_objects as go
+
+    df = impact_df.copy()
+    df["source_carrier"] = df["type"].astype(str).map(TYPE_TO_CARRIER)
+    df = df[df["source_carrier"].notna()]
+    df = df[df["source_carrier"] != "heat/gas"]
+    df["impact_abs"] = df["impact"].abs()
+
+    source_order = ["electricity", "heat", "gas", "multi"]
+    target_order = ["electricity", "heat", "gas"]
+    color_map = eval.NETWORK_COLOR_MAP
+
+    # Per-scenario Σ |impact| for each (network_type, source, target) cell,
+    # reindexed against the canonical (source, target) grid so missing
+    # combinations contribute 0 (otherwise the mean would silently exclude
+    # scenarios where, say, no gas-side component failed).
+    per_scenario_sum = (
+        df.groupby(["network_type", "source_carrier", "carrier"], as_index=False)[
+            "impact_abs"
+        ]
+        .sum()
+    )
+    nets = sort_scenarios(per_scenario_sum["network_type"].unique())
+    if not nets:
+        print("Cross-carrier impact (aggregated): no scenarios after filtering — skipping.")
+        return
+
+    # Build a (source × target) DataFrame per scenario and stack into a
+    # 3-D array (n_scenarios, |source|, |target|) for mean/std.
+    full_index = pandas.MultiIndex.from_product(
+        [source_order, target_order], names=["source_carrier", "carrier"],
+    )
+    layer_arrays = []
+    for nt in nets:
+        sub = (
+            per_scenario_sum[per_scenario_sum["network_type"] == nt]
+            .set_index(["source_carrier", "carrier"])["impact_abs"]
+            .reindex(full_index, fill_value=0.0)
+            .unstack("carrier")
+            .reindex(index=source_order, columns=target_order)
+            .fillna(0.0)
+        )
+        layer_arrays.append(sub.to_numpy(dtype=float))
+    stack = _np.stack(layer_arrays, axis=0)  # (n_scenarios, n_sources, n_targets)
+    mean_arr = stack.mean(axis=0)
+    std_arr = stack.std(axis=0, ddof=1) if stack.shape[0] > 1 else _np.zeros_like(mean_arr)
+
+    fig = go.Figure()
+    for j, target in enumerate(target_order):
+        fig.add_trace(go.Bar(
+            x=source_order,
+            y=mean_arr[:, j],
+            name=f"→ {target}",
+            marker_color=color_map.get(target, "#888888"),
+            error_y=dict(
+                type="data",
+                array=std_arr[:, j].tolist(),
+                thickness=1.5, width=4, color="#333",
+                visible=bool(stack.shape[0] > 1),
+            ),
+            hovertemplate=(
+                "source=%{x}<br>"
+                f"target={target}<br>"
+                "mean Σ |impact|=%{y:.4f} MW<br>"
+                f"n_scenarios={stack.shape[0]}<extra></extra>"
+            ),
+        ))
+
+    fig.update_layout(
+        barmode="group",
+        height=520,
+        width=820,
+        template=eval.CMRES_TEMPLATE,
+        legend=dict(title="Impacted carrier"),
+        xaxis=dict(title="Source carrier"),
+        yaxis=dict(title="Mean Σ |impact| across scenarios (MW)"),
+        margin={"l": 70, "b": 60, "r": 30, "t": 70},
+    )
+
+    Path(output_dir).mkdir(exist_ok=True, parents=True)
+    eval.write_all_in_one(
+        [fig], "Figure", Path("."),
+        output_dir + "/cross_carrier_impact_aggregated.html",
+        titles=[
+            f"Cross-carrier impact aggregated across all scenarios "
+            f"(n_scenarios={stack.shape[0]}, mean ± std)"
+        ],
+    )
+    print(
+        f"Cross-carrier impact (aggregated): {stack.shape[0]} scenarios → "
+        f"{output_dir}/cross_carrier_impact_aggregated.html"
+    )
+
+
 def pooled_metric_comparison(pooled_df, output_dir):
     """Run metric comparison figures on data pooled across all network types.
 
@@ -2572,6 +2693,19 @@ def evaluate(folder_id):
     # carry state.
     cmres_artefacts = []
 
+
+    pooled_resilience_per_scenario(perf_df, OUTPUT + "/pooled")
+    cross_carrier_impact_per_scenario(impact_df, OUTPUT + "/pooled")
+    cross_carrier_impact_aggregated(impact_df, OUTPUT + "/pooled")
+
+    if len(per_network_dfs) > 1:
+        pooled_df = pandas.concat(per_network_dfs, ignore_index=True)
+        pooled_metric_comparison(pooled_df, OUTPUT + "/pooled")
+        cp_only_pooled_metric_comparison(pooled_df, OUTPUT + "/pooled")
+    elif len(per_network_dfs) == 1:
+        print("Only one network type found — skipping pooled metric analysis.")
+        cp_only_pooled_metric_comparison(per_network_dfs[0], OUTPUT + "/pooled")
+        
     for network_type, monee_net in net_type_to_net.items():
         print(network_type)
         # Plain run_energy_flow is a hard feasibility solve and goes infeasible
@@ -2655,17 +2789,6 @@ def evaluate(folder_id):
                     distribution=distribution,
                 )
             )
-
-    pooled_resilience_per_scenario(perf_df, OUTPUT + "/pooled")
-    cross_carrier_impact_per_scenario(impact_df, OUTPUT + "/pooled")
-
-    if len(per_network_dfs) > 1:
-        pooled_df = pandas.concat(per_network_dfs, ignore_index=True)
-        pooled_metric_comparison(pooled_df, OUTPUT + "/pooled")
-        cp_only_pooled_metric_comparison(pooled_df, OUTPUT + "/pooled")
-    elif len(per_network_dfs) == 1:
-        print("Only one network type found — skipping pooled metric analysis.")
-        cp_only_pooled_metric_comparison(per_network_dfs[0], OUTPUT + "/pooled")
 
     # ── CMRES evaluation experiments (E2..E16) ─────────────────────────
     # Run the full CMRES evaluation battery on the per-scenario artefacts
