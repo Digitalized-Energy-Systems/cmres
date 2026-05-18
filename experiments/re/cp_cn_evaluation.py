@@ -19,6 +19,12 @@ import networkx as nx
 sys.path.insert(0, str(Path(__file__).parent))
 from cp_metric import mes_all_components_metric, CPMetricConfig
 import eval_common as _ec
+# Shared plot-style helpers (sector legend, bar marker, error-bar shape)
+# so every bar produced by this module matches the E16 bars 1-to-1.
+from cmres_eval_plots import (
+    SECTOR_COLORS, SECTOR_PRETTY,
+    bar_error_kwargs, outlined_marker,
+)
 
 # Default simulation-output directory used when no --input-dir is passed
 # on the CLI. The slurm worker submits without arguments and inherits this.
@@ -1255,25 +1261,30 @@ def cp_metric_vs_actual_impact(monee_net, impact_df_nt, network_type):
         })
     rho_df = pandas.DataFrame(rho_rows).sort_values("Spearman ρ", ascending=False)
 
+    _palette = eval.PALETTE_QUAL[:len(rho_df)]
     rho_bar = go.Figure(go.Bar(
         x=rho_df["Metric"],
         y=rho_df["Spearman ρ"],
-        error_y=dict(
-            type="data", symmetric=False,
-            array=rho_df["err_hi"].tolist(),
-            arrayminus=rho_df["err_lo"].tolist(),
+        error_y=bar_error_kwargs(
+            err_hi=rho_df["err_hi"].tolist(),
+            err_lo=rho_df["err_lo"].tolist(),
         ),
         text=[f"ρ={r:.2f} [{lo:.2f},{hi:.2f}]<br>p={p:.3f}"
               for r, p, lo, hi in zip(
                   rho_df["Spearman ρ"], rho_df["p-value"],
                   rho_df["ci_lo"], rho_df["ci_hi"])],
         textposition="outside",
-        marker_color=eval.PALETTE_QUAL[:len(rho_df)],
+        marker=outlined_marker(_palette[0]),  # uniform fill — palette via individual bars below
     ))
+    # Recolour bars per-metric using the qualitative palette while keeping the
+    # E16 outline.
+    rho_bar.data[0].marker.color = list(_palette)
+
     rho_bar.update_layout(
         height=450, width=800,
         template=eval.CMRES_TEMPLATE,
         yaxis=dict(title="Spearman ρ vs Actual (95% CI)", range=[-1.15, 1.15],
+                   gridcolor="#e5e5e5",
                    zeroline=True, zerolinecolor="black", zerolinewidth=1),
         xaxis_title="Metric",
         margin={"l": 50, "b": 100, "r": 20, "t": 40},
@@ -1432,15 +1443,20 @@ def cp_metric_vs_actual_impact(monee_net, impact_df_nt, network_type):
             x=vals,
             y=acc_df["Metric"],
             orientation="h",
-            marker_color=[metric_colors[m] for m in acc_df["Metric"]],
-            error_x=dict(type="data", symmetric=False,
-                         array=err_hi.tolist(), arrayminus=err_lo.tolist()),
+            marker=dict(
+                color=[metric_colors[m] for m in acc_df["Metric"]],
+                line=dict(color="#222", width=0.4),
+            ),
+            error_x=bar_error_kwargs(
+                err_hi=err_hi.tolist(), err_lo=err_lo.tolist(),
+            ),
             text=[f"{v:.3f} [{lo:.2f},{hi:.2f}]"
                   for v, lo, hi in zip(vals, acc_df[lo_col], acc_df[hi_col])],
             textposition="outside",
             showlegend=False,
         ), row=1, col=col_idx)
         acc_fig.update_xaxes(title_text=measure, range=ref_range,
+                             gridcolor="#e5e5e5",
                              zeroline=True, zerolinecolor="black", zerolinewidth=1,
                              row=1, col=col_idx)
         acc_fig.update_yaxes(title_text="Metric" if col_idx == 1 else "",
@@ -1535,28 +1551,27 @@ def cp_metric_vs_actual_impact(monee_net, impact_df_nt, network_type):
         cmp_fig.add_trace(go.Bar(
             name=f"All matched (n={n_all})",
             x=cmp_df["Metric"], y=cmp_df["rho_all"],
-            error_y=dict(
-                type="data", symmetric=False,
-                array=(cmp_df["ci_hi_all"] - cmp_df["rho_all"]).tolist(),
-                arrayminus=(cmp_df["rho_all"] - cmp_df["ci_lo_all"]).tolist(),
+            error_y=bar_error_kwargs(
+                err_hi=(cmp_df["ci_hi_all"] - cmp_df["rho_all"]).tolist(),
+                err_lo=(cmp_df["rho_all"] - cmp_df["ci_lo_all"]).tolist(),
             ),
-            marker_color="lightgrey",
+            marker=outlined_marker("lightgrey"),
         ))
         cmp_fig.add_trace(go.Bar(
             name=f"MC-sampled (n={n_mc})",
             x=cmp_df["Metric"], y=cmp_df["rho_mc"],
-            error_y=dict(
-                type="data", symmetric=False,
-                array=(cmp_df["ci_hi_mc"] - cmp_df["rho_mc"]).tolist(),
-                arrayminus=(cmp_df["rho_mc"] - cmp_df["ci_lo_mc"]).tolist(),
+            error_y=bar_error_kwargs(
+                err_hi=(cmp_df["ci_hi_mc"] - cmp_df["rho_mc"]).tolist(),
+                err_lo=(cmp_df["rho_mc"] - cmp_df["ci_lo_mc"]).tolist(),
             ),
-            marker_color=eval.PALETTE_QUAL[0],
+            marker=outlined_marker(eval.PALETTE_QUAL[0]),
         ))
         cmp_fig.update_layout(
             barmode="group",
             height=500, width=900,
             template=eval.CMRES_TEMPLATE,
             yaxis=dict(title="Spearman ρ vs Actual (95% CI)", range=[-1.15, 1.15],
+                       gridcolor="#e5e5e5",
                        zeroline=True, zerolinecolor="black"),
             xaxis=dict(title="Metric"),
             margin={"l": 60, "b": 100, "r": 20, "t": 50},
@@ -1767,21 +1782,21 @@ def _cp_only_metric_comparison_core(
     rho_df = pandas.DataFrame(rho_rows).sort_values("rho", ascending=True)
     rho_fig = go.Figure(go.Bar(
         x=rho_df["rho"], y=rho_df["Metric"], orientation="h",
-        error_x=dict(
-            type="data", symmetric=False,
-            array=(rho_df["hi"] - rho_df["rho"]).clip(lower=0).tolist(),
-            arrayminus=(rho_df["rho"] - rho_df["lo"]).clip(lower=0).tolist(),
+        error_x=bar_error_kwargs(
+            err_hi=(rho_df["hi"] - rho_df["rho"]).clip(lower=0).tolist(),
+            err_lo=(rho_df["rho"] - rho_df["lo"]).clip(lower=0).tolist(),
         ),
         text=[f"ρ={r:.2f} [{lo:.2f},{hi:.2f}]<br>p={p:.3f}"
               for r, lo, hi, p in zip(
                   rho_df["rho"], rho_df["lo"], rho_df["hi"], rho_df["p"])],
         textposition="outside",
-        marker_color=eval.PALETTE_QUAL[0],
+        marker=outlined_marker(eval.PALETTE_QUAL[0]),
     ))
     rho_fig.update_layout(
         height=80 + 40 * len(rho_df), width=900,
         template=eval.CMRES_TEMPLATE,
         xaxis=dict(title="Spearman ρ vs Actual (95% CI)", range=[-1.05, 1.05],
+                   gridcolor="#e5e5e5",
                    zeroline=True, zerolinecolor="black"),
         yaxis=dict(title="Metric"),
         margin={"l": 200, "b": 50, "r": 160, "t": 50},
@@ -1845,8 +1860,10 @@ def _cp_only_metric_comparison_core(
             err_hi = (acc_df[hi_col].values - vals).clip(0)
             acc_fig.add_trace(go.Bar(
                 x=vals, y=acc_df["Metric"], orientation="h",
-                error_x=dict(type="data", symmetric=False,
-                             array=err_hi.tolist(), arrayminus=err_lo.tolist()),
+                marker=outlined_marker(eval.PALETTE_QUAL[col_idx - 1]),
+                error_x=bar_error_kwargs(
+                    err_hi=err_hi.tolist(), err_lo=err_lo.tolist(),
+                ),
                 text=[f"{v:.3f} [{lo:.2f},{hi:.2f}]"
                       for v, lo, hi in zip(vals, acc_df[lo_col], acc_df[hi_col])],
                 textposition="outside",
@@ -1854,7 +1871,8 @@ def _cp_only_metric_comparison_core(
             ), row=1, col=col_idx)
             acc_fig.update_xaxes(
                 title_text=title_,
-                range=ref_range, zeroline=True, zerolinecolor="black",
+                range=ref_range, gridcolor="#e5e5e5",
+                zeroline=True, zerolinecolor="black",
                 row=1, col=col_idx,
             )
         acc_fig.update_layout(
@@ -2053,7 +2071,19 @@ def cross_carrier_impact_per_scenario(
 
     source_order = ["electricity", "heat", "gas", "multi"]
     target_order = ["electricity", "heat", "gas"]
-    color_map = eval.NETWORK_COLOR_MAP  # {"heat": .., "gas": .., "electricity": ..}
+
+    # Carrier-key → sector helpers. ``SECTOR_*`` uses ``power`` for the
+    # electricity bucket; cross-carrier data still labels that carrier
+    # ``electricity``. Translate once so both legends render identically.
+    _CARRIER_TO_SECTOR = {
+        "electricity": "power", "heat": "heat", "gas": "gas", "multi": "multi",
+    }
+
+    def _sector_label(c: str) -> str:
+        return SECTOR_PRETTY[_CARRIER_TO_SECTOR[c]]
+
+    def _sector_color(c: str) -> str:
+        return SECTOR_COLORS[_CARRIER_TO_SECTOR[c]]
 
     agg = (
         df.groupby(["network_type", "source_carrier", "carrier"], as_index=False)[
@@ -2108,17 +2138,21 @@ def cross_carrier_impact_per_scenario(
             ]
             show_legend = target not in legend_seen
             legend_seen.add(target)
+            target_label = _sector_label(target)
             fig.add_trace(
                 go.Bar(
-                    x=source_order, y=ys,
-                    name=f"→ {target}",
-                    marker_color=color_map.get(target, "#888888"),
+                    x=[_sector_label(s) for s in source_order], y=ys,
+                    name=f"→ {target_label}",
+                    marker=dict(
+                        color=_sector_color(target),
+                        line=dict(color="#222", width=0.4),
+                    ),
                     legendgroup=target,
                     showlegend=show_legend,
                     hovertemplate=(
                         f"scenario={pretty_scenario(nt)}<br>"
                         "source=%{x}<br>"
-                        f"target={target}<br>"
+                        f"target={target_label}<br>"
                         "Σ |impact|=%{y:.4f} MW<extra></extra>"
                     ),
                 ),
@@ -2195,7 +2229,18 @@ def cross_carrier_impact_aggregated(
 
     source_order = ["electricity", "heat", "gas", "multi"]
     target_order = ["electricity", "heat", "gas"]
-    color_map = eval.NETWORK_COLOR_MAP
+
+    # Carrier-key → sector helpers — same translation as the per-scenario
+    # variant so both figures share legend colour + text.
+    _CARRIER_TO_SECTOR = {
+        "electricity": "power", "heat": "heat", "gas": "gas", "multi": "multi",
+    }
+
+    def _sector_label(c: str) -> str:
+        return SECTOR_PRETTY[_CARRIER_TO_SECTOR[c]]
+
+    def _sector_color(c: str) -> str:
+        return SECTOR_COLORS[_CARRIER_TO_SECTOR[c]]
 
     # Per-scenario Σ |impact| for each (network_type, source, target) cell,
     # reindexed against the canonical (source, target) grid so missing
@@ -2288,21 +2333,25 @@ def cross_carrier_impact_aggregated(
             extra_hover = ""
             if show_n_components:
                 extra_hover = "<br>mean n_components=%{customdata:.1f}"
+            target_label = _sector_label(target)
             fig.add_trace(go.Bar(
-                x=source_order,
+                x=[_sector_label(s) for s in source_order],
                 y=mean_arr[:, j],
-                name=f"→ {target}",
-                marker_color=color_map.get(target, "#888888"),
+                name=f"→ {target_label}",
+                marker=dict(
+                    color=_sector_color(target),
+                    line=dict(color="#222", width=0.4),
+                ),
                 customdata=n_comp_per_source if show_n_components else None,
                 error_y=dict(
                     type="data",
                     array=std_arr[:, j].tolist(),
-                    thickness=1.5, width=4, color="#333",
+                    thickness=1.2, width=3, color="#333",
                     visible=bool(total_stack.shape[0] > 1),
                 ),
                 hovertemplate=(
                     "source=%{x}<br>"
-                    f"target={target}<br>"
+                    f"target={target_label}<br>"
                     "%{y:.4f}" + f" {unit}"
                     + extra_hover
                     + f"<br>n_scenarios={total_stack.shape[0]}<extra></extra>"
@@ -2531,9 +2580,11 @@ def pooled_metric_comparison(pooled_df, output_dir):
         x=rho_df["Spearman ρ"],
         y=rho_df["Metric"],
         orientation="h",
-        error_x=dict(type="data", symmetric=False,
-                     array=rho_df["err_hi"].tolist(),
-                     arrayminus=rho_df["err_lo"].tolist()),
+        marker=outlined_marker(eval.PALETTE_QUAL[0]),
+        error_x=bar_error_kwargs(
+            err_hi=rho_df["err_hi"].tolist(),
+            err_lo=rho_df["err_lo"].tolist(),
+        ),
         text=[f"ρ={r:.2f} [{lo:.2f},{hi:.2f}]<br>p={p:.3f}"
               for r, lo, hi, p in zip(rho_df["Spearman ρ"], rho_df["ci_lo"],
                                       rho_df["ci_hi"], rho_df["p-value"])],
@@ -2543,6 +2594,7 @@ def pooled_metric_comparison(pooled_df, output_dir):
         height=80 + 40 * len(rho_df), width=750,
         template=eval.CMRES_TEMPLATE,
         xaxis=dict(title="Spearman ρ", range=[-1.05, 1.05],
+                   gridcolor="#e5e5e5",
                    zeroline=True, zerolinecolor="black"),
         yaxis=dict(title="Metric"),
         margin={"l": 160, "b": 50, "r": 160, "t": 50},
@@ -2553,7 +2605,7 @@ def pooled_metric_comparison(pooled_df, output_dir):
     # ── 3. Spearman ρ per network type (small multiples) ──────────────────
     if len(net_types) > 1:
         nt_rho_fig = go.Figure()
-        for col, label in pred_metrics:
+        for m_idx, (col, label) in enumerate(pred_metrics):
             nt_rhos, nt_errs_lo, nt_errs_hi = [], [], []
             for nt in net_types:
                 sub = valid[valid["network_type"] == nt]
@@ -2570,8 +2622,8 @@ def pooled_metric_comparison(pooled_df, output_dir):
                 name=label,
                 x=[pretty_scenario(nt) for nt in net_types],
                 y=nt_rhos,
-                error_y=dict(type="data", symmetric=False,
-                             array=nt_errs_hi, arrayminus=nt_errs_lo),
+                marker=outlined_marker(eval.PALETTE_QUAL[m_idx % 10]),
+                error_y=bar_error_kwargs(err_hi=nt_errs_hi, err_lo=nt_errs_lo),
             ))
         nt_rho_fig.update_layout(
             barmode="group",
@@ -2579,6 +2631,7 @@ def pooled_metric_comparison(pooled_df, output_dir):
             template=eval.CMRES_TEMPLATE,
             xaxis=dict(title="Network type"),
             yaxis=dict(title="Spearman ρ", range=[-1.05, 1.05],
+                       gridcolor="#e5e5e5",
                        zeroline=True, zerolinecolor="black"),
             legend=dict(title="Metric"),
             margin={"l": 60, "b": 60, "r": 20, "t": 50},
@@ -2638,15 +2691,20 @@ def pooled_metric_comparison(pooled_df, output_dir):
         err_hi = (acc_df[hi_col].values - vals).clip(0)
         acc_fig.add_trace(go.Bar(
             x=vals, y=acc_df["Metric"], orientation="h",
-            marker_color=[metric_colors[m] for m in acc_df["Metric"]],
-            error_x=dict(type="data", symmetric=False,
-                         array=err_hi.tolist(), arrayminus=err_lo.tolist()),
+            marker=dict(
+                color=[metric_colors[m] for m in acc_df["Metric"]],
+                line=dict(color="#222", width=0.4),
+            ),
+            error_x=bar_error_kwargs(
+                err_hi=err_hi.tolist(), err_lo=err_lo.tolist(),
+            ),
             text=[f"{v:.3f} [{lo:.2f},{hi:.2f}]"
                   for v, lo, hi in zip(vals, acc_df[lo_col], acc_df[hi_col])],
             textposition="outside",
             showlegend=False,
         ), row=1, col=col_idx)
         acc_fig.update_xaxes(title_text=title_, range=ref_range,
+                             gridcolor="#e5e5e5",
                              zeroline=True, zerolinecolor="black", row=1, col=col_idx)
         acc_fig.update_yaxes(title_text="Metric" if col_idx == 1 else "",
                              row=1, col=col_idx)
@@ -2715,28 +2773,27 @@ def pooled_metric_comparison(pooled_df, output_dir):
         cmp_fig.add_trace(go.Bar(
             name=f"All matched (n={n_all})",
             x=cmp_df["Metric"], y=cmp_df["rho_all"],
-            error_y=dict(
-                type="data", symmetric=False,
-                array=(cmp_df["ci_hi_all"] - cmp_df["rho_all"]).tolist(),
-                arrayminus=(cmp_df["rho_all"] - cmp_df["ci_lo_all"]).tolist(),
+            error_y=bar_error_kwargs(
+                err_hi=(cmp_df["ci_hi_all"] - cmp_df["rho_all"]).tolist(),
+                err_lo=(cmp_df["rho_all"] - cmp_df["ci_lo_all"]).tolist(),
             ),
-            marker_color="lightgrey",
+            marker=outlined_marker("lightgrey"),
         ))
         cmp_fig.add_trace(go.Bar(
             name=f"MC-sampled (n={n_mc})",
             x=cmp_df["Metric"], y=cmp_df["rho_mc"],
-            error_y=dict(
-                type="data", symmetric=False,
-                array=(cmp_df["ci_hi_mc"] - cmp_df["rho_mc"]).tolist(),
-                arrayminus=(cmp_df["rho_mc"] - cmp_df["ci_lo_mc"]).tolist(),
+            error_y=bar_error_kwargs(
+                err_hi=(cmp_df["ci_hi_mc"] - cmp_df["rho_mc"]).tolist(),
+                err_lo=(cmp_df["rho_mc"] - cmp_df["ci_lo_mc"]).tolist(),
             ),
-            marker_color=eval.PALETTE_QUAL[0],
+            marker=outlined_marker(eval.PALETTE_QUAL[0]),
         ))
         cmp_fig.update_layout(
             barmode="group",
             height=500, width=1000,
             template=eval.CMRES_TEMPLATE,
             yaxis=dict(title="Spearman ρ vs Actual (95% CI)", range=[-1.15, 1.15],
+                       gridcolor="#e5e5e5",
                        zeroline=True, zerolinecolor="black"),
             xaxis=dict(title="Metric"),
             margin={"l": 60, "b": 100, "r": 20, "t": 50},

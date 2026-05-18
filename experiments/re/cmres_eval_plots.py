@@ -180,6 +180,85 @@ def _e16_bump_subplot_titles(fig: "go.Figure") -> None:
             ann.font = font
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared sector palette + bar style — single source of truth for legend
+# colours / labels / Bar styling used by both the E16 plots and the
+# cp_cn cross-carrier / ρ figures. Keep all sector-bearing plots
+# referencing these names so the dissertation legend stays consistent.
+# ─────────────────────────────────────────────────────────────────────────────
+
+#: Canonical sector ↔ colour map. ``power`` / ``heat`` / ``gas`` reuse the
+#: cmres ``NETWORK_COLOR_MAP`` so plain carrier figures match the sector
+#: figures pixel-perfect.
+SECTOR_COLORS: Dict[str, str] = {
+    "total": "#444444",
+    "multi": "#7e57c2",  # purple — distinct from any single-carrier hue
+    "power": eval.NETWORK_COLOR_MAP["electricity"],
+    "heat":  eval.NETWORK_COLOR_MAP["heat"],
+    "gas":   eval.NETWORK_COLOR_MAP["gas"],
+}
+
+#: Sector ↔ display label. Used as the trace ``name=`` (and therefore as
+#: the legend entry text) on every sector-bearing bar. The qualifier on
+#: ``"Multi (CPs)"`` is the only non-obvious entry — the plain carrier
+#: bars don't need a partition suffix.
+SECTOR_PRETTY: Dict[str, str] = {
+    "total": "Total",
+    "multi": "Multi (CPs)",
+    "power": "Electricity",
+    "heat":  "Heat",
+    "gas":   "Gas",
+}
+
+#: Canonical sector display order. Anything that builds a sector legend
+#: should iterate this list (skipping keys it doesn't carry).
+SECTOR_ORDER: List[str] = ["total", "multi", "power", "heat", "gas"]
+
+
+def outlined_marker(color: str) -> dict:
+    """``marker=`` with the canonical 0.4 px ``#222`` outline. Use for any
+    Bar that should match the E16 style but isn't sector- or carrier-keyed
+    (per-metric ρ bars, ranking-accuracy bars, etc.)."""
+    return dict(color=color, line=dict(color="#222", width=0.4))
+
+
+def sector_marker(sector_key: str, *, alpha: Optional[float] = None) -> dict:
+    """Return the ``marker=`` kwargs for one sector bar (color + outline)."""
+    return outlined_marker(SECTOR_COLORS.get(sector_key, "#888888"))
+
+
+def carrier_marker(carrier_name: str) -> dict:
+    """``marker=`` for plain ``electricity``/``heat``/``gas`` bars — same
+    outline + line styling as :func:`sector_marker` but coloured straight
+    from ``NETWORK_COLOR_MAP`` (so it's safe to pass ``"electricity"`` /
+    ``"heat"`` / ``"gas"`` directly without translating to a sector key).
+    """
+    return outlined_marker(eval.NETWORK_COLOR_MAP.get(carrier_name, "#888888"))
+
+
+def bar_error_kwargs(
+    *,
+    err_hi=None, err_lo=None,
+    axis: str = "y",
+) -> Optional[dict]:
+    """Build a uniform ``error_x`` / ``error_y`` dict matching the E16
+    bar styling. ``err_hi`` / ``err_lo`` may be None when only one side
+    is available; the other defaults to zero. Returns ``None`` when no
+    error data has been supplied so callers can use ``error_y=...`` /
+    ``error_x=...`` directly without branching."""
+    if err_hi is None and err_lo is None:
+        return None
+    if err_hi is None:
+        err_hi = [0.0] * len(err_lo)
+    if err_lo is None:
+        err_lo = [0.0] * len(err_hi)
+    return dict(
+        type="data", symmetric=False,
+        array=list(err_hi), arrayminus=list(err_lo),
+        thickness=1.2, width=3,
+    )
+
+
 def _scenario_order(values: Sequence[str]) -> List[str]:
     """Stable display order: known scenarios first (in NAME_MAP order),
     then unknown alphabetically."""
@@ -1277,7 +1356,7 @@ def _e16_scatter(merged: pd.DataFrame, metric: str, scenario: str) -> go.Figure:
         return go.Figure()
 
     fig.update_layout(**_e16_layout(
-        title=f"E16 — {pretty_scenario(scenario)}: {metric} vs analytical shed (per sector)",
+        title=f"{pretty_scenario(scenario)}: {metric} vs analytical shed (per sector)",
         height=720, width=1080,
         legend=dict(title="cp_type"),
     ))
@@ -1314,23 +1393,9 @@ def _e16_rho_per_sector_bar(df: pd.DataFrame, scenario: str) -> go.Figure:
         return go.Figure()
     order = sub.sort_values("rho_vs_total_shed",
                             na_position="last")["metric"].tolist()
-    sector_color = {
-        "total": "#444444",
-        "multi": "#7e57c2",  # purple — distinct from any single-carrier hue
-        "power": eval.NETWORK_COLOR_MAP["electricity"],
-        "heat":  eval.NETWORK_COLOR_MAP["heat"],
-        "gas":   eval.NETWORK_COLOR_MAP["gas"],
-    }
-    sector_pretty = {
-        "total": "Total",
-        "multi": "Multi (CPs)",
-        "power": "Electricity (non-CP)",
-        "heat":  "Heat (non-CP)",
-        "gas":   "Gas (non-CP)",
-    }
     bar = go.Figure()
     any_trace = False
-    for tag in ("total", "multi", "power", "heat", "gas"):
+    for tag in SECTOR_ORDER:
         rho_col = f"rho_vs_{tag}_shed"
         hi_col = f"ci_hi_{tag}_shed"
         lo_col = f"ci_lo_{tag}_shed"
@@ -1348,15 +1413,11 @@ def _e16_rho_per_sector_bar(df: pd.DataFrame, scenario: str) -> go.Figure:
         err_lo = (rho - lo).clip(lower=0) if not lo.empty else None
         n_arr = sub_t[n_col] if n_col in sub_t.columns else sub_t.get("n")
         bar.add_trace(go.Bar(
-            name=sector_pretty[tag],
+            name=SECTOR_PRETTY[tag],
             x=sub_t["metric"], y=rho,
-            marker=dict(color=sector_color[tag],
-                        line=dict(color="#222", width=0.4)),
-            error_y=dict(
-                type="data", symmetric=False,
-                array=err_hi, arrayminus=err_lo,
-                thickness=1.2, width=3,
-            ) if err_hi is not None else None,
+            marker=sector_marker(tag),
+            error_y=bar_error_kwargs(err_hi=err_hi, err_lo=err_lo)
+                if err_hi is not None else None,
             customdata=np.c_[n_arr.values] if n_arr is not None else None,
             hovertemplate=(
                 f"<b>{sector_pretty[tag]}</b><br>"
@@ -1367,7 +1428,7 @@ def _e16_rho_per_sector_bar(df: pd.DataFrame, scenario: str) -> go.Figure:
         return go.Figure()
     bar.add_hline(y=0, line=dict(color="#444", width=1, dash="dot"))
     bar.update_layout(**_e16_layout(
-        title=f"E16 — {pretty_scenario(scenario)}: Spearman ρ vs analytical shed, per sector",
+        title=f"{pretty_scenario(scenario)}: Spearman ρ vs analytical shed, per sector",
         barmode="group",
         xaxis=dict(title="Metric", tickangle=-25),
         yaxis=dict(title="Spearman ρ", range=[-1.10, 1.10],
@@ -1404,7 +1465,7 @@ def _e16_top_overlap(merged: pd.DataFrame, scenario: str,
         color_discrete_sequence=QUAL,
     )
     fig.update_layout(**_e16_layout(
-        title=f"E16 — {pretty_scenario(scenario)}: top-K overlap (metric vs analytical shed)",
+        title=f"{pretty_scenario(scenario)}: top-K overlap (metric vs analytical shed)",
         xaxis_title="K", yaxis_title="|top_K(metric) ∩ top_K(shed)| / K",
         yaxis=dict(range=[0, 1.05], tickformat=".0%"),
         height=420, width=860, legend=dict(title="Metric"),
@@ -1465,20 +1526,6 @@ def _e16_rho_per_sector_bar_aggregated(
         ("heat",  "heat_shed",  "branch"),
         ("gas",   "gas_shed",   "branch"),
     ]
-    sector_color = {
-        "total": "#444444",
-        "multi": "#7e57c2",
-        "power": eval.NETWORK_COLOR_MAP["electricity"],
-        "heat":  eval.NETWORK_COLOR_MAP["heat"],
-        "gas":   eval.NETWORK_COLOR_MAP["gas"],
-    }
-    sector_pretty = {
-        "total": "Total",
-        "multi": "Multi (CPs)",
-        "power": "Electricity (non-CP)",
-        "heat":  "Heat (non-CP)",
-        "gas":   "Gas (non-CP)",
-    }
 
     # Candidate metric columns: any non-meta column with float-like values
     # present on every scenario. Exclude the known-shed / id / metadata
@@ -1558,18 +1605,14 @@ def _e16_rho_per_sector_bar_aggregated(
         err_lo = (rho - lo).clip(lower=0) if not lo.empty else None
         n_arr = rho_df[f"n_{tag}"]
         bar.add_trace(go.Bar(
-            name=sector_pretty[tag],
+            name=SECTOR_PRETTY[tag],
             x=rho_df["metric"], y=rho,
-            marker=dict(color=sector_color[tag],
-                        line=dict(color="#222", width=0.4)),
-            error_y=dict(
-                type="data", symmetric=False,
-                array=err_hi, arrayminus=err_lo,
-                thickness=1.2, width=3,
-            ) if err_hi is not None else None,
+            marker=sector_marker(tag),
+            error_y=bar_error_kwargs(err_hi=err_hi, err_lo=err_lo)
+                if err_hi is not None else None,
             customdata=np.c_[n_arr.values],
             hovertemplate=(
-                f"<b>{sector_pretty[tag]}</b><br>"
+                f"<b>{SECTOR_PRETTY[tag]}</b><br>"
                 "metric = %{x}<br>ρ = %{y:+.3f}<br>n = %{customdata[0]}<extra></extra>"
             ),
         ))
@@ -1579,7 +1622,7 @@ def _e16_rho_per_sector_bar_aggregated(
     n_total_row = int(rho_df["n_total"].max()) if "n_total" in rho_df.columns else 0
     bar.update_layout(**_e16_layout(
         title=(
-            f"E16 — Pooled across all scenarios (n={n_total_row}): "
+            f"Pooled across all scenarios (n={n_total_row}): "
             "Spearman ρ vs analytical shed, per sector"
         ),
         barmode="group",
@@ -1709,7 +1752,7 @@ def _e16_per_sector_heatmap(df: pd.DataFrame) -> go.Figure:
 
     heat.update_layout(**_e16_layout(
         title=(
-            "E16 — Spearman ρ between metric and analytical shed, "
+            "Spearman ρ between metric and analytical shed, "
             "per scenario × sector"
         ),
         xaxis=dict(title="Metric", tickangle=30),
@@ -1762,7 +1805,7 @@ def plot_e16_single_removal(input_dir: Path, output_dir: Path) -> Optional[Path]
             heat = _e16_per_sector_heatmap(df)
             if heat.data:
                 figs.append(heat)
-                titles.append("E16 ρ vs analytical shed — per scenario × sector")
+                titles.append("ρ vs analytical shed — per scenario × sector")
                 slugs.append("e16_rho_vs_shed_heatmap_per_sector")
         else:
             # Single-scenario fallback: legacy total-only heatmap stays.
@@ -1786,13 +1829,13 @@ def plot_e16_single_removal(input_dir: Path, output_dir: Path) -> Optional[Path]
                 hovertemplate="<b>%{y}</b><br>%{x}: ρ = %{z:.3f}<extra></extra>",
             ))
             heat.update_layout(**_e16_layout(
-                title="E16 — Spearman ρ between metric and analytical single-removal shed",
+                title="Spearman ρ between metric and analytical single-removal shed",
                 xaxis=dict(title="Metric", tickangle=30), yaxis=dict(title=""),
                 height=max(320, 80 + 64 * len(pivot_shed.index)),
                 width=180 + 110 * len(pivot_shed.columns),
             ))
             figs.append(heat)
-            titles.append("E16 ρ vs analytical shed")
+            titles.append("ρ vs analytical shed")
             slugs.append("e16_rho_vs_shed_heatmap")
 
     # Aggregated (pooled across all scenarios) per-sector ρ bar chart.
@@ -1804,7 +1847,7 @@ def plot_e16_single_removal(input_dir: Path, output_dir: Path) -> Optional[Path]
         agg_bar = _e16_rho_per_sector_bar_aggregated(pooled_files)
         if agg_bar.data:
             figs.append(agg_bar)
-            titles.append("E16 ρ vs analytical shed — pooled across all scenarios")
+            titles.append("ρ vs analytical shed — pooled across all scenarios")
             slugs.append("e16_rho_vs_shed_per_sector_pooled")
     # Per-scenario per-sector grouped bar — emitted for *every* scenario so
     # the per-sector ρ view is always available, even when the cross-grid
@@ -1813,7 +1856,7 @@ def plot_e16_single_removal(input_dir: Path, output_dir: Path) -> Optional[Path]
         bar = _e16_rho_per_sector_bar(df, scenario)
         if bar.data:
             figs.append(bar)
-            titles.append(f"E16 {scenario} — ρ vs shed, per sector")
+            titles.append(f"{pretty_scenario(scenario)} — ρ vs shed, per sector")
             slugs.append(f"e16_{scenario}_rho_vs_shed_per_sector")
 
     # ρ vs shed vs ρ vs MC scatter — does shed-quality predict MC-quality?
@@ -1837,7 +1880,7 @@ def plot_e16_single_removal(input_dir: Path, output_dir: Path) -> Optional[Path]
     fig.add_hline(y=0, line=dict(color="#bbb", width=1, dash="dot"))
     fig.add_vline(x=0, line=dict(color="#bbb", width=1, dash="dot"))
     fig.update_layout(**_e16_layout(
-        title="E16 — ρ vs analytical shed (x) vs ρ vs MC actual (y)",
+        title="ρ vs analytical shed (x) vs ρ vs MC actual (y)",
         xaxis=dict(title="Spearman ρ vs shed", range=[-1.05, 1.05],
                    gridcolor="#e5e5e5"),
         yaxis=dict(title="Spearman ρ vs MC actual", range=[-1.05, 1.05],
@@ -1846,7 +1889,7 @@ def plot_e16_single_removal(input_dir: Path, output_dir: Path) -> Optional[Path]
         legend=dict(title="Metric"),
     ))
     figs.append(fig)
-    titles.append("E16 metric ρ — shed vs MC")
+    titles.append("Metric ρ — shed vs MC")
     slugs.append("e16_rho_shed_vs_mc")
 
     # Ceiling: how well does the analytical shed itself predict MC?
@@ -1870,14 +1913,14 @@ def plot_e16_single_removal(input_dir: Path, output_dir: Path) -> Optional[Path]
         ))
         fig2.add_vline(x=0, line=dict(color="#444", width=1, dash="dot"))
         fig2.update_layout(**_e16_layout(
-            title="E16 — Ceiling: ρ between analytical shed and MC actual_total",
+            title="Ceiling: ρ between analytical shed and MC actual_total",
             xaxis=dict(title="Spearman ρ", range=[-1.05, 1.10],
                        gridcolor="#e5e5e5"),
             yaxis=dict(title=""),
             height=max(220, 80 + 44 * len(ceil)), width=900,
         ))
         figs.append(fig2)
-        titles.append("E16 ceiling ρ")
+        titles.append("Ceiling ρ")
         slugs.append("e16_ceiling_rho")
 
     # ── Per-scenario raw scatter + top-K overlap (only if the
@@ -1898,16 +1941,16 @@ def plot_e16_single_removal(input_dir: Path, output_dir: Path) -> Optional[Path]
             sc_fig = _e16_scatter(merged, m, scenario)
             if sc_fig.data:
                 figs.append(sc_fig)
-                titles.append(f"E16 {scenario} — {m} vs total_shed")
+                titles.append(f"{pretty_scenario(scenario)} — {m} vs total_shed")
                 slugs.append(f"e16_{scenario}_scatter_{m}")
         ov_fig = _e16_top_overlap(merged, scenario, present_metrics)
         if ov_fig.data:
             figs.append(ov_fig)
-            titles.append(f"E16 {scenario} — top-K overlap")
+            titles.append(f"{pretty_scenario(scenario)} — top-K overlap")
             slugs.append(f"e16_{scenario}_top_k_overlap")
 
     return _emit(figs, titles, slugs, output_dir / "E16_single_removal.html",
-                 "E16 — Single-removal-shed validation")
+                 "Single-removal-shed validation")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
