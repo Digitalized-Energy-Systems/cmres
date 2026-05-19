@@ -181,6 +181,33 @@ def _e16_bump_subplot_titles(fig: "go.Figure") -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Canonical metric labels — same display strings the cp_cn_evaluation
+# bar / scatter / NDCG figures use (from ``eval_common.CORE_METRIC_LABELS``).
+# E16 plots historically rendered raw column names like ``"predicted_score"``
+# while cp_cn rendered ``"PTDF stress + phys. BC"`` — route every E16
+# axis / legend label through :func:`metric_label` so the two report
+# pipelines stay in sync.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def metric_label(col_or_iter):
+    """Translate a metric column name to the canonical display label.
+
+    Accepts a single string or any iterable of strings. Returns either a
+    string or a list, matching the input shape. Unknown metric names fall
+    through unchanged so this is safe to apply blanket-style to any axis
+    that may contain non-CORE metrics.
+    """
+    try:
+        from eval_common import CORE_METRIC_LABELS as _LBL
+    except Exception:
+        _LBL = {}
+    if isinstance(col_or_iter, str):
+        return _LBL.get(col_or_iter, col_or_iter)
+    return [_LBL.get(c, c) for c in col_or_iter]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Shared sector palette + bar style — single source of truth for legend
 # colours / labels / Bar styling used by both the E16 plots and the
 # cp_cn cross-carrier / ρ figures. Keep all sector-bearing plots
@@ -1330,7 +1357,7 @@ def _e16_scatter(merged: pd.DataFrame, metric: str, scenario: str) -> go.Figure:
                     hovertemplate=(
                         f"<b>{cp_type}</b><br>"
                         + (("cp_id=%{customdata[0]}<br>") if "cp_id" in sub.columns else "")
-                        + f"{metric}=%{{x:.4g}}<br>{sector_col}=%{{y:.4g}}<extra></extra>"
+                        + f"{metric_label(metric)}=%{{x:.4g}}<br>{sector_col}=%{{y:.4g}}<extra></extra>"
                     ),
                     customdata=sub[["cp_id"]].values if "cp_id" in sub.columns else None,
                 ),
@@ -1350,13 +1377,16 @@ def _e16_scatter(merged: pd.DataFrame, metric: str, scenario: str) -> go.Figure:
                 row=row, col=col,
             )
         fig.update_yaxes(type="log", row=row, col=col, title_text=f"{sector_col} (MW, log)")
-        fig.update_xaxes(row=row, col=col, title_text=metric if row == 2 else "")
+        fig.update_xaxes(
+            row=row, col=col,
+            title_text=metric_label(metric) if row == 2 else "",
+        )
 
     if not any_data:
         return go.Figure()
 
     fig.update_layout(**_e16_layout(
-        title=f"{pretty_scenario(scenario)}: {metric} vs analytical shed (per sector)",
+        title=f"{pretty_scenario(scenario)}: {metric_label(metric)} vs analytical shed (per sector)",
         height=720, width=1080,
         legend=dict(title="cp_type"),
     ))
@@ -1414,13 +1444,13 @@ def _e16_rho_per_sector_bar(df: pd.DataFrame, scenario: str) -> go.Figure:
         n_arr = sub_t[n_col] if n_col in sub_t.columns else sub_t.get("n")
         bar.add_trace(go.Bar(
             name=SECTOR_PRETTY[tag],
-            x=sub_t["metric"], y=rho,
+            x=metric_label(list(sub_t["metric"])), y=rho,
             marker=sector_marker(tag),
             error_y=bar_error_kwargs(err_hi=err_hi, err_lo=err_lo)
                 if err_hi is not None else None,
             customdata=np.c_[n_arr.values] if n_arr is not None else None,
             hovertemplate=(
-                f"<b>{sector_pretty[tag]}</b><br>"
+                f"<b>{SECTOR_PRETTY[tag]}</b><br>"
                 "metric = %{x}<br>ρ = %{y:+.3f}<br>n = %{customdata[0]}<extra></extra>"
             ),
         ))
@@ -1455,7 +1485,7 @@ def _e16_top_overlap(merged: pd.DataFrame, scenario: str,
                 continue
             top_metric = set(metric_rank.head(k)[join_col])
             top_shed = set(shed_rank.head(k)[join_col])
-            rows.append({"metric": m, "k": k,
+            rows.append({"metric": metric_label(m), "k": k,
                          "overlap": len(top_metric & top_shed) / k})
     if not rows:
         return go.Figure()
@@ -1606,7 +1636,7 @@ def _e16_rho_per_sector_bar_aggregated(
         n_arr = rho_df[f"n_{tag}"]
         bar.add_trace(go.Bar(
             name=SECTOR_PRETTY[tag],
-            x=rho_df["metric"], y=rho,
+            x=metric_label(list(rho_df["metric"])), y=rho,
             marker=sector_marker(tag),
             error_y=bar_error_kwargs(err_hi=err_hi, err_lo=err_lo)
                 if err_hi is not None else None,
@@ -1626,8 +1656,10 @@ def _e16_rho_per_sector_bar_aggregated(
             "Spearman ρ vs analytical shed, per sector"
         ),
         barmode="group",
+        # categoryarray uses the same display-label translation so the
+        # explicit sort order survives the relabel.
         xaxis=dict(title="Metric", tickangle=-25, categoryorder="array",
-                   categoryarray=metrics_order),
+                   categoryarray=metric_label(metrics_order)),
         yaxis=dict(title="Spearman ρ", range=[-1.10, 1.10],
                    gridcolor="#e5e5e5"),
         height=480, width=160 + 120 * max(len(metrics_order), 1),
@@ -1712,31 +1744,59 @@ def _e16_per_sector_heatmap(df: pd.DataFrame) -> go.Figure:
     if z.size == 0:
         return go.Figure()
 
-    text = np.where(np.isfinite(z),
-                    np.array([f"{v:.2f}" for v in z.ravel()],
-                             dtype=object).reshape(z.shape), "")
+    # +2 pt over the base E16 typography on every text element of this
+    # figure (per dissertation request — this heatmap is the headline E16
+    # figure and needs a touch more presence than the surrounding plots).
+    ann_size = _E16_FONT_SIZES["annotation"] + 2
+    cbar_size = _E16_FONT_SIZES["colorbar"] + 2
+
+    # Translate metric column names to canonical display labels for the
+    # x-axis (and the per-cell annotation x positions below) so this
+    # heatmap reads identically to the cp_cn pairwise-ρ heatmap.
+    metric_labels = metric_label(metrics)
+
     heat = go.Figure(go.Heatmap(
-        z=z, x=metrics, y=row_labels,
-        colorscale="RdBu", zmid=0, zmin=-1, zmax=1,
+        z=z, x=metric_labels, y=row_labels,
+        # Match the cp_cn pairwise-ρ heatmap convention: ``RdBu_r`` with
+        # ``reversescale=False`` puts red on positive ρ and blue on
+        # negative ρ (the corr_fig in pooled_metric_comparison uses the
+        # same setting — the two heatmaps now read the same).
+        colorscale="RdBu_r", reversescale=False,
+        zmid=0, zmin=-1, zmax=1,
         colorbar=dict(
             title=dict(
-                text="ρ vs shed", side="right",
-                font=dict(size=_E16_FONT_SIZES["colorbar"]),
+                text="Spearman ρ", side="right",
+                font=dict(size=cbar_size),
             ),
-            tickfont=dict(size=_E16_FONT_SIZES["colorbar"]),
+            tickfont=dict(size=cbar_size),
+            tickvals=[-1, -0.5, 0, 0.5, 1],
             thickness=14, len=0.9,
         ),
-        text=text, texttemplate="%{text}",
-        textfont=dict(size=_E16_FONT_SIZES["annotation"]),
         xgap=1, ygap=1,
         hovertemplate="<b>%{y}</b><br>%{x}: ρ = %{z:.3f}<extra></extra>",
     ))
 
-    # Horizontal separators at every scenario boundary so the eye can
-    # group the per-sector rows that belong together. ``y`` in
-    # category-axis coordinates is the half-integer between two rows; we
-    # add a darker stroke at the start of every scenario block (i.e.
-    # after the previous scenario's last sector row).
+    # Cell annotations with adaptive text colour — same logic as the
+    # cp_cn pairwise heatmap: white text on saturated cells (|ρ| > 0.55)
+    # for legibility, black on light cells. Using a layout-level
+    # annotation list (instead of texttemplate) gives us per-cell colour
+    # control plus the +2 pt size.
+    annotations = []
+    for i in range(z.shape[0]):
+        for j in range(z.shape[1]):
+            v = z[i, j]
+            if not np.isfinite(v):
+                continue
+            text_color = "white" if abs(v) > 0.55 else "black"
+            annotations.append(dict(
+                x=metric_labels[j], y=row_labels[i],
+                text=f"{v:.2f}",
+                xref="x", yref="y", showarrow=False,
+                font=dict(size=ann_size, color=text_color),
+            ))
+
+    # Scenario block separators as layout shapes so the per-sector rows
+    # that belong together read as a group.
     shapes = []
     if row_keys:
         prev_scenario = row_keys[0][0]
@@ -1755,18 +1815,37 @@ def _e16_per_sector_heatmap(df: pd.DataFrame) -> go.Figure:
             "Spearman ρ between metric and analytical shed, "
             "per scenario × sector"
         ),
-        xaxis=dict(title="Metric", tickangle=30),
+        # tickangle matches the cp_cn pairwise heatmap (-35 vs the
+        # previous +30) so the two figures share an axis orientation.
+        xaxis=dict(title="Metric", tickangle=-35, automargin=True),
         yaxis=dict(
             title="Scenario — Sector",
             autorange="reversed",
+            automargin=True,
             # Gridlines between every category for per-sector resolution
             # (in addition to the heavier scenario-boundary separators).
             showgrid=True, gridcolor="#eeeeee", gridwidth=1,
         ),
-        height=max(360, 80 + 28 * len(row_labels)),
+        # +8 px per row over the previous 28 → 36 px row pitch so the
+        # extended figure has more vertical breathing room.
+        height=max(420, 100 + 36 * len(row_labels)),
         width=240 + 110 * max(len(metrics), 1),
+        font=dict(size=_E16_FONT_SIZES["base"] + 2),
+        title_font=dict(size=_E16_FONT_SIZES["title"] + 2),
+        annotations=annotations,
         shapes=shapes,
     ))
+    # Bump axis title / tick fonts +2 too (``_e16_layout`` set them at
+    # the base sizes; plotly's layout-level ``font`` doesn't propagate
+    # to ``xaxis.title.font`` or ``tickfont`` automatically).
+    heat.update_xaxes(
+        title_font=dict(size=_E16_FONT_SIZES["axis_title"] + 2),
+        tickfont=dict(size=_E16_FONT_SIZES["axis_tick"] + 2),
+    )
+    heat.update_yaxes(
+        title_font=dict(size=_E16_FONT_SIZES["axis_title"] + 2),
+        tickfont=dict(size=_E16_FONT_SIZES["axis_tick"] + 2),
+    )
     return heat
 
 
@@ -1813,7 +1892,7 @@ def plot_e16_single_removal(input_dir: Path, output_dir: Path) -> Optional[Path]
                             np.array([f"{v:.2f}" for v in z.ravel()],
                                      dtype=object).reshape(z.shape), "")
             heat = go.Figure(go.Heatmap(
-                z=z, x=list(pivot_shed.columns),
+                z=z, x=metric_label(list(pivot_shed.columns)),
                 y=[pretty_scenario(s) for s in pivot_shed.index],
                 colorscale="RdBu", zmid=0, zmin=-1, zmax=1,
                 colorbar=dict(
@@ -1865,13 +1944,14 @@ def plot_e16_single_removal(input_dir: Path, output_dir: Path) -> Optional[Path]
     cmap = {m: QUAL[i % len(QUAL)] for i, m in enumerate(metrics)}
     for m in metrics:
         sub = df[df["metric"] == m]
+        m_label = metric_label(m)
         fig.add_trace(go.Scatter(
             x=sub["rho_vs_shed"], y=sub["rho_vs_mc"],
-            mode="markers", name=m,
+            mode="markers", name=m_label,
             marker=dict(color=cmap[m], size=11,
                         line=dict(color="#222", width=0.5)),
             hovertext=[pretty_scenario(s) for s in sub["scenario"]],
-            hovertemplate=("<b>%{hovertext}</b><br>" + m
+            hovertemplate=("<b>%{hovertext}</b><br>" + m_label
                            + "<br>ρ vs shed = %{x:+.3f}"
                            "<br>ρ vs MC = %{y:+.3f}<extra></extra>"),
         ))
