@@ -2940,14 +2940,6 @@ def evaluate(folder_id):
     cross_carrier_impact_per_scenario(impact_df, OUTPUT + "/pooled")
     cross_carrier_impact_aggregated(impact_df, OUTPUT + "/pooled")
 
-    if len(per_network_dfs) > 1:
-        pooled_df = pandas.concat(per_network_dfs, ignore_index=True)
-        pooled_metric_comparison(pooled_df, OUTPUT + "/pooled")
-        cp_only_pooled_metric_comparison(pooled_df, OUTPUT + "/pooled")
-    elif len(per_network_dfs) == 1:
-        print("Only one network type found — skipping pooled metric analysis.")
-        cp_only_pooled_metric_comparison(per_network_dfs[0], OUTPUT + "/pooled")
-        
     for network_type, monee_net in net_type_to_net.items():
         print(network_type)
         # Plain run_energy_flow is a hard feasibility solve and goes infeasible
@@ -3032,6 +3024,15 @@ def evaluate(folder_id):
                 )
             )
 
+    if len(per_network_dfs) > 1:
+        pooled_df = pandas.concat(per_network_dfs, ignore_index=True)
+        pooled_metric_comparison(pooled_df, OUTPUT + "/pooled")
+        cp_only_pooled_metric_comparison(pooled_df, OUTPUT + "/pooled")
+    elif len(per_network_dfs) == 1:
+        print("Only one network type found — skipping pooled metric analysis.")
+        cp_only_pooled_metric_comparison(per_network_dfs[0], OUTPUT + "/pooled")
+        
+        
     # ── CMRES evaluation experiments (E2..E16) ─────────────────────────
     # Run the full CMRES evaluation battery on the per-scenario artefacts
     # we collected during the loop. Each experiment writes its own CSV (and
