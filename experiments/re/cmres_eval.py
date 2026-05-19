@@ -1088,6 +1088,17 @@ def run_cmres_block(
     output_dir.mkdir(exist_ok=True, parents=True)
     results: Dict[str, pd.DataFrame] = {}
 
+    if "E16" in enabled:
+        # E16 reads the slurm-produced single_removal_shed CSVs from a
+        # parallel directory; if they don't exist, the experiment skips
+        # cleanly with a per-scenario warning.
+        try:
+            results["E16"] = experiment_e16_single_removal_validation(
+                artefacts, output_dir,
+            )
+        except Exception as e:
+            print(f"[E16] FAILED: {type(e).__name__}: {e}")
+
     # E8 and E15 must run before E2/E9/E12/E16 because they augment
     # df_eval with new columns (ml_bc, ddar_mw_total, ss_bc_total,
     # substitutability, …). Order: E8 → E15 → everything else.
@@ -1174,17 +1185,6 @@ def run_cmres_block(
             results["E13"] = experiment_e13_spectral(artefacts, output_dir)
         except Exception as e:
             print(f"[E13] FAILED: {type(e).__name__}: {e}")
-
-    if "E16" in enabled:
-        # E16 reads the slurm-produced single_removal_shed CSVs from a
-        # parallel directory; if they don't exist, the experiment skips
-        # cleanly with a per-scenario warning.
-        try:
-            results["E16"] = experiment_e16_single_removal_validation(
-                artefacts, output_dir,
-            )
-        except Exception as e:
-            print(f"[E16] FAILED: {type(e).__name__}: {e}")
 
     try:
         import cmres_eval_plots
