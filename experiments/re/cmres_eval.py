@@ -1114,19 +1114,19 @@ def run_cmres_block(
         except Exception as e:
             print(f"[E15] FAILED: {type(e).__name__}: {e}")
 
-    if "E2" in enabled:
-        for art in artefacts:
-            scenario_imp = impact_df[impact_df["network_type"] == art.label] \
-                if "network_type" in impact_df.columns else impact_df
-            try:
-                # Pass the matched df from E1/E5 so the "full" variant doesn't
-                # rerun mes_all_components_metric (the slow part).
-                experiment_e2_ablation(
-                    art.monee_net, scenario_imp, art.label, output_dir,
-                    df_eval_full=art.df_eval,
-                )
-            except Exception as e:
-                print(f"[E2:{art.label}] FAILED: {type(e).__name__}: {e}")
+    # if "E2" in enabled:
+    #     for art in artefacts:
+    #         scenario_imp = impact_df[impact_df["network_type"] == art.label] \
+    #             if "network_type" in impact_df.columns else impact_df
+    #         try:
+    #             # Pass the matched df from E1/E5 so the "full" variant doesn't
+    #             # rerun mes_all_components_metric (the slow part).
+    #             experiment_e2_ablation(
+    #                 art.monee_net, scenario_imp, art.label, output_dir,
+    #                 df_eval_full=art.df_eval,
+    #             )
+    #         except Exception as e:
+    #             print(f"[E2:{art.label}] FAILED: {type(e).__name__}: {e}")
 
     if "E3" in enabled:
         try:
@@ -1141,14 +1141,14 @@ def run_cmres_block(
         except Exception as e:
             print(f"[E4] FAILED: {type(e).__name__}: {e}")
 
-    if "E6" in enabled:
-        for art in artefacts:
-            scenario_imp = impact_df[impact_df["network_type"] == art.label] \
-                if "network_type" in impact_df.columns else impact_df
-            try:
-                experiment_e6_sensitivity(art.monee_net, scenario_imp, art.label, output_dir)
-            except Exception as e:
-                print(f"[E6:{art.label}] FAILED: {type(e).__name__}: {e}")
+    # if "E6" in enabled:
+    #     for art in artefacts:
+    #         scenario_imp = impact_df[impact_df["network_type"] == art.label] \
+    #             if "network_type" in impact_df.columns else impact_df
+    #         try:
+    #             experiment_e6_sensitivity(art.monee_net, scenario_imp, art.label, output_dir)
+    #         except Exception as e:
+    #             print(f"[E6:{art.label}] FAILED: {type(e).__name__}: {e}")
 
     if "E7" in enabled:
         try:

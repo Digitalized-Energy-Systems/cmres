@@ -3043,6 +3043,7 @@ def evaluate(folder_id):
                 cmres_artefacts,
                 impact_df,
                 Path(OUTPUT) / "cmres",
+                enabled=["E16"]
             )
         except Exception as e:
             traceback.print_exc()
