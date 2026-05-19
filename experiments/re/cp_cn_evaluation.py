@@ -1996,21 +1996,66 @@ def pooled_resilience_per_scenario(perf_df: pandas.DataFrame, output_dir: str):
         .reset_index(drop=True)
     )
 
-    fig = eval.create_bar(
-        pooled,
-        x_label="scenario",
-        y_label="resilience_mean",
-        color="carrier",
-        color_discrete_map=eval.NETWORK_COLOR_MAP,
-        pattern_shape_map=eval.NETWORK_PATTERN_MAP,
-        legend_text="carrier",
-        template=eval.CMRES_TEMPLATE,
-        yaxis_title="mean performance loss in MW",
-        xaxis_title="scenario",
-        title="Pooled performance drop by scenario, by carrier",
+    # Build the figure via ``go.Bar`` (instead of ``eval.create_bar`` /
+    # ``px.bar``) so it shares the same legend text + bar styling as the
+    # cross-carrier pooled bars in ``cross_carrier_impact_aggregated``:
+    #   * carrier labels routed through SECTOR_PRETTY ("Electricity" /
+    #     "Heat" / "Gas") instead of the raw "electricity" / "heat" / "gas"
+    #     px would render.
+    #   * outlined markers (0.4 px ``#222`` outline) matching the E16 +
+    #     cross-carrier bar style.
+    import plotly.graph_objects as go
+
+    # Same translation table as the cross-carrier bars — SECTOR_* uses
+    # ``power`` for the electricity bucket; perf_df uses ``electricity``.
+    _CARRIER_TO_SECTOR = {
+        "electricity": "power", "heat": "heat", "gas": "gas",
+    }
+
+    def _sector_label(c: str) -> str:
+        return SECTOR_PRETTY[_CARRIER_TO_SECTOR[c]]
+
+    def _sector_color(c: str) -> str:
+        return SECTOR_COLORS[_CARRIER_TO_SECTOR[c]]
+
+    carriers_present = [c for c in ("electricity", "heat", "gas")
+                        if c in pooled["carrier"].unique()]
+    scenarios_present = list(pooled["scenario"].unique())
+
+    fig = go.Figure()
+    for carrier in carriers_present:
+        sub = pooled[pooled["carrier"] == carrier]
+        # Reindex against the canonical scenario list so missing
+        # (scenario, carrier) cells render as zero rather than dropping
+        # the carrier's bar group out of alignment.
+        y_by_scenario = dict(zip(sub["scenario"], sub["resilience_mean"]))
+        carrier_label = _sector_label(carrier)
+        fig.add_trace(go.Bar(
+            x=scenarios_present,
+            y=[float(y_by_scenario.get(s, 0.0)) for s in scenarios_present],
+            name=carrier_label,
+            marker=dict(
+                color=_sector_color(carrier),
+                line=dict(color="#222", width=0.4),
+            ),
+            hovertemplate=(
+                "scenario=%{x}<br>"
+                f"carrier={carrier_label}<br>"
+                "mean performance loss=%{y:.4f} MW<extra></extra>"
+            ),
+        ))
+    fig.update_layout(
         barmode="group",
-        width=max(800, 80 * len(pooled["scenario"].unique())),
-        height=480,
+        template=eval.CMRES_TEMPLATE,
+        title="Pooled performance drop by scenario, by carrier",
+        xaxis=dict(title="Scenario"),
+        yaxis=dict(title="Mean performance loss (MW)", gridcolor="#e5e5e5"),
+        # Same dim convention as the E16 / cross-carrier vertical bars:
+        # 460 px tall, (120 + 110·N_categories) wide.
+        height=460,
+        width=120 + 110 * max(len(scenarios_present), 1),
+        legend=dict(title="Carrier"),
+        margin={"l": 70, "b": 60, "r": 30, "t": 60},
     )
 
     Path(output_dir).mkdir(exist_ok=True, parents=True)
