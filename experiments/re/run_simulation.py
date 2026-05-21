@@ -256,6 +256,7 @@ def run_experiment(grid_name: str, shard: int = 0, n_shards: int = 1):
             ext_grid_el_bounds=container.ext_grid_el_bounds,
             ext_grid_gas_bounds=container.ext_grid_gas_bounds,
             ext_grid_heat_bounds=container.ext_grid_heat_bounds,
+            include_coupling_points=container.include_coupling_points,
         )
         return carrier_sums  # shape (3,): [power, heat, gas]
 

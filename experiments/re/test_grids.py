@@ -48,12 +48,21 @@ from monee.network import (
 
 @dataclass
 class MESContainer:
-    """A network bundled with the ext-grid bounds the solver should use."""
+    """A network bundled with the ext-grid bounds the solver should use.
+
+    ``include_coupling_points`` propagates to both the min-load-shedding
+    optimisation (CPs become demand-weighted loads on their input carrier)
+    and the performance metric (CP nameplate shed counted alongside
+    end-user load shed). Set to True for the ``same_cap`` variants where
+    CPs replace primary generation and therefore should themselves be
+    treated as input-side demand.
+    """
 
     network: mm.Network
     ext_grid_el_bounds: tuple = (-0.05, 0.05)
     ext_grid_gas_bounds: tuple = (-0.006, 0.006)
     ext_grid_heat_bounds: tuple = (0.0, 6.0)
+    include_coupling_points: bool = False
 
 # =============================================================================
 # Helpers
@@ -337,6 +346,7 @@ def create_large_lv_simbench(density, central=False, cp_capacity_invariant=False
             ext_grid_el_bounds=(-0.10, 0.10),
             ext_grid_gas_bounds=(-0.007, 0.007),
             ext_grid_heat_bounds=(-6, 6),
+            include_coupling_points=cp_capacity_invariant,
         )
     return create
 
@@ -416,6 +426,7 @@ def solve(
     ext_grid_el_bounds=(-0.25, 0.25),
     ext_grid_gas_bounds=(-1.5, 1.5),
     ext_grid_heat_bounds=(-100, 100),
+    include_coupling_points=False,
 ):
     optimization_problem = mp.create_min_load_shedding_problem(
         bounds_el=(0.9, 1.1),
@@ -425,6 +436,7 @@ def solve(
         ext_grid_gas_bounds=ext_grid_gas_bounds,
         ext_grid_heat_bounds=ext_grid_heat_bounds,
         include_ext_grids=True,
+        include_coupling_points=include_coupling_points,
         check_vm=True,
         check_pressure=True,
         check_temperature=True,
@@ -454,6 +466,7 @@ if __name__ == "__main__":
         ext_grid_el_bounds=container.ext_grid_el_bounds,
         ext_grid_gas_bounds=container.ext_grid_gas_bounds,
         ext_grid_heat_bounds=container.ext_grid_heat_bounds,
+        include_coupling_points=container.include_coupling_points,
     )
     print(res.summary())
 

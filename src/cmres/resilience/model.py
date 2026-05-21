@@ -285,6 +285,7 @@ class CascadingModel(StepModel):
         ext_grid_el_bounds=ms.DEFAULT_EXT_GRID_EL_BOUNDS,
         ext_grid_gas_bounds=ms.DEFAULT_EXT_GRID_GAS_BOUNDS,
         ext_grid_heat_bounds=ms.DEFAULT_EXT_GRID_HEAT_BOUNDS,
+        include_coupling_points=False,
     ) -> None:
         self._cascading_metric = CascadingResilienceMetric()
         self._performance_metric = GeneralResiliencePerformanceMetric()
@@ -294,6 +295,7 @@ class CascadingModel(StepModel):
         self._ext_grid_el_bounds = ext_grid_el_bounds
         self._ext_grid_gas_bounds = ext_grid_gas_bounds
         self._ext_grid_heat_bounds = ext_grid_heat_bounds
+        self._include_coupling_points = include_coupling_points
 
     def calc_performance(self, network: Network, without_load=False):
         log.info("Solving network for performance calculation")
@@ -302,9 +304,16 @@ class CascadingModel(StepModel):
             ext_grid_el_bounds=self._ext_grid_el_bounds,
             ext_grid_gas_bounds=self._ext_grid_gas_bounds,
             ext_grid_heat_bounds=self._ext_grid_heat_bounds,
+            include_coupling_points=self._include_coupling_points,
         )
         log.info("Network solve complete")
-        return self._performance_metric.calc(result.network), result
+        return (
+            self._performance_metric.calc(
+                result.network,
+                include_coupling_points=self._include_coupling_points,
+            ),
+            result,
+        )
 
     def fault_delta_exists(self, step):
         for fault in self._faults:
@@ -312,8 +321,7 @@ class CascadingModel(StepModel):
                 return True
         return False
 
-    @staticmethod
-    def _max_load_shedding(net):
+    def _max_load_shedding(self, net):
         """Return (power_MW, heat_MW, gas_MW) assuming all active load is shed.
 
         Mirrors the load-types accounted for by ``GeneralResiliencePerformanceMetric``
@@ -356,6 +364,24 @@ class CascadingModel(StepModel):
             and c.active
             and not c.ignored
         )
+
+        if self._include_coupling_points:
+            # Mirror monee.problem.metric: when CPs are counted as loads,
+            # an "all shed" fallback must also include the CP nameplate
+            # on the input carrier, otherwise the fallback under-reports
+            # shed for grids whose criticality lives on the CP side.
+            from monee.problem.utils import cp_input_rated_mw
+            for component in net.nodes + net.branches:
+                if not component.active or component.ignored:
+                    continue
+                carrier_rated = cp_input_rated_mw(component)
+                if carrier_rated is None:
+                    continue
+                carrier, rated_mw = carrier_rated
+                if carrier == "power":
+                    power += rated_mw
+                elif carrier == "gas":
+                    gas += rated_mw
         return (power, heat, gas)
 
     def step(self, net, step, step_state, step_result, base_net):

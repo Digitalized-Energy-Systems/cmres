@@ -134,6 +134,7 @@ def _solve_load_shed(
     ext_grid_el_bounds: Tuple[float, float],
     ext_grid_gas_bounds: Tuple[float, float],
     ext_grid_heat_bounds: Tuple[float, float],
+    include_coupling_points: bool = False,
 ):
     """Run the same min-load-shedding problem the resilience model uses
     when the hard solve goes infeasible. Returns the result object on
@@ -159,6 +160,7 @@ def _solve_load_shed(
         ext_grid_gas_bounds=ext_grid_gas_bounds,
         ext_grid_heat_bounds=ext_grid_heat_bounds,
         include_ext_grids=True,
+        include_coupling_points=include_coupling_points,
         check_vm=True,
         check_pressure=True,
         check_temperature=True,
@@ -178,9 +180,15 @@ def _solve_load_shed(
         return None
 
 
-def _shed_from_solved(net) -> Tuple[float, float, float, float]:
+def _shed_from_solved(
+    net, include_coupling_points: bool = False
+) -> Tuple[float, float, float, float]:
     """Extract per-carrier and total load shed from a solved network.
     Mirrors ``GeneralResiliencePerformanceMetric.calc(network)``.
+
+    ``include_coupling_points=True`` mirrors monee's metric option: CP
+    nameplate input MW × (1 − regulation) is charged to the CP's input
+    carrier (gas or power) on top of end-user load shed.
 
     Returns (power_mw, heat_mw, gas_mw, total_mw).
     """
@@ -265,6 +273,26 @@ def _shed_from_solved(net) -> Tuple[float, float, float, float]:
         except Exception:
             pass
 
+    if include_coupling_points:
+        from monee.problem.utils import cp_input_rated_mw
+        for component in net.nodes + net.branches:
+            carrier_rated = cp_input_rated_mw(component)
+            if carrier_rated is None:
+                continue
+            carrier, rated_mw = carrier_rated
+            if component.ignored or not component.active:
+                loss = rated_mw
+            else:
+                try:
+                    reg = float(mm.value(getattr(component.model, "regulation", 1)) or 1.0)
+                except Exception:
+                    reg = 1.0
+                loss = rated_mw * max(0.0, 1.0 - reg)
+            if carrier == "power":
+                power += loss
+            elif carrier == "gas":
+                gas += loss
+
     total = power + heat + gas
     return float(power), float(heat), float(gas), float(total)
 
@@ -273,6 +301,7 @@ def compute_single_removal_shed(
     net_factory,
     ext_grid_bounds: dict,
     targets: Optional[List[Tuple[str, str, object]]] = None,
+    include_coupling_points: bool = False,
 ) -> pd.DataFrame:
     """Run deactivate-solve for each target on a *factory-fresh* network.
 
@@ -310,9 +339,12 @@ def compute_single_removal_shed(
 
     # Baseline shed (no faults).
     t0 = time.time()
-    base = _solve_load_shed(net_factory(), **bounds)
+    base = _solve_load_shed(
+        net_factory(), include_coupling_points=include_coupling_points, **bounds
+    )
     base_p, base_h, base_g, base_t = (
-        _shed_from_solved(base.network) if base is not None else (0.0, 0.0, 0.0, 0.0)
+        _shed_from_solved(base.network, include_coupling_points=include_coupling_points)
+        if base is not None else (0.0, 0.0, 0.0, 0.0)
     )
     log.info(
         "baseline: total_shed=%.4f MW (p=%.4f, h=%.4f, g=%.4f) in %.1fs",
@@ -352,12 +384,18 @@ def compute_single_removal_shed(
             })
             continue
         try:
-            res = _solve_load_shed(net_iter, **bounds)
+            res = _solve_load_shed(
+                net_iter,
+                include_coupling_points=include_coupling_points,
+                **bounds,
+            )
             if res is None:
                 p, h, g, tot = float("nan"), float("nan"), float("nan"), float("nan")
                 status = "solve_fail"
             else:
-                p, h, g, tot = _shed_from_solved(res.network)
+                p, h, g, tot = _shed_from_solved(
+                    res.network, include_coupling_points=include_coupling_points
+                )
                 status = "ok"
         except Exception:
             log.exception("shed solve failed for %s", cp_id)
@@ -428,7 +466,7 @@ def _resolve_grid(grid_name: str):
         "ext_grid_gas_bounds": container.ext_grid_gas_bounds,
         "ext_grid_heat_bounds": container.ext_grid_heat_bounds,
     }
-    return net_factory, bounds, pristine
+    return net_factory, bounds, pristine, container.include_coupling_points
 
 
 def main():
@@ -477,9 +515,10 @@ def main():
     # state. ``Network.copy()`` doesn't reliably round-trip Vars (they
     # come back as floats), and rebuilding from scratch via the factory
     # would re-pay the simbench load + formulation cost on every solve.
-    net_factory, ext_bounds, net = _resolve_grid(args.grid)
+    net_factory, ext_bounds, net, include_coupling_points = _resolve_grid(args.grid)
     log.info("built %s from test_grids.ALL_GRIDS (%s)", args.grid, net.statistics())
     log.info("ext-grid bounds for %s: %s", args.grid, ext_bounds)
+    log.info("include_coupling_points for %s: %s", args.grid, include_coupling_points)
 
     targets = _enumerate_targets(net)
     log.info(
@@ -489,7 +528,10 @@ def main():
     )
 
     sliced = _slice_targets(targets, args.shard, args.n_shards) if args.n_shards > 1 else targets
-    df = compute_single_removal_shed(net_factory, ext_bounds, targets=sliced)
+    df = compute_single_removal_shed(
+        net_factory, ext_bounds, targets=sliced,
+        include_coupling_points=include_coupling_points,
+    )
     if args.shard and args.n_shards > 1:
         path = args.output_dir / f"single_removal_shed_{args.grid}_shard_{args.shard}_of_{args.n_shards}.csv"
     else:

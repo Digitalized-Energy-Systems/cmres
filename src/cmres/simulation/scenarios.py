@@ -23,6 +23,7 @@ def start_res_simulation(
     ext_grid_el_bounds=None,
     ext_grid_gas_bounds=None,
     ext_grid_heat_bounds=None,
+    include_coupling_points=False,
 ):
     """Run one resilience simulation.
 
@@ -55,4 +56,5 @@ def start_res_simulation(
         ext_grid_el_bounds=ext_grid_el_bounds,
         ext_grid_gas_bounds=ext_grid_gas_bounds,
         ext_grid_heat_bounds=ext_grid_heat_bounds,
+        include_coupling_points=include_coupling_points,
     )

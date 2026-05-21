@@ -15,6 +15,7 @@ def solve(
     ext_grid_el_bounds=DEFAULT_EXT_GRID_EL_BOUNDS,
     ext_grid_gas_bounds=DEFAULT_EXT_GRID_GAS_BOUNDS,
     ext_grid_heat_bounds=DEFAULT_EXT_GRID_HEAT_BOUNDS,
+    include_coupling_points=False,
 ):
 
     optimization_problem = mp.create_min_load_shedding_problem(
@@ -25,6 +26,7 @@ def solve(
         ext_grid_gas_bounds=ext_grid_gas_bounds,
         ext_grid_heat_bounds=ext_grid_heat_bounds,
         include_ext_grids=True,
+        include_coupling_points=include_coupling_points,
         check_vm=True,
         check_pressure=True,
         check_temperature=True,

@@ -168,11 +168,12 @@ def start_resilience_simulation(
     ext_grid_el_bounds=None,
     ext_grid_gas_bounds=None,
     ext_grid_heat_bounds=None,
+    include_coupling_points=False,
 ):
     def iteration_step(net, step, step_state, step_result, base_net):
         resilience_measurement_model.gather(net, step)
 
-    cm_kwargs = {}
+    cm_kwargs = {"include_coupling_points": include_coupling_points}
     if ext_grid_el_bounds is not None:
         cm_kwargs["ext_grid_el_bounds"] = ext_grid_el_bounds
     if ext_grid_gas_bounds is not None:

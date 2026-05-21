@@ -34,8 +34,12 @@ class GeneralResiliencePerformanceMetric(PerformanceMetric):
             if is_load(component)
         ]
 
-    def calc(self, network):
-        return mp.calc_general_resilience_performance(network, include_ext_grid=False)
+    def calc(self, network, include_coupling_points=False):
+        return mp.calc_general_resilience_performance(
+            network,
+            include_ext_grid=False,
+            include_coupling_points=include_coupling_points,
+        )
 
 
 class CascadingResilienceMetric(ResilienceMetric):
