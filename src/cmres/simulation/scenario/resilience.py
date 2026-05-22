@@ -236,12 +236,17 @@ def start_resilience_simulation(
 
             # Per-carrier performance sums: index 0=power, 1=heat, 2=gas.
             # Each entry in obs.data()["performance"] is a 3-tuple (or scalar).
+            # ``skipna=False`` so a single NaN step (e.g. CascadingModel.step
+            # gathered NaN performance after a solver time-limit abort)
+            # propagates into the carrier sum — the MC accumulator then
+            # drops the whole run via its non-finite skip path, which is
+            # exactly what we want for non-converged samples.
             raw_perfs = obs.data().get("performance", [])
             per_carrier = pandas.DataFrame(
                 [t if isinstance(t, (list, tuple)) else [t, 0.0, 0.0] for t in raw_perfs],
                 columns=["power", "heat", "gas"],
             )
-            carrier_sums = per_carrier.sum().to_numpy()  # shape (3,): [power, heat, gas]
+            carrier_sums = per_carrier.sum(skipna=False).to_numpy()
             performance_sum = float(carrier_sums.sum())  # scalar total
             return performance_sum, carrier_sums
         finally:

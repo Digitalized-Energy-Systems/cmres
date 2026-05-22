@@ -269,6 +269,34 @@ class SimpleResilienceModel(ResilienceModel):
         return failures
 
 
+# Substrings that indicate a Pyomo solve aborted on a resource limit
+# (time, iteration, …) and returned a *witness* incumbent rather than a
+# converged solution. We pattern-match the stringified
+# ``solver_status`` / ``termination_condition`` instead of importing
+# pyomo enums so this module stays decoupled from monee's solver
+# backend.
+_ABORT_INDICATORS = (
+    "limit",      # ``maxTimeLimit``, ``maxIterations``, ``minStepLength`` …
+    "aborted",    # ``SolverStatus.aborted``
+    "interrupt",  # ``userInterrupt``
+)
+
+
+def _solver_aborted_with_witness(sresult) -> bool:
+    """Return True if a ``SolverResult`` with ``success=True`` actually
+    came from a non-converged abort (time-limit, iteration-limit, etc.).
+
+    Used by :class:`CascadingModel` to drop such samples from the MC
+    estimator — the witness incumbent's load shed is not comparable to
+    the converged samples and would otherwise pull the mean toward
+    whatever Gurobi happened to have when it cut off.
+    """
+    tc = getattr(sresult, "termination_condition", None) or ""
+    status = getattr(sresult, "solver_status", None) or ""
+    combined = (str(tc) + " " + str(status)).lower()
+    return any(tag in combined for tag in _ABORT_INDICATORS)
+
+
 class CascadingModel(StepModel):
     """Per-step performance evaluator with infeasibility-fallback shedding.
 
@@ -442,6 +470,42 @@ class CascadingModel(StepModel):
                         },
                     )
                     performance = self._max_load_shedding(net)
+                elif _solver_aborted_with_witness(sresult):
+                    # Gurobi (or any Pyomo solver) hit its TimeLimit and
+                    # returned a non-converged witness incumbent. The
+                    # witness's shed value is not comparable to the
+                    # converged samples — average it in and the MC mean
+                    # quietly drifts toward whatever Gurobi happened to
+                    # have at the cutoff. Poison the run with NaN
+                    # performance so the MC accumulator drops the sample
+                    # via its existing non-finite skip path (and the
+                    # ``n_skipped_nonfinite`` counter on ``MCResult``
+                    # surfaces the count in mc_summary.txt / mc_result.npz).
+                    active_faults = [
+                        str(f) for f in (self._faults or []) if f.start_time <= step
+                    ]
+                    tc = getattr(sresult, "termination_condition", None)
+                    status = getattr(sresult, "solver_status", None)
+                    log.warning(
+                        "Solver aborted (status=%s, termination=%s) at step=%d "
+                        "(active faults=%d); dropping this MC sample (NaN "
+                        "performance).",
+                        status, tc, step, len(active_faults),
+                    )
+                    observer.gather(
+                        "infeasibility",
+                        {
+                            "step": step,
+                            "kind": "time_limit",
+                            "n_active_faults": len(active_faults),
+                            "active_faults": " | ".join(active_faults),
+                            "report": (
+                                f"solver_status={status}; "
+                                f"termination_condition={tc}"
+                            ),
+                        },
+                    )
+                    performance = (float("nan"), float("nan"), float("nan"))
             self._last_performance = performance
         else:
             performance = self._last_performance
