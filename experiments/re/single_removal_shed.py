@@ -184,117 +184,20 @@ def _shed_from_solved(
     net, include_coupling_points: bool = False
 ) -> Tuple[float, float, float, float]:
     """Extract per-carrier and total load shed from a solved network.
-    Mirrors ``GeneralResiliencePerformanceMetric.calc(network)``.
 
-    ``include_coupling_points=True`` mirrors monee's metric option: CP
-    nameplate input MW × (1 − regulation) is charged to the CP's input
-    carrier (gas or power) on top of end-user load shed.
+    Delegates to ``monee.problem.metric.GeneralResiliencePerformanceMetric``
+    so the single-removal sweep and the MC resilience runs measure shed the
+    same way. ``include_ext_grid=False`` matches the prior local
+    implementation (ext-grid imbalance is not counted as shed).
 
     Returns (power_mw, heat_mw, gas_mw, total_mw).
     """
-    passive_hx = getattr(mm, "PassiveHeatExchangerLoad", mm.HeatExchangerLoad)
-
-    power = 0.0
-    for c in net.childs:
-        m = c.model
-        if c.ignored or not c.active:
-            if isinstance(m, mm.PowerLoad):
-                power += float(mm.upper(m.p_mw) or 0.0)
-            continue
-        if isinstance(m, mm.PowerLoad):
-            try:
-                power += float(mm.upper(m.p_mw) or 0.0) - float(
-                    mm.value(m.p_mw) or 0.0
-                ) * float(mm.value(m.regulation) or 1.0)
-            except Exception:
-                pass
-
-    heat = 0.0
-    for c in net.childs:
-        m = c.model
-        if c.ignored or not c.active:
-            if isinstance(m, mm.HeatLoad):
-                heat += float(mm.upper(m.q_mw_heat) or 0.0)
-            elif isinstance(m, (mm.HeatExchangerLoad, passive_hx)):
-                heat += float(mm.upper(m.q_mw) or 0.0)
-            continue
-        if isinstance(m, mm.HeatLoad):
-            try:
-                heat += float(mm.upper(m.q_mw_heat) or 0.0) - float(
-                    mm.value(m.q_mw_heat) or 0.0
-                ) * float(mm.value(m.regulation) or 1.0)
-            except Exception:
-                pass
-        elif isinstance(m, (mm.HeatExchangerLoad, passive_hx)):
-            try:
-                heat += float(mm.upper(m.q_mw) or 0.0) - float(
-                    mm.value(m.q_mw) or 0.0
-                ) * float(mm.value(m.regulation) or 1.0)
-            except Exception:
-                pass
-    for b in net.branches:
-        m = b.model
-        if isinstance(m, (mm.HeatExchangerLoad, passive_hx)):
-            if not b.active or b.ignored:
-                heat += float(mm.upper(m.q_mw) or 0.0)
-            else:
-                try:
-                    heat += float(mm.upper(m.q_mw) or 0.0) - float(
-                        mm.value(m.q_mw) or 0.0
-                    ) * float(mm.value(m.regulation) or 1.0)
-                except Exception:
-                    pass
-
-    gas = 0.0
-    for c in net.childs:
-        m = c.model
-        if not isinstance(m, mm.Sink):
-            continue
-        grid = getattr(c, "grid", None)
-        # Only gas-grid Sinks contribute to gas shedding. Water Sinks live on
-        # WaterGrid which has no ``higher_heating_value`` — defaulting to a
-        # gas HHV here would conjure huge fake gas energy from water mass
-        # flows (mirrors model.py::_max_load_shedding).
-        if grid is None or not hasattr(grid, "higher_heating_value"):
-            continue
-        hhv = float(grid.higher_heating_value)
-        if c.ignored or not c.active:
-            try:
-                gas += float(mm.upper(m.mass_flow) or 0.0) * 3.6 * hhv
-            except Exception:
-                pass
-            continue
-        try:
-            gas += (
-                float(mm.upper(m.mass_flow) or 0.0)
-                - float(mm.value(m.mass_flow) or 0.0)
-                * float(mm.value(m.regulation) or 1.0)
-            ) * 3.6 * hhv
-        except Exception:
-            pass
-
-    if include_coupling_points:
-        from monee.problem.utils import cp_input_rated_mw
-        for component in net.nodes + net.branches:
-            carrier_rated = cp_input_rated_mw(component)
-            if carrier_rated is None:
-                continue
-            carrier, rated_mw = carrier_rated
-            if component.ignored or not component.active:
-                loss = rated_mw
-            else:
-                try:
-                    reg = float(mm.value(getattr(component.model, "regulation", 1)) or 1.0)
-                except Exception:
-                    reg = 1.0
-                loss = rated_mw * max(0.0, 1.0 - reg)
-            if carrier == "power":
-                power += loss
-            elif carrier == "gas":
-                gas += loss
-
-    total = power + heat + gas
-    return float(power), float(heat), float(gas), float(total)
+    power, heat, gas = mp.calc_general_resilience_performance(
+        net,
+        include_ext_grid=False,
+        include_coupling_points=include_coupling_points,
+    )
+    return float(power), float(heat), float(gas), float(power + heat + gas)
 
 
 def compute_single_removal_shed(
