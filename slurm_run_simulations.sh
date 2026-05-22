@@ -18,12 +18,12 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
-#SBATCH --time=2:00:00
+#SBATCH --time=16:00:00
 #SBATCH --output=logs/slurm_%A_%a.out
 #SBATCH --error=logs/slurm_%A_%a.err
 #SBATCH --mail-type=FAIL
 #SBATCH --mail-user=rico.schrage@uni-oldenburg.de
-#SBATCH --nodelist=mpcs046,mpcs047
+#SBATCH --nodelist=mpcs008,mpcs009
 
 # Tunable knobs (must match the launcher's defaults).
 N_GRIDS=${N_GRIDS:-11}
