@@ -1,1 +1,1 @@
-sbatch -p rosa.p slurm_evaluation.sh
+CMRES_INPUT=~/cmres_new/cmres/data/res sbatch -p rosa.p slurm_evaluation.sh
