@@ -63,15 +63,30 @@ conda activate cmres_env
 
 TASK_ID="${SLURM_ARRAY_TASK_ID}"
 
-if [[ -n "${CMRES_MERGE_PHASE:-}" ]]; then
-    GRID_IDX="${TASK_ID}"
-    echo "Merging shards for grid #${GRID_IDX}"
-    python "${SCRIPT}" "${GRID_IDX}" --merge
+# When the launcher pins a single grid by name, CMRES_GRID_NAME is set and
+# the TASK_ID encodes the shard index directly (no grid dimension).  In that
+# case run_simulation.py resolves the name via ALL_GRIDS itself.
+if [[ -n "${CMRES_GRID_NAME:-}" ]]; then
+    GRID_SELECTOR=( --name "${CMRES_GRID_NAME}" )
+    GRID_LABEL="grid=${CMRES_GRID_NAME}"
+    SHARD_IDX="${TASK_ID}"
 else
-    GRID_IDX=$(( (TASK_ID - 1) / N_SHARDS + 1 ))
-    SHARD_IDX=$(( (TASK_ID - 1) % N_SHARDS + 1 ))
-    echo "Running grid #${GRID_IDX}, shard ${SHARD_IDX}/${N_SHARDS}"
-    python "${SCRIPT}" "${GRID_IDX}" \
+    if [[ -n "${CMRES_MERGE_PHASE:-}" ]]; then
+        GRID_IDX="${TASK_ID}"
+    else
+        GRID_IDX=$(( (TASK_ID - 1) / N_SHARDS + 1 ))
+        SHARD_IDX=$(( (TASK_ID - 1) % N_SHARDS + 1 ))
+    fi
+    GRID_SELECTOR=( "${GRID_IDX}" )
+    GRID_LABEL="grid #${GRID_IDX}"
+fi
+
+if [[ -n "${CMRES_MERGE_PHASE:-}" ]]; then
+    echo "Merging shards for ${GRID_LABEL}"
+    python "${SCRIPT}" "${GRID_SELECTOR[@]}" --merge
+else
+    echo "Running ${GRID_LABEL}, shard ${SHARD_IDX}/${N_SHARDS}"
+    python "${SCRIPT}" "${GRID_SELECTOR[@]}" \
         --shard "${SHARD_IDX}" --n-shards "${N_SHARDS}" \
         ${RESUME_FLAG}
 fi

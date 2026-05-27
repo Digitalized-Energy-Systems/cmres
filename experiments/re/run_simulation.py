@@ -463,6 +463,13 @@ def main():
         help=f"1-based experiment index (1–{len(EXPERIMENTS)}).  Omit to run all.",
     )
     parser.add_argument(
+        "--name",
+        type=str,
+        default=None,
+        help="Grid name (key in ALL_GRIDS).  Alternative to the positional "
+        "index; mutually exclusive with it.",
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help="Skip experiments whose mc_result.npz already exists.",
@@ -502,6 +509,19 @@ def main():
     # Initialise console logging before any experiment runs.
     console_level = logging.DEBUG if args.debug else logging.INFO
     cmres.log.setup(console_level=console_level)
+
+    # Resolve --name to a 1-based index so the rest of the code stays unchanged.
+    if args.name is not None:
+        if args.index is not None:
+            log.error("Pass either INDEX or --name, not both.")
+            sys.exit(1)
+        if args.name not in EXPERIMENTS:
+            log.error(
+                "Grid %r not in ALL_GRIDS. Available: %s",
+                args.name, EXPERIMENTS,
+            )
+            sys.exit(1)
+        args.index = EXPERIMENTS.index(args.name) + 1
 
     if args.list:
         print(f"{'#':>3}  {'grid':<24}  {'done?':>6}")
