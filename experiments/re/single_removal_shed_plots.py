@@ -243,7 +243,7 @@ def _hist_total(sweep: pd.DataFrame, grid: str, baseline_total: float) -> go.Fig
         nbins=60,
         color_discrete_map=KIND_COLOR_MAP,
         category_orders={"kind": kinds_here} if kinds_here else None,
-        title=f"{grid}: distribution of total shed (MW) per single-component removal",
+        title=f"{pretty_scenario(grid)}: distribution of total shed (MW) per single-component removal",
     )
     # Use a colour outside KIND_COLOR_MAP for the baseline reference line so
     # it's never confused with a category.
@@ -278,7 +278,7 @@ def _top_components(sweep: pd.DataFrame, grid: str, top_n: int = 20) -> go.Figur
         ))
     fig.update_layout(
         barmode="stack",
-        title=f"{grid}: top-{top_n} components by total shed (per-carrier breakdown)",
+        title=f"{pretty_scenario(grid)}: top-{top_n} components by total shed (per-carrier breakdown)",
         xaxis_title="Load shed (MW)",
         yaxis_title="Component (cp_id)",
         height=600, width=950,
@@ -303,7 +303,7 @@ def _pareto(sweep: pd.DataFrame, grid: str) -> go.Figure:
         yaxis="y2",
     ))
     fig.update_layout(
-        title=f"{grid}: shed Pareto curve (rank vs total_shed and cumulative share)",
+        title=f"{pretty_scenario(grid)}: shed Pareto curve (rank vs total_shed and cumulative share)",
         xaxis=dict(title="Component rank (sorted by total_shed desc)", type="log"),
         yaxis=dict(title="Total shed (MW)"),
         yaxis2=dict(title="Cumulative share of total shed", overlaying="y", side="right",
@@ -325,7 +325,7 @@ def _carrier_breakdown(sweep: pd.DataFrame, grid: str) -> go.Figure:
     fig = px.box(
         long, x="carrier", y="shed_mw", color="carrier", points="outliers",
         color_discrete_map=ev.NETWORK_COLOR_MAP,
-        title=f"{grid}: per-carrier shed distribution across all single removals",
+        title=f"{pretty_scenario(grid)}: per-carrier shed distribution across all single removals",
     )
     fig.update_layout(yaxis_type="log", yaxis_title="Shed (MW, log)", height=420, width=750)
     return _srs_finalize(fig, legend="right")
@@ -346,7 +346,7 @@ def _kind_summary(sweep: pd.DataFrame, grid: str) -> go.Figure:
     ])
     fig.update_layout(
         barmode="group",
-        title=f"{grid}: total shed by component kind (mean vs max)",
+        title=f"{pretty_scenario(grid)}: total shed by component kind (mean vs max)",
         xaxis_title="Component kind", xaxis=dict(categoryorder="array", categoryarray=kind_order),
         yaxis_title="Total shed (MW)",
         height=400, width=750,
@@ -358,7 +358,7 @@ def _solve_time(sweep: pd.DataFrame, grid: str) -> go.Figure:
     fig = px.histogram(
         sweep, x="elapsed_s", nbins=40,
         color_discrete_sequence=[ev.PALETTE_QUAL[2]],
-        title=f"{grid}: solve-time distribution per single-removal LP",
+        title=f"{pretty_scenario(grid)}: solve-time distribution per single-removal LP",
     )
     fig.update_layout(
         xaxis_title="Per-component solve time (s)",
@@ -836,7 +836,7 @@ def plot_grid(grid: str, csv_path: Path, out_dir: Path):
         "solve_time",
     )]
     out_html = out_dir / f"{grid}_report.html"
-    ev.write_all_in_one(figs, f"single-removal shed — {grid}", Path("."), str(out_html),
+    ev.write_all_in_one(figs, f"single-removal shed — {pretty_scenario(grid)}", Path("."), str(out_html),
                         write_single_files=True, titles=titles, slugs=slugs)
     print(f"  -> {out_html}")
 

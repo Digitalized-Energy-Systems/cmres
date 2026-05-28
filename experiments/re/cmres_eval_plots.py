@@ -30,11 +30,20 @@ from plotly.subplots import make_subplots
 
 import cmres.evaluation.evaluation as eval
 
-try:
-    from cp_cn_evaluation import pretty_scenario
-except Exception:  # pragma: no cover — script may be imported standalone
-    def pretty_scenario(name):
-        return "" if name is None else str(name)
+# Lazy proxy: ``cp_cn_evaluation`` imports back from this module
+# (``SECTOR_COLORS`` etc.), so a top-level ``from cp_cn_evaluation import
+# pretty_scenario`` hits a partial module when ``cmres_eval_plots`` is
+# imported first, silently binds the no-op fallback, and every plot ends
+# up showing raw grid keys.  Resolving lazily at call time avoids that —
+# by the time any plotter runs, both modules are fully loaded.
+def pretty_scenario(name):
+    if name is None:
+        return ""
+    try:
+        from cp_cn_evaluation import pretty_scenario as _real
+    except Exception:  # pragma: no cover — module imported standalone
+        return str(name)
+    return _real(name)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
