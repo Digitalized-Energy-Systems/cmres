@@ -51,6 +51,47 @@ _COMPOUND_CP_TYPES = ("CHP", "CHPHG", "PowerToHeat")
 _NON_CP_BRANCH_TYPES = ("PowerLine", "GasPipe", "WaterPipe", "HeatExchanger")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Stress-class split — shared by every cross-scenario plotter so the
+# baseline / ``_relaxed`` partitioning logic lives in exactly one place.
+# ─────────────────────────────────────────────────────────────────────────────
+
+RELAXED_SUFFIX = "_relaxed"
+
+
+def is_relaxed(scenario) -> bool:
+    """True iff the scenario key carries the ``_relaxed`` headroom suffix."""
+    return str(scenario).endswith(RELAXED_SUFFIX)
+
+
+def stress_class(scenario) -> str:
+    """``"relaxed"`` for ``_relaxed`` variants, ``"baseline"`` otherwise."""
+    return "relaxed" if is_relaxed(scenario) else "baseline"
+
+
+def split_scenarios_by_stress(scenarios) -> List[Tuple[str, List[str]]]:
+    """Partition scenarios into ``[("baseline", [...]), ("relaxed", [...])]``.
+
+    Empty classes are dropped so the legacy 11-grid case collapses to a single
+    group — letting callers detect "no split needed" via ``len(result) <= 1``
+    and keep their original (unsuffixed) figure slugs.
+
+    Order is stable: scenarios within each class keep their input order, which
+    matters for figures whose colour mapping or axis ticks read in source
+    order (e.g. ``_scenario_order`` already returns the canonical sequence).
+    """
+    baseline: List[str] = []
+    relaxed: List[str] = []
+    for s in scenarios:
+        (relaxed if is_relaxed(s) else baseline).append(s)
+    out: List[Tuple[str, List[str]]] = []
+    if baseline:
+        out.append(("baseline", baseline))
+    if relaxed:
+        out.append(("relaxed", relaxed))
+    return out
+
+
 # Canonical 10-metric line-up used by both ``cp_cn_evaluation`` (scatter /
 # correlation / NDCG figures) and ``cmres_eval.experiment_e16`` (per-sector
 # Spearman ρ vs analytical shed). Single source of truth so the two

@@ -33,7 +33,7 @@
 #SBATCH --nodelist=mpcs046,mpcs047
 
 # Tunable knobs — must match the launcher's defaults.
-N_GRIDS=${N_GRIDS:-11}
+N_GRIDS=${N_GRIDS:-22}
 N_SHARDS=${N_SHARDS:-8}
 
 # SLURM array index → (grid_idx, shard_idx) — both 0-based.
@@ -42,23 +42,23 @@ N_SHARDS=${N_SHARDS:-8}
 # required any more — only the output dir.
 OUTPUT_DIR=${OUTPUT_DIR:-data/out/single_removal_shed}
 
-# Grid catalogue MUST stay aligned with experiments/re/test_grids.py::ALL_GRIDS
-# (insertion order matters: must match the keys of ALL_GRIDS so a given
-# SLURM_ARRAY_TASK_ID/N_SHARDS index resolves to the same grid as in
-# run_simulation.py).
-GRIDS=(
-    "simbench_lv_no"
-    "simbench_lv_low"
-    "simbench_lv"
-    "simbench_lv_high"
-    "simbench_lv_xl"
-    "simbench_lv_xxl"
-    "simbench_lv_low_same_cap"
-    "simbench_lv_same_cap"
-    "simbench_lv_high_same_cap"
-    "simbench_lv_xl_same_cap"
-    "simbench_lv_xxl_same_cap"
-)
+# Grid catalogue — derived dynamically from
+# experiments/re/test_grids.py::ALL_GRIDS via sed so this list cannot drift
+# from the Python truth (insertion order matters: index → name must match
+# what slurm_run_simulations.sh / submit_simulations.sh use).
+GRIDS=( $(
+    sed -n \
+        '/^ALL_GRIDS[[:space:]]*=[[:space:]]*{/,/^}/ s/^[[:space:]]*"\([^"]*\)"[[:space:]]*:.*/\1/p' \
+        experiments/re/test_grids.py
+) )
+if (( ${#GRIDS[@]} == 0 )); then
+    echo "ERROR: could not extract ALL_GRIDS keys from experiments/re/test_grids.py" >&2
+    exit 2
+fi
+if (( ${#GRIDS[@]} != N_GRIDS )); then
+    echo "WARN: N_GRIDS=$N_GRIDS but ALL_GRIDS has ${#GRIDS[@]} keys — using the file's count." >&2
+    N_GRIDS=${#GRIDS[@]}
+fi
 
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-1}
 export MKL_NUM_THREADS=${SLURM_CPUS_PER_TASK:-1}

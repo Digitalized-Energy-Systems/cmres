@@ -1961,10 +1961,19 @@ def cp_only_metric_comparison(df_all: pandas.DataFrame, network_type: str):
     _cp_only_metric_comparison_core(df_all, network_type, out)
 
 
-def cp_only_pooled_metric_comparison(pooled_df: pandas.DataFrame, output_dir: str):
-    """Pooled CP-only view across all network types, broken out by cp_type."""
-    out = output_dir + "/cp_metric_vs_actual_cp_only_pooled.html"
-    _cp_only_metric_comparison_core(pooled_df, "pooled", out)
+def cp_only_pooled_metric_comparison(
+    pooled_df: pandas.DataFrame, output_dir: str, class_label: str = ""
+):
+    """Pooled CP-only view across all network types, broken out by cp_type.
+
+    ``class_label`` (``"baseline"`` / ``"relaxed"`` / ``""``) is appended to
+    the output filename so the caller can split the pooled view by stress
+    class without overwriting a single shared HTML.
+    """
+    slug_suffix = f"_{class_label}" if class_label else ""
+    label = f"pooled-{class_label}" if class_label else "pooled"
+    out = output_dir + f"/cp_metric_vs_actual_cp_only_pooled{slug_suffix}.html"
+    _cp_only_metric_comparison_core(pooled_df, label, out)
 
 
 def pooled_resilience_per_scenario(perf_df: pandas.DataFrame, output_dir: str):
@@ -2033,56 +2042,68 @@ def pooled_resilience_per_scenario(perf_df: pandas.DataFrame, output_dir: str):
 
     carriers_present = [c for c in ("electricity", "heat", "gas")
                         if c in pooled["carrier"].unique()]
-    scenarios_present = list(pooled["scenario"].unique())
 
-    fig = go.Figure()
-    for carrier in carriers_present:
-        sub = pooled[pooled["carrier"] == carrier]
-        # Reindex against the canonical scenario list so missing
-        # (scenario, carrier) cells render as zero rather than dropping
-        # the carrier's bar group out of alignment.
-        y_by_scenario = dict(zip(sub["scenario"], sub["resilience_mean"]))
-        carrier_label = _sector_label(carrier)
-        fig.add_trace(go.Bar(
-            x=scenarios_present,
-            y=[float(y_by_scenario.get(s, 0.0)) for s in scenarios_present],
-            name=carrier_label,
-            marker=dict(
-                color=_sector_color(carrier),
-                line=dict(color="#222", width=0.4),
-            ),
-            hovertemplate=(
-                "scenario=%{x}<br>"
-                f"carrier={carrier_label}<br>"
-                "mean performance loss=%{y:.4f} MW<extra></extra>"
-            ),
-        ))
-    fig.update_layout(
-        barmode="group",
-        template=eval.CMRES_TEMPLATE,
-        title="Pooled performance drop by scenario, by carrier",
-        xaxis=dict(title="Scenario"),
-        yaxis=dict(title="Mean performance loss (MW)", gridcolor="#e5e5e5"),
-        # Same dim convention as the E16 / cross-carrier vertical bars:
-        # 460 px tall, (120 + 110·N_categories) wide.
-        height=460,
-        width=120 + 110 * max(len(scenarios_present), 1),
-        legend=dict(title="Carrier"),
-        margin={"l": 70, "b": 60, "r": 30, "t": 60},
-    )
+    def _build_fig(sub_pooled):
+        scens = list(sub_pooled["scenario"].unique())
+        fig = go.Figure()
+        for carrier in carriers_present:
+            sub = sub_pooled[sub_pooled["carrier"] == carrier]
+            y_by_scenario = dict(zip(sub["scenario"], sub["resilience_mean"]))
+            carrier_label = _sector_label(carrier)
+            fig.add_trace(go.Bar(
+                x=scens,
+                y=[float(y_by_scenario.get(s, 0.0)) for s in scens],
+                name=carrier_label,
+                marker=dict(
+                    color=_sector_color(carrier),
+                    line=dict(color="#222", width=0.4),
+                ),
+                hovertemplate=(
+                    "scenario=%{x}<br>"
+                    f"carrier={carrier_label}<br>"
+                    "mean performance loss=%{y:.4f} MW<extra></extra>"
+                ),
+            ))
+        return fig, scens
 
+    # Split by stress class so the 22-grid case doesn't render a 2.5k-px-wide
+    # bar chart. Filter on the raw network_type (the dataframe column that
+    # carries the unstyled key) since stress-class detection keys off the
+    # ``_relaxed`` suffix of the technical name, not the pretty label.
+    classes = _ec.split_scenarios_by_stress(pooled["network_type"].drop_duplicates())
     Path(output_dir).mkdir(exist_ok=True, parents=True)
-    eval.write_all_in_one(
-        [fig],
-        "Figure",
-        Path("."),
-        output_dir + "/resilience_per_carrier_per_scenario_pooled.html",
-        titles=[
-            f"Pooled performance drop by scenario "
-            f"(n_scenarios={pooled['scenario'].nunique()}, "
-            f"n_network_types={pooled['network_type'].nunique()})"
-        ],
-    )
+
+    def _emit(sub_pooled, class_label):
+        fig, scens = _build_fig(sub_pooled)
+        suffix = f" ({class_label})" if class_label else ""
+        slug_suffix = f"_{class_label}" if class_label else ""
+        fig.update_layout(
+            barmode="group",
+            template=eval.CMRES_TEMPLATE,
+            title=f"Pooled performance drop by scenario, by carrier{suffix}",
+            xaxis=dict(title="Scenario"),
+            yaxis=dict(title="Mean performance loss (MW)", gridcolor="#e5e5e5"),
+            height=460,
+            width=120 + 110 * max(len(scens), 1),
+            legend=dict(title="Carrier"),
+            margin={"l": 70, "b": 60, "r": 30, "t": 60},
+        )
+        eval.write_all_in_one(
+            [fig], "Figure", Path("."),
+            f"{output_dir}/resilience_per_carrier_per_scenario_pooled{slug_suffix}.html",
+            titles=[
+                f"Pooled performance drop by scenario{suffix} "
+                f"(n_scenarios={sub_pooled['scenario'].nunique()}, "
+                f"n_network_types={sub_pooled['network_type'].nunique()})"
+            ],
+        )
+
+    if len(classes) <= 1:
+        _emit(pooled, class_label="")
+    else:
+        for cl, types in classes:
+            _emit(pooled[pooled["network_type"].isin(types)], class_label=cl)
+
     print(
         f"Pooled resilience plot: "
         f"{pooled['scenario'].nunique()} scenarios across "
@@ -2176,83 +2197,94 @@ def cross_carrier_impact_per_scenario(
         )
         return
 
-    n = len(nets)
-    n_cols = min(3, n)
-    n_rows = (n + n_cols - 1) // n_cols
-    fig = make_subplots(
-        rows=n_rows, cols=n_cols,
-        subplot_titles=[pretty_scenario(nt) for nt in nets],
-        shared_yaxes=False,
-        horizontal_spacing=0.07, vertical_spacing=0.18,
-    )
-
-    # Find a global y-range so subplots are comparable at a glance.
+    # Find a global y-range across *all* scenarios so subplots remain
+    # comparable across the per-class figures, not just within each.
     y_max = float(agg["impact_abs"].max() or 0.0) * 1.10
     if y_max <= 0:
         y_max = 1.0
 
-    legend_seen: set = set()
-    for idx, nt in enumerate(nets):
-        r = idx // n_cols + 1
-        c = idx % n_cols + 1
-        sub = agg[agg["network_type"] == nt]
-        for target in target_order:
-            sub_t = sub[sub["carrier"] == target]
-            # Reindex over source_order so empty buckets render as zero
-            # and the x-axis is identical across every subplot.
-            ys = [
-                float(sub_t.loc[sub_t["source_carrier"] == s, "impact_abs"].sum())
-                for s in source_order
-            ]
-            show_legend = target not in legend_seen
-            legend_seen.add(target)
-            target_label = _sector_label(target)
-            fig.add_trace(
-                go.Bar(
-                    x=[_sector_label(s) for s in source_order], y=ys,
-                    name=f"→ {target_label}",
-                    marker=dict(
-                        color=_sector_color(target),
-                        line=dict(color="#222", width=0.4),
-                    ),
-                    legendgroup=target,
-                    showlegend=show_legend,
-                    hovertemplate=(
-                        f"scenario={pretty_scenario(nt)}<br>"
-                        "source=%{x}<br>"
-                        f"target={target_label}<br>"
-                        "Σ |impact|=%{y:.4f} MW<extra></extra>"
-                    ),
-                ),
-                row=r, col=c,
-            )
-        fig.update_xaxes(title_text="Source carrier", row=r, col=c)
-        fig.update_yaxes(
-            title_text="Σ |impact| (MW)", range=[0, y_max], row=r, col=c,
+    Path(output_dir).mkdir(exist_ok=True, parents=True)
+
+    def _emit(nt_subset, class_label):
+        n = len(nt_subset)
+        n_cols = min(3, n)
+        n_rows = (n + n_cols - 1) // n_cols
+        fig = make_subplots(
+            rows=n_rows, cols=n_cols,
+            subplot_titles=[pretty_scenario(nt) for nt in nt_subset],
+            shared_yaxes=False,
+            horizontal_spacing=0.07, vertical_spacing=0.18,
         )
 
-    fig.update_layout(
-        barmode="group",
-        height=300 * n_rows + 80,
-        width=420 * n_cols,
-        template=eval.CMRES_TEMPLATE,
-        legend=dict(title="Impacted carrier"),
-        margin={"l": 70, "b": 60, "r": 30, "t": 70},
-    )
+        legend_seen: set = set()
+        for idx, nt in enumerate(nt_subset):
+            r = idx // n_cols + 1
+            c = idx % n_cols + 1
+            sub = agg[agg["network_type"] == nt]
+            for target in target_order:
+                sub_t = sub[sub["carrier"] == target]
+                ys = [
+                    float(sub_t.loc[sub_t["source_carrier"] == s, "impact_abs"].sum())
+                    for s in source_order
+                ]
+                show_legend = target not in legend_seen
+                legend_seen.add(target)
+                target_label = _sector_label(target)
+                fig.add_trace(
+                    go.Bar(
+                        x=[_sector_label(s) for s in source_order], y=ys,
+                        name=f"→ {target_label}",
+                        marker=dict(
+                            color=_sector_color(target),
+                            line=dict(color="#222", width=0.4),
+                        ),
+                        legendgroup=target,
+                        showlegend=show_legend,
+                        hovertemplate=(
+                            f"scenario={pretty_scenario(nt)}<br>"
+                            "source=%{x}<br>"
+                            f"target={target_label}<br>"
+                            "Σ |impact|=%{y:.4f} MW<extra></extra>"
+                        ),
+                    ),
+                    row=r, col=c,
+                )
+            fig.update_xaxes(title_text="Source carrier", row=r, col=c)
+            fig.update_yaxes(
+                title_text="Σ |impact| (MW)", range=[0, y_max], row=r, col=c,
+            )
 
-    Path(output_dir).mkdir(exist_ok=True, parents=True)
-    eval.write_all_in_one(
-        [fig], "Figure", Path("."),
-        output_dir + "/cross_carrier_impact_per_scenario.html",
-        titles=[
-            f"Cross-carrier impact per scenario "
-            f"(n_scenarios={n}, source × target, no averaging)"
-        ],
-    )
-    print(
-        f"Cross-carrier impact: {n} scenarios → "
-        f"{output_dir}/cross_carrier_impact_per_scenario.html"
-    )
+        suffix = f" ({class_label})" if class_label else ""
+        slug_suffix = f"_{class_label}" if class_label else ""
+        fig.update_layout(
+            barmode="group",
+            height=300 * n_rows + 80,
+            width=420 * n_cols,
+            template=eval.CMRES_TEMPLATE,
+            legend=dict(title="Impacted carrier"),
+            margin={"l": 70, "b": 60, "r": 30, "t": 70},
+            title=f"Cross-carrier impact per scenario{suffix}",
+        )
+        eval.write_all_in_one(
+            [fig], "Figure", Path("."),
+            f"{output_dir}/cross_carrier_impact_per_scenario{slug_suffix}.html",
+            titles=[
+                f"Cross-carrier impact per scenario{suffix} "
+                f"(n_scenarios={n}, source × target, no averaging)"
+            ],
+        )
+        print(
+            f"Cross-carrier impact{suffix}: {n} scenarios → "
+            f"{output_dir}/cross_carrier_impact_per_scenario{slug_suffix}.html"
+        )
+
+    # Split by stress class so 22 scenarios don't become 8 subplot rows.
+    classes = _ec.split_scenarios_by_stress(nets)
+    if len(classes) <= 1:
+        _emit(nets, class_label="")
+    else:
+        for cl, types in classes:
+            _emit([nt for nt in nets if nt in set(types)], class_label=cl)
 
 
 def cross_carrier_impact_aggregated(
@@ -2468,11 +2500,15 @@ def cross_carrier_impact_aggregated(
     )
 
 
-def pooled_metric_comparison(pooled_df, output_dir):
+def pooled_metric_comparison(pooled_df, output_dir, class_label: str = ""):
     """Run metric comparison figures on data pooled across all network types.
 
     pooled_df must have the same columns as the per-network df produced by
     cp_metric_vs_actual_impact, plus a 'network_type' column.
+
+    ``class_label`` (``"baseline"`` / ``"relaxed"`` / ``""``) is appended to
+    the output filename so the caller can split the pooled view by stress
+    class without overwriting a single shared HTML.
     """
     import numpy as _np
     import plotly.graph_objects as go
@@ -2881,14 +2917,18 @@ def pooled_metric_comparison(pooled_df, output_dir):
         )
 
     Path(output_dir).mkdir(exist_ok=True, parents=True)
+    slug_suffix = f"_{class_label}" if class_label else ""
+    suffix_h = f" ({class_label})" if class_label else ""
+    out_path = f"{output_dir}/cp_metric_vs_actual_pooled{slug_suffix}.html"
     eval.write_all_in_one(
         figures, "Figure", Path("."),
-        output_dir + "/cp_metric_vs_actual_pooled.html",
-        titles=titles,
+        out_path,
+        titles=[f"{t}{suffix_h}" for t in titles],
     )
     print(
-        f"Written pooled metric comparison (MC-sampled n={n_total} of {n_all} matched) "
-        f"to {output_dir}/cp_metric_vs_actual_pooled.html"
+        f"Written pooled metric comparison{suffix_h} "
+        f"(MC-sampled n={n_total} of {n_all} matched) "
+        f"to {out_path}"
     )
 
 
@@ -3046,8 +3086,22 @@ def evaluate(folder_id):
 
     if len(per_network_dfs) > 1:
         pooled_df = pandas.concat(per_network_dfs, ignore_index=True)
-        pooled_metric_comparison(pooled_df, OUTPUT + "/pooled")
-        cp_only_pooled_metric_comparison(pooled_df, OUTPUT + "/pooled")
+        # Split by stress class so the per-metric scatter grid + Spearman
+        # heatmap stay readable when both baseline and ``_relaxed`` networks
+        # are present (legacy single-class runs collapse to the original
+        # unsuffixed filename).
+        nets = list(pooled_df["network_type"].drop_duplicates())
+        classes = _ec.split_scenarios_by_stress(nets)
+        if len(classes) <= 1:
+            pooled_metric_comparison(pooled_df, OUTPUT + "/pooled")
+            cp_only_pooled_metric_comparison(pooled_df, OUTPUT + "/pooled")
+        else:
+            for cl, types in classes:
+                sub = pooled_df[pooled_df["network_type"].isin(types)]
+                pooled_metric_comparison(sub, OUTPUT + "/pooled", class_label=cl)
+                cp_only_pooled_metric_comparison(
+                    sub, OUTPUT + "/pooled", class_label=cl
+                )
     elif len(per_network_dfs) == 1:
         print("Only one network type found — skipping pooled metric analysis.")
         cp_only_pooled_metric_comparison(per_network_dfs[0], OUTPUT + "/pooled")

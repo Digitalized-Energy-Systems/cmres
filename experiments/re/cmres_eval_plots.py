@@ -20,7 +20,12 @@ Style conventions (matching the rest of the repo)
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence
+
+from eval_common import split_scenarios_by_stress  # noqa: E402  # canonical
+                                                  # baseline / `_relaxed`
+                                                  # partition, used by every
+                                                  # cross-scenario plotter.
 
 import numpy as np
 import pandas as pd
@@ -415,13 +420,17 @@ def plot_e2_ablation(input_dir: Path, output_dir: Path) -> Optional[Path]:
         titles.append(f"E2 ablation — {pretty_scenario(scenario)}")
         slugs.append(f"e2_ablation_{scenario}")
 
-    # Pooled heatmap of Δ vs full (signed, diverging).
-    delta = pooled[pooled["variant"] != "full"].pivot_table(
-        index="scenario", columns="variant", values="delta_vs_full",
-    )
-    delta = delta.reindex(columns=[v for v in _VARIANT_ORDER if v != "full"])
-    delta = delta.reindex(index=_scenario_order(delta.index))
-    if not delta.empty:
+    # Pooled heatmap of Δ vs full (signed, diverging) — split by stress
+    # class when both baseline and ``_relaxed`` scenarios are present so a
+    # 22-row matrix doesn't overflow the printed page.
+    def _emit_delta_heatmap(sub_pooled, class_label):
+        delta = sub_pooled[sub_pooled["variant"] != "full"].pivot_table(
+            index="scenario", columns="variant", values="delta_vs_full",
+        )
+        delta = delta.reindex(columns=[v for v in _VARIANT_ORDER if v != "full"])
+        delta = delta.reindex(index=_scenario_order(delta.index))
+        if delta.empty:
+            return
         z = delta.values
         zmax = float(np.nanmax(np.abs(z))) if np.isfinite(z).any() else 0.5
         zmax = max(zmax, 0.05)
@@ -437,14 +446,26 @@ def plot_e2_ablation(input_dir: Path, output_dir: Path) -> Optional[Path]:
             text=text, texttemplate="%{text}",
             hovertemplate="<b>%{y}</b><br>%{x}: Δρ = %{z:+.3f}<extra></extra>",
         ))
+        title_suffix = f" ({class_label})" if class_label else ""
+        slug_suffix = f"_{class_label}" if class_label else ""
         heat.update_layout(**_layout(
-            title="E2 — Per-factor ablation effect (Δρ vs full) across scenarios",
+            title=(
+                "E2 — Per-factor ablation effect (Δρ vs full) across scenarios"
+                + title_suffix
+            ),
             xaxis=dict(title=""), yaxis=dict(title=""),
             height=80 + 36 * len(delta.index), width=860,
         ))
         figs.append(heat)
-        titles.append("E2 ablation — pooled Δρ heatmap")
-        slugs.append("e2_ablation_pooled_heatmap")
+        titles.append(f"E2 ablation — pooled Δρ heatmap{title_suffix}")
+        slugs.append(f"e2_ablation_pooled_heatmap{slug_suffix}")
+
+    classes = split_scenarios_by_stress(pooled["scenario"].drop_duplicates())
+    if len(classes) <= 1:
+        _emit_delta_heatmap(pooled, class_label="")
+    else:
+        for cl, scens in classes:
+            _emit_delta_heatmap(pooled[pooled["scenario"].isin(scens)], class_label=cl)
 
     return _emit(figs, titles, slugs, output_dir / "E2_ablation.html",
                  "E2 — Predicted-score ablation")
@@ -703,83 +724,115 @@ def plot_e7_mc_validity(input_dir: Path, output_dir: Path) -> Optional[Path]:
     titles: List[str] = []
     slugs: List[str] = []
 
+    def _slug(base, class_label):
+        return f"{base}_{class_label}" if class_label else base
+
+    def _title_suffix(class_label):
+        return f" ({class_label})" if class_label else ""
+
+    def _emit_rhw(sub_rhw, class_label):
+        scenarios = _scenario_order(sub_rhw["scenario"].unique())
+        if not scenarios:
+            return
+        ncols = min(3, len(scenarios))
+        nrows = int(np.ceil(len(scenarios) / ncols))
+        fig = make_subplots(
+            rows=nrows, cols=ncols,
+            subplot_titles=[pretty_scenario(s) for s in scenarios],
+            horizontal_spacing=0.07, vertical_spacing=0.16,
+            shared_xaxes=False,
+        )
+        for i, s in enumerate(scenarios):
+            r = i // ncols + 1
+            c = i % ncols + 1
+            sub = sub_rhw[sub_rhw["scenario"] == s]
+            for k, carrier in enumerate(["power", "heat", "gas"]):
+                cur = sub[sub["carrier"] == carrier].sort_values("n")
+                if cur.empty:
+                    continue
+                fig.add_trace(go.Scatter(
+                    x=cur["n"], y=cur["rhw"],
+                    mode="lines+markers",
+                    name=carrier, legendgroup=carrier,
+                    showlegend=(i == 0),
+                    line=dict(color=CARRIER_COLORS[carrier], width=2),
+                    marker=dict(size=6, color=CARRIER_COLORS[carrier],
+                                line=dict(color="#222", width=0.4)),
+                    hovertemplate=("<b>" + carrier + "</b><br>n = %{x}"
+                                   "<br>RHW = %{y:.4f}<extra></extra>"),
+                ), row=r, col=c)
+            fig.add_hline(y=0.05, line=dict(color="#444", width=1, dash="dash"),
+                          row=r, col=c)
+            fig.update_xaxes(title_text="MC samples n", type="log", row=r, col=c)
+            fig.update_yaxes(title_text="Relative half-width" if c == 1 else "",
+                             type="log", row=r, col=c)
+        fig.update_layout(**_layout(
+            title=(
+                "E7 — RHW(n) convergence per carrier (target = 0.05, dashed)"
+                + _title_suffix(class_label)
+            ),
+            height=320 * nrows + 60, width=370 * ncols,
+            legend=dict(title="Carrier", orientation="h",
+                        y=-0.10, x=0.5, xanchor="center"),
+        ))
+        figs.append(fig)
+        titles.append(f"E7 RHW convergence{_title_suffix(class_label)}")
+        slugs.append(_slug("e7_rhw_convergence", class_label))
+
+    def _emit_av(sub_s, class_label):
+        if sub_s.empty:
+            return
+        sub_s = sub_s.sort_values("AV_reduction_factor", na_position="first")
+        colors = ["#388e3c" if (np.isfinite(v) and v > 1.0) else "#d32f2f"
+                  for v in sub_s["AV_reduction_factor"]]
+        fig = go.Figure(go.Bar(
+            y=[pretty_scenario(x) for x in sub_s["scenario"]],
+            x=sub_s["AV_reduction_factor"],
+            orientation="h",
+            marker=dict(color=colors, line=dict(color="#222", width=0.6)),
+            text=[f"{v:.2f}×" if np.isfinite(v) else "n/a"
+                  for v in sub_s["AV_reduction_factor"]],
+            textposition="outside", cliponaxis=False,
+            hovertemplate=("<b>%{y}</b><br>AV reduction = %{x:.3f}×"
+                           "<br>n_runs = %{customdata[0]}<extra></extra>"),
+            customdata=np.c_[sub_s["n_runs"].values] if "n_runs" in sub_s else None,
+            showlegend=False,
+        ))
+        fig.add_vline(x=1.0, line=dict(color="#444", width=1.2, dash="dash"),
+                      annotation_text="no reduction", annotation_position="top")
+        fig.update_layout(**_layout(
+            title=(
+                "E7 — Antithetic-variates variance-reduction factor"
+                + _title_suffix(class_label)
+            ),
+            xaxis=dict(title="Var(naive) / [2 · Var(pair-mean)]",
+                       gridcolor="#e5e5e5"),
+            yaxis=dict(title=""),
+            height=80 + 36 * len(sub_s), width=820,
+        ))
+        figs.append(fig)
+        titles.append(f"E7 AV reduction factor{_title_suffix(class_label)}")
+        slugs.append(_slug("e7_av_reduction_factor", class_label))
+
     if rhw_path.exists():
         rhw = pd.read_csv(rhw_path)
         if not rhw.empty:
-            scenarios = _scenario_order(rhw["scenario"].unique())
-            ncols = min(3, len(scenarios))
-            nrows = int(np.ceil(len(scenarios) / ncols))
-            fig = make_subplots(
-                rows=nrows, cols=ncols,
-                subplot_titles=[pretty_scenario(s) for s in scenarios],
-                horizontal_spacing=0.07, vertical_spacing=0.16,
-                shared_xaxes=False,
-            )
-            for i, s in enumerate(scenarios):
-                r = i // ncols + 1
-                c = i % ncols + 1
-                sub = rhw[rhw["scenario"] == s]
-                for k, carrier in enumerate(["power", "heat", "gas"]):
-                    cur = sub[sub["carrier"] == carrier].sort_values("n")
-                    if cur.empty:
-                        continue
-                    fig.add_trace(go.Scatter(
-                        x=cur["n"], y=cur["rhw"],
-                        mode="lines+markers",
-                        name=carrier, legendgroup=carrier,
-                        showlegend=(i == 0),
-                        line=dict(color=CARRIER_COLORS[carrier], width=2),
-                        marker=dict(size=6, color=CARRIER_COLORS[carrier],
-                                    line=dict(color="#222", width=0.4)),
-                        hovertemplate=("<b>" + carrier + "</b><br>n = %{x}"
-                                       "<br>RHW = %{y:.4f}<extra></extra>"),
-                    ), row=r, col=c)
-                fig.add_hline(y=0.05, line=dict(color="#444", width=1, dash="dash"),
-                              row=r, col=c)
-                fig.update_xaxes(title_text="MC samples n", type="log", row=r, col=c)
-                fig.update_yaxes(title_text="Relative half-width" if c == 1 else "",
-                                 type="log", row=r, col=c)
-            fig.update_layout(**_layout(
-                title="E7 — RHW(n) convergence per carrier (target = 0.05, dashed)",
-                height=320 * nrows + 60, width=370 * ncols,
-                legend=dict(title="Carrier", orientation="h",
-                            y=-0.10, x=0.5, xanchor="center"),
-            ))
-            figs.append(fig)
-            titles.append("E7 RHW convergence")
-            slugs.append("e7_rhw_convergence")
+            classes = split_scenarios_by_stress(rhw["scenario"].drop_duplicates())
+            if len(classes) <= 1:
+                _emit_rhw(rhw, class_label="")
+            else:
+                for cl, scens in classes:
+                    _emit_rhw(rhw[rhw["scenario"].isin(scens)], class_label=cl)
 
     if sum_path.exists():
         s = pd.read_csv(sum_path)
         if not s.empty and "AV_reduction_factor" in s.columns:
-            s = s.sort_values("AV_reduction_factor", na_position="first")
-            colors = ["#388e3c" if (np.isfinite(v) and v > 1.0) else "#d32f2f"
-                      for v in s["AV_reduction_factor"]]
-            fig = go.Figure(go.Bar(
-                y=[pretty_scenario(x) for x in s["scenario"]],
-                x=s["AV_reduction_factor"],
-                orientation="h",
-                marker=dict(color=colors, line=dict(color="#222", width=0.6)),
-                text=[f"{v:.2f}×" if np.isfinite(v) else "n/a"
-                      for v in s["AV_reduction_factor"]],
-                textposition="outside", cliponaxis=False,
-                hovertemplate=("<b>%{y}</b><br>AV reduction = %{x:.3f}×"
-                               "<br>n_runs = %{customdata[0]}<extra></extra>"),
-                customdata=np.c_[s["n_runs"].values] if "n_runs" in s else None,
-                showlegend=False,
-            ))
-            fig.add_vline(x=1.0, line=dict(color="#444", width=1.2, dash="dash"),
-                          annotation_text="no reduction", annotation_position="top")
-            fig.update_layout(**_layout(
-                title="E7 — Antithetic-variates variance-reduction factor",
-                xaxis=dict(title="Var(naive) / [2 · Var(pair-mean)]",
-                           gridcolor="#e5e5e5"),
-                yaxis=dict(title=""),
-                height=80 + 36 * len(s), width=820,
-            ))
-            figs.append(fig)
-            titles.append("E7 AV reduction factor")
-            slugs.append("e7_av_reduction_factor")
+            classes = split_scenarios_by_stress(s["scenario"].drop_duplicates())
+            if len(classes) <= 1:
+                _emit_av(s, class_label="")
+            else:
+                for cl, scens in classes:
+                    _emit_av(s[s["scenario"].isin(scens)], class_label=cl)
 
     if not figs:
         return None
@@ -1074,51 +1127,66 @@ def plot_e11_null_models(input_dir: Path, output_dir: Path) -> Optional[Path]:
     slugs: List[str] = []
 
     # One panel per statistic: grouped bar, x = scenario, group = null kind,
-    # y = z-score, with shaded |z| > 1.96 region.
+    # y = z-score, with shaded |z| > 1.96 region. Split by stress class when
+    # both baseline and ``_relaxed`` scenarios are present so the per-stat
+    # panel widths stay readable.
     stats = list(df["statistic"].drop_duplicates())
     nulls = sorted(df["null_kind"].dropna().unique())
     null_color = {k: QUAL[i % len(QUAL)] for i, k in enumerate(nulls)}
 
-    fig = make_subplots(
-        rows=1, cols=len(stats),
-        subplot_titles=stats, shared_yaxes=True, horizontal_spacing=0.05,
-    )
-    for j, stat in enumerate(stats, start=1):
-        sub_stat = df[df["statistic"] == stat]
-        scens = _scenario_order(sub_stat["scenario"].unique())
-        for k in nulls:
-            sub = sub_stat[sub_stat["null_kind"] == k].set_index("scenario")
-            sub = sub.reindex(scens)
-            fig.add_trace(go.Bar(
-                x=[pretty_scenario(s) for s in scens],
-                y=sub["z"],
-                name=k, legendgroup=k, showlegend=(j == 1),
-                marker=dict(color=null_color[k],
-                            line=dict(color="#222", width=0.5)),
-                hovertemplate=("<b>%{x}</b><br>z = %{y:+.2f}"
-                               "<br>obs = %{customdata[0]:.3f}"
-                               "<br>null μ = %{customdata[1]:.3f}"
-                               " ± %{customdata[2]:.3f}"
-                               "<extra>" + stat + " · " + k + "</extra>"),
-                customdata=np.c_[sub["observed"].values,
-                                 sub["null_mean"].values,
-                                 sub["null_std"].values],
-            ), row=1, col=j)
-        fig.add_hrect(y0=-1.96, y1=1.96, fillcolor="rgba(180,180,180,0.18)",
-                      line_width=0, row=1, col=j)
-        fig.add_hline(y=0, line=dict(color="#444", width=1), row=1, col=j)
-        fig.update_xaxes(tickangle=30, row=1, col=j)
-    fig.update_yaxes(title_text="z-score (vs null)", row=1, col=1)
-    fig.update_layout(**_layout(
-        title="E11 — Observed structural quantities vs null ensembles (|z|>1.96 shaded)",
-        barmode="group",
-        height=560, width=max(640, 380 * len(stats)),
-        legend=dict(title="Null model", orientation="h",
-                    y=-0.25, x=0.5, xanchor="center"),
-    ))
-    figs.append(fig)
-    titles.append("E11 null z-scores")
-    slugs.append("e11_null_z_scores")
+    def _emit_null_z(sub_df, class_label):
+        fig = make_subplots(
+            rows=1, cols=len(stats),
+            subplot_titles=stats, shared_yaxes=True, horizontal_spacing=0.05,
+        )
+        for j, stat in enumerate(stats, start=1):
+            sub_stat = sub_df[sub_df["statistic"] == stat]
+            scens = _scenario_order(sub_stat["scenario"].unique())
+            for k in nulls:
+                sub = sub_stat[sub_stat["null_kind"] == k].set_index("scenario")
+                sub = sub.reindex(scens)
+                fig.add_trace(go.Bar(
+                    x=[pretty_scenario(s) for s in scens],
+                    y=sub["z"],
+                    name=k, legendgroup=k, showlegend=(j == 1),
+                    marker=dict(color=null_color[k],
+                                line=dict(color="#222", width=0.5)),
+                    hovertemplate=("<b>%{x}</b><br>z = %{y:+.2f}"
+                                   "<br>obs = %{customdata[0]:.3f}"
+                                   "<br>null μ = %{customdata[1]:.3f}"
+                                   " ± %{customdata[2]:.3f}"
+                                   "<extra>" + stat + " · " + k + "</extra>"),
+                    customdata=np.c_[sub["observed"].values,
+                                     sub["null_mean"].values,
+                                     sub["null_std"].values],
+                ), row=1, col=j)
+            fig.add_hrect(y0=-1.96, y1=1.96, fillcolor="rgba(180,180,180,0.18)",
+                          line_width=0, row=1, col=j)
+            fig.add_hline(y=0, line=dict(color="#444", width=1), row=1, col=j)
+            fig.update_xaxes(tickangle=30, row=1, col=j)
+        fig.update_yaxes(title_text="z-score (vs null)", row=1, col=1)
+        title_suffix = f" ({class_label})" if class_label else ""
+        slug_suffix = f"_{class_label}" if class_label else ""
+        fig.update_layout(**_layout(
+            title=(
+                "E11 — Observed structural quantities vs null ensembles "
+                "(|z|>1.96 shaded)" + title_suffix
+            ),
+            barmode="group",
+            height=560, width=max(640, 380 * len(stats)),
+            legend=dict(title="Null model", orientation="h",
+                        y=-0.25, x=0.5, xanchor="center"),
+        ))
+        figs.append(fig)
+        titles.append(f"E11 null z-scores{title_suffix}")
+        slugs.append(f"e11_null_z_scores{slug_suffix}")
+
+    classes = split_scenarios_by_stress(df["scenario"].drop_duplicates())
+    if len(classes) <= 1:
+        _emit_null_z(df, class_label="")
+    else:
+        for cl, scens in classes:
+            _emit_null_z(df[df["scenario"].isin(scens)], class_label=cl)
 
     return _emit(figs, titles, slugs, Path(output_dir) / "E11_null_models.html",
                  "E11 — Null-model z-scores")
@@ -1860,24 +1928,6 @@ def _e16_per_sector_heatmap(df: pd.DataFrame) -> go.Figure:
     return heat
 
 
-_E16_RELAXED_SUFFIX = "_relaxed"
-
-
-def _e16_split_scenarios_by_stress(scenarios) -> List[Tuple[str, List[str]]]:
-    """Group scenario keys by stress class — ``baseline`` vs ``relaxed``.
-    Empty classes are dropped so a legacy run with no ``_relaxed`` grids
-    collapses to a single group and the figures keep their unsuffixed
-    slugs / titles."""
-    baseline = [s for s in scenarios if not str(s).endswith(_E16_RELAXED_SUFFIX)]
-    relaxed  = [s for s in scenarios if     str(s).endswith(_E16_RELAXED_SUFFIX)]
-    out: List[Tuple[str, List[str]]] = []
-    if baseline:
-        out.append(("baseline", baseline))
-    if relaxed:
-        out.append(("relaxed", relaxed))
-    return out
-
-
 def plot_e16_single_removal(input_dir: Path, output_dir: Path) -> Optional[Path]:
     """Per-metric ρ vs analytical shed AND vs MC, with the ceiling
     (ρ_shed_vs_mc) drawn as a hatched reference for each scenario.
@@ -2062,7 +2112,7 @@ def plot_e16_single_removal(input_dir: Path, output_dir: Path) -> Optional[Path]
     # Cross-scenario figures: one set per stress class (or one combined set
     # if only baselines are present, preserving legacy slug names).
     all_scenarios = list(df["scenario"].drop_duplicates())
-    classes = _e16_split_scenarios_by_stress(all_scenarios)
+    classes = split_scenarios_by_stress(all_scenarios)
     if len(classes) <= 1:
         _emit_cross_scenario(df, pooled_files_all, ceil, class_label="")
         scenario_order_for_bars = (

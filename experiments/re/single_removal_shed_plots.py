@@ -382,13 +382,19 @@ def _grid_order(grids: List[str]) -> List[str]:
     return known + rest
 
 
-_RELAXED_SUFFIX = "_relaxed"
+# Canonical stress-class helpers live in eval_common so every cross-scenario
+# plotter shares the same partitioning logic.
+from eval_common import (  # noqa: E402
+    RELAXED_SUFFIX as _RELAXED_SUFFIX,
+    is_relaxed as _is_relaxed,
+    split_scenarios_by_stress as _split_scenarios_by_stress,
+)
 
 
 def _grid_base(g: str) -> str:
     """Strip the ``_relaxed`` suffix so each (baseline, relaxed) pair
     resolves to the same key for palette / order purposes."""
-    return g[: -len(_RELAXED_SUFFIX)] if g.endswith(_RELAXED_SUFFIX) else g
+    return g[: -len(_RELAXED_SUFFIX)] if _is_relaxed(g) else g
 
 
 def _grid_color_map(grids: List[str]) -> Dict[str, str]:
@@ -413,28 +419,13 @@ def _grid_color_map(grids: List[str]) -> Dict[str, str]:
 def _grid_dash(g: str) -> str:
     """Line dash style: ``dash`` for ``_relaxed`` variants, ``solid`` otherwise.
     Use on Scatter ``line`` to keep paired curves distinguishable."""
-    return "dash" if g.endswith(_RELAXED_SUFFIX) else "solid"
+    return "dash" if _is_relaxed(g) else "solid"
 
 
 def _grid_opacity(g: str) -> float:
     """Marker / bar opacity: lighter for ``_relaxed`` variants so paired
     boxes / bars sharing a hue stay visually distinguishable."""
-    return 0.55 if g.endswith(_RELAXED_SUFFIX) else 1.0
-
-
-def _split_by_stress_class(grids: List[str]) -> List[Tuple[str, List[str]]]:
-    """Group grids by stress class — ``baseline`` (no suffix) vs
-    ``relaxed`` (``_relaxed`` suffix). Empty classes are dropped so the
-    legacy 11-grid case collapses to a single group and emits identical
-    filenames as before the relaxed variants were introduced."""
-    baseline = [g for g in grids if not g.endswith(_RELAXED_SUFFIX)]
-    relaxed  = [g for g in grids if     g.endswith(_RELAXED_SUFFIX)]
-    out: List[Tuple[str, List[str]]] = []
-    if baseline:
-        out.append(("baseline", baseline))
-    if relaxed:
-        out.append(("relaxed", relaxed))
-    return out
+    return 0.55 if _is_relaxed(g) else 1.0
 
 
 def _pooled_baseline(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
@@ -879,7 +870,7 @@ def plot_pooled(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
     sites that ignore the return value).
     """
     grids = _grid_order(list(records))
-    classes = _split_by_stress_class(grids)
+    classes = _split_scenarios_by_stress(grids)
 
     if len(classes) <= 1:
         # Legacy / single-class run — emit unsuffixed filenames.
