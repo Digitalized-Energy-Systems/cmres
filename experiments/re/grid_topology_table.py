@@ -44,7 +44,24 @@ SCENARIO_LABEL = {
     "simbench_lv_same_cap":                 "LV-m-eq",
     "simbench_lv_high_same_cap":            "LV-l-eq",
     "simbench_lv_xl_same_cap":              "LV-xl-eq",
-    "simbench_lv_xxl_same_cap":        "LV-xxl-eq",
+    "simbench_lv_xxl_same_cap":             "LV-xxl-eq",
+
+    # ``_relaxed`` variants: 20 % carrier headroom over demand, split evenly
+    # between in-grid generation (+10 %) and slack budget (+10 %). Suffixed
+    # ``-r`` in display labels so the tables/plots stay compact.
+    "simbench_lv_no_relaxed":               "LV-no-r",
+
+    "simbench_lv_low_relaxed":              "LV-s-r",
+    "simbench_lv_relaxed":                  "LV-m-r",
+    "simbench_lv_high_relaxed":             "LV-l-r",
+    "simbench_lv_xl_relaxed":               "LV-xl-r",
+    "simbench_lv_xxl_relaxed":              "LV-xxl-r",
+
+    "simbench_lv_low_same_cap_relaxed":     "LV-s-eq-r",
+    "simbench_lv_same_cap_relaxed":         "LV-m-eq-r",
+    "simbench_lv_high_same_cap_relaxed":    "LV-l-eq-r",
+    "simbench_lv_xl_same_cap_relaxed":      "LV-xl-eq-r",
+    "simbench_lv_xxl_same_cap_relaxed":     "LV-xxl-eq-r",
 }
 
 

@@ -470,6 +470,19 @@ except Exception:  # pragma: no cover
         "simbench_lv_high_same_cap":     "LV-l-eq",
         "simbench_lv_xl_same_cap":       "LV-xl-eq",
         "simbench_lv_xxl_same_cap":      "LV-xxl-eq",
+        # ``_relaxed`` variants (20 % headroom, split 50/50 gen/slack) —
+        # mirror the entries in grid_topology_table.SCENARIO_LABEL.
+        "simbench_lv_no_relaxed":               "LV-no-r",
+        "simbench_lv_low_relaxed":              "LV-s-r",
+        "simbench_lv_relaxed":                  "LV-m-r",
+        "simbench_lv_high_relaxed":             "LV-l-r",
+        "simbench_lv_xl_relaxed":               "LV-xl-r",
+        "simbench_lv_xxl_relaxed":              "LV-xxl-r",
+        "simbench_lv_low_same_cap_relaxed":     "LV-s-eq-r",
+        "simbench_lv_same_cap_relaxed":         "LV-m-eq-r",
+        "simbench_lv_high_same_cap_relaxed":    "LV-l-eq-r",
+        "simbench_lv_xl_same_cap_relaxed":      "LV-xl-eq-r",
+        "simbench_lv_xxl_same_cap_relaxed":     "LV-xxl-eq-r",
     }
 
 # Public alias kept for backwards compatibility — downstream modules
@@ -2885,8 +2898,15 @@ def _scenario_density_distribution(network_type: str):
     Returns ``(None, None)`` for scenarios that don't follow the
     ``simbench_lv[...]`` naming convention so the CMRES E3/E4
     experiments can simply skip them.
+
+    The ``_relaxed`` suffix (20 % carrier headroom variant, see
+    ``test_grids._apply_headroom``) is stripped first because it's a stress
+    knob, not a topology variant — the relaxed grid has the same CP density
+    and distribution as its baseline counterpart.
     """
     name = str(network_type)
+    if name.endswith("_relaxed"):
+        name = name[: -len("_relaxed")]
     distribution = "centralized" if "centralized" in name else "distributed"
     if name.endswith("_no") or name == "simbench_lv_no":
         return 0.0, distribution

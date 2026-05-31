@@ -382,9 +382,59 @@ def _grid_order(grids: List[str]) -> List[str]:
     return known + rest
 
 
+_RELAXED_SUFFIX = "_relaxed"
+
+
+def _grid_base(g: str) -> str:
+    """Strip the ``_relaxed`` suffix so each (baseline, relaxed) pair
+    resolves to the same key for palette / order purposes."""
+    return g[: -len(_RELAXED_SUFFIX)] if g.endswith(_RELAXED_SUFFIX) else g
+
+
 def _grid_color_map(grids: List[str]) -> Dict[str, str]:
+    """Stable colour per grid, with baseline and ``_relaxed`` variants
+    sharing a hue so the eye groups them. Differentiation between the
+    members of a pair is carried by ``_grid_dash`` (Scatter lines) and
+    ``_grid_opacity`` (Bars / Boxes). Palette indexes by *base* name in
+    first-seen order so adding the 11 relaxed variants doesn't shift
+    colours on the legacy plots."""
     palette = list(ev.PALETTE_QUAL)
-    return {g: palette[i % len(palette)] for i, g in enumerate(grids)}
+    bases_in_order: List[str] = []
+    seen: set = set()
+    for g in grids:
+        b = _grid_base(g)
+        if b not in seen:
+            bases_in_order.append(b)
+            seen.add(b)
+    base_color = {b: palette[i % len(palette)] for i, b in enumerate(bases_in_order)}
+    return {g: base_color[_grid_base(g)] for g in grids}
+
+
+def _grid_dash(g: str) -> str:
+    """Line dash style: ``dash`` for ``_relaxed`` variants, ``solid`` otherwise.
+    Use on Scatter ``line`` to keep paired curves distinguishable."""
+    return "dash" if g.endswith(_RELAXED_SUFFIX) else "solid"
+
+
+def _grid_opacity(g: str) -> float:
+    """Marker / bar opacity: lighter for ``_relaxed`` variants so paired
+    boxes / bars sharing a hue stay visually distinguishable."""
+    return 0.55 if g.endswith(_RELAXED_SUFFIX) else 1.0
+
+
+def _split_by_stress_class(grids: List[str]) -> List[Tuple[str, List[str]]]:
+    """Group grids by stress class — ``baseline`` (no suffix) vs
+    ``relaxed`` (``_relaxed`` suffix). Empty classes are dropped so the
+    legacy 11-grid case collapses to a single group and emits identical
+    filenames as before the relaxed variants were introduced."""
+    baseline = [g for g in grids if not g.endswith(_RELAXED_SUFFIX)]
+    relaxed  = [g for g in grids if     g.endswith(_RELAXED_SUFFIX)]
+    out: List[Tuple[str, List[str]]] = []
+    if baseline:
+        out.append(("baseline", baseline))
+    if relaxed:
+        out.append(("relaxed", relaxed))
+    return out
 
 
 def _pooled_baseline(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
@@ -444,6 +494,7 @@ def _pooled_total_shed_box(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
         fig.add_trace(go.Box(
             y=sweep["total_shed"], x=[pretty_scenario(g)] * len(sweep),
             name=pretty_scenario(g), marker_color=color[g],
+            opacity=_grid_opacity(g),
             boxpoints="outliers", showlegend=False,
             hovertemplate=("<b>" + pretty_scenario(g)
                            + "</b><br>total_shed = %{y:.4f} MW<extra></extra>"),
@@ -488,6 +539,7 @@ def _pooled_excess_shed_box(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
         fig.add_trace(go.Box(
             y=positive, x=[pretty_scenario(g)] * len(positive),
             name=pretty_scenario(g), marker_color=color[g],
+            opacity=_grid_opacity(g),
             boxpoints="outliers", showlegend=False,
             hovertemplate=("<b>" + pretty_scenario(g)
                            + "</b><br>Δ shed = %{y:.4f} MW<extra></extra>"),
@@ -527,7 +579,7 @@ def _pooled_pareto(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
         fig.add_trace(go.Scatter(
             x=ranks, y=cum_share, mode="lines",
             name=pretty_scenario(g),
-            line=dict(color=color[g], width=2),
+            line=dict(color=color[g], width=2, dash=_grid_dash(g)),
             hovertemplate=("<b>" + pretty_scenario(g)
                            + "</b><br>rank %{x}<br>cum. share %{y:.1%}"
                            "<extra></extra>"),
@@ -613,6 +665,7 @@ def _pooled_kind_summary(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
             name=pretty_scenario(g),
             x=sub["kind"], y=sub["mean"],
             marker_color=color[g],
+            opacity=_grid_opacity(g),
             hovertemplate=("<b>" + pretty_scenario(g)
                            + "</b><br>kind = %{x}<br>mean shed = %{y:.4f} MW"
                            "<br>n = %{customdata[0]}<extra></extra>"),
@@ -695,6 +748,7 @@ def _pooled_solve_time(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
         fig.add_trace(go.Box(
             y=sweep["elapsed_s"], x=[pretty_scenario(g)] * len(sweep),
             name=pretty_scenario(g), marker_color=color[g],
+            opacity=_grid_opacity(g),
             boxpoints="outliers", showlegend=False,
             hovertemplate=("<b>" + pretty_scenario(g)
                            + "</b><br>elapsed = %{y:.2f} s<extra></extra>"),
@@ -755,15 +809,17 @@ def _pooled_top_components(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
     return _srs_finalize(fig, legend="right")
 
 
-def plot_pooled(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
-                out_dir: Path) -> Path:
-    """Pooled cross-grid comparison report.
-
-    ``records`` maps grid name → ``(sweep_df, baseline_row)`` from ``_load``.
-    Emits one HTML with the pooled panels plus per-figure PDFs under
-    ``single/`` (slugs are prefixed with ``pooled_``).
+def _emit_pooled_report(
+    records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
+    grids: List[str],
+    out_dir: Path,
+    class_label: str = "",
+) -> Path:
+    """Build the pooled cross-grid figures for one stress-class subset and
+    write them to ``pooled[_<class>]_report.html`` plus per-figure PDFs
+    under ``single/``. ``class_label=""`` keeps the legacy filename so
+    runs with only baseline grids stay byte-identical to before.
     """
-    grids = _grid_order(list(records))
     figs: List[go.Figure] = [
         _pooled_baseline(records, grids),
         _pooled_total_shed_box(records, grids),
@@ -786,7 +842,8 @@ def plot_pooled(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
         "Top-10 components per grid",
         "Solve-time per grid",
     ]
-    slugs = [f"pooled_{s}" for s in (
+    suffix = f"_{class_label}" if class_label else ""
+    slugs = [f"pooled{suffix}_{s}" for s in (
         "baseline",
         "total_shed_box",
         "excess_shed_box",
@@ -797,12 +854,44 @@ def plot_pooled(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
         "top10_components",
         "solve_time",
     )]
-    out_html = out_dir / "pooled_report.html"
-    ev.write_all_in_one(figs, "single-removal shed — pooled across grids",
-                        Path("."), str(out_html),
+    out_html = out_dir / f"pooled{suffix}_report.html"
+    heading = (
+        f"single-removal shed — pooled ({class_label}, {len(grids)} grids)"
+        if class_label
+        else "single-removal shed — pooled across grids"
+    )
+    ev.write_all_in_one(figs, heading, Path("."), str(out_html),
                         write_single_files=True, titles=titles, slugs=slugs)
     print(f"  -> {out_html}")
     return out_html
+
+
+def plot_pooled(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
+                out_dir: Path) -> Path:
+    """Pooled cross-grid comparison report.
+
+    ``records`` maps grid name → ``(sweep_df, baseline_row)`` from ``_load``.
+    When the record set spans both baseline and ``_relaxed`` grids the
+    output is split into one report per stress class (``pooled_baseline_*``
+    and ``pooled_relaxed_*``); otherwise the legacy single ``pooled_*``
+    filenames are kept for backwards compatibility. Returns the path of
+    the last report written (mostly for the existing single-class call
+    sites that ignore the return value).
+    """
+    grids = _grid_order(list(records))
+    classes = _split_by_stress_class(grids)
+
+    if len(classes) <= 1:
+        # Legacy / single-class run — emit unsuffixed filenames.
+        return _emit_pooled_report(records, grids, out_dir, class_label="")
+
+    # Mixed run — one report per stress class so each fits ≤11 grids.
+    last_path: Path | None = None
+    for class_label, subset in classes:
+        sub_records = {g: records[g] for g in subset}
+        last_path = _emit_pooled_report(sub_records, subset, out_dir,
+                                        class_label=class_label)
+    return last_path  # type: ignore[return-value]
 
 
 def plot_grid(grid: str, csv_path: Path, out_dir: Path):

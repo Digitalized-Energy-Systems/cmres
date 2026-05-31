@@ -20,7 +20,7 @@ Style conventions (matching the rest of the repo)
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -58,9 +58,11 @@ TEMPLATE = eval.CMRES_TEMPLATE
 CARRIER_COLORS = eval.NETWORK_COLOR_MAP | {"power": eval.NETWORK_COLOR_MAP["electricity"]}
 DIVERGING = eval.PALETTE_DIVERGING
 SEQUENTIAL = eval.PALETTE_SEQUENTIAL
-# Extend the 10-colour qualitative palette with Plotly's D3 set for plots that
-# need >10 distinct categories.
-QUAL = eval.PALETTE_QUAL + px.colors.qualitative.D3
+# Extend the 10-colour qualitative palette with two of Plotly's preset
+# palettes so plots that key colour off scenarios / metrics have enough
+# distinct hues for the full 22-grid set (11 baselines × 2 stress levels)
+# without modulo collisions in the first ~28 categories.
+QUAL = eval.PALETTE_QUAL + list(px.colors.qualitative.D3) + list(px.colors.qualitative.Set2)
 
 
 def _layout(**overrides) -> dict:
@@ -1858,6 +1860,24 @@ def _e16_per_sector_heatmap(df: pd.DataFrame) -> go.Figure:
     return heat
 
 
+_E16_RELAXED_SUFFIX = "_relaxed"
+
+
+def _e16_split_scenarios_by_stress(scenarios) -> List[Tuple[str, List[str]]]:
+    """Group scenario keys by stress class — ``baseline`` vs ``relaxed``.
+    Empty classes are dropped so a legacy run with no ``_relaxed`` grids
+    collapses to a single group and the figures keep their unsuffixed
+    slugs / titles."""
+    baseline = [s for s in scenarios if not str(s).endswith(_E16_RELAXED_SUFFIX)]
+    relaxed  = [s for s in scenarios if     str(s).endswith(_E16_RELAXED_SUFFIX)]
+    out: List[Tuple[str, List[str]]] = []
+    if baseline:
+        out.append(("baseline", baseline))
+    if relaxed:
+        out.append(("relaxed", relaxed))
+    return out
+
+
 def plot_e16_single_removal(input_dir: Path, output_dir: Path) -> Optional[Path]:
     """Per-metric ρ vs analytical shed AND vs MC, with the ceiling
     (ρ_shed_vs_mc) drawn as a hatched reference for each scenario.
@@ -1865,6 +1885,11 @@ def plot_e16_single_removal(input_dir: Path, output_dir: Path) -> Optional[Path]
     When per-scenario ``E16_<scenario>_merged.csv`` files are present
     (emitted by the refactored ``experiment_e16_single_removal_validation``),
     appends per-metric scatter panels and a top-K overlap curve per scenario.
+
+    When the input mixes baseline and ``_relaxed`` grids the cross-scenario
+    figures (heatmap, pooled bar, shed-vs-MC scatter, ceiling) are emitted
+    once per stress class so each fits ≤11 grids on its axis — single-class
+    runs keep the original layout and slugs.
     """
     input_dir, output_dir = Path(input_dir), Path(output_dir)
     metric_path = input_dir / "E16_metric_vs_shed.csv"
@@ -1875,148 +1900,213 @@ def plot_e16_single_removal(input_dir: Path, output_dir: Path) -> Optional[Path]
     if df.empty:
         return None
     ceil = pd.read_csv(ceil_path) if ceil_path.exists() else pd.DataFrame()
+    pooled_files_all = sorted(input_dir.glob("E16_*_merged.csv"))
 
     figs: List[go.Figure] = []
     titles: List[str] = []
     slugs: List[str] = []
 
-    # ρ vs analytical shed — extended per-sector heatmap whose y-axis
-    # lists (scenario, sector) pairs so every combination is visible in
-    # one matrix. Falls back to the legacy total-only heatmap when there
-    # is only one scenario (a 1×N matrix crashes Kaleido on axis scaling).
-    pivot_shed = df.pivot_table(index="scenario", columns="metric", values="rho_vs_shed")
-    pivot_shed = pivot_shed.reindex(index=_scenario_order(pivot_shed.index))
-    pivot_shed = pivot_shed.dropna(axis=1, how="all").dropna(axis=0, how="all")
-    z = pivot_shed.values
-    if z.size:
-        if pivot_shed.shape[0] >= 2:
-            heat = _e16_per_sector_heatmap(df)
-            if heat.data:
-                figs.append(heat)
-                titles.append("ρ vs analytical shed — per scenario × sector")
-                slugs.append("e16_rho_vs_shed_heatmap_per_sector")
-        else:
-            # Single-scenario fallback: legacy total-only heatmap stays.
-            text = np.where(np.isfinite(z),
-                            np.array([f"{v:.2f}" for v in z.ravel()],
-                                     dtype=object).reshape(z.shape), "")
-            heat = go.Figure(go.Heatmap(
-                z=z, x=metric_label(list(pivot_shed.columns)),
-                y=[pretty_scenario(s) for s in pivot_shed.index],
-                colorscale="RdBu", zmid=0, zmin=-1, zmax=1,
-                colorbar=dict(
-                    title=dict(
-                        text="ρ vs shed", side="right",
-                        font=dict(size=_E16_FONT_SIZES["colorbar"]),
-                    ),
-                    tickfont=dict(size=_E16_FONT_SIZES["colorbar"]),
-                    thickness=14, len=0.9,
-                ),
-                text=text, texttemplate="%{text}",
-                textfont=dict(size=_E16_FONT_SIZES["annotation"]),
-                hovertemplate="<b>%{y}</b><br>%{x}: ρ = %{z:.3f}<extra></extra>",
-            ))
-            heat.update_layout(**_e16_layout(
-                title="Spearman ρ between metric and analytical single-removal shed",
-                xaxis=dict(title="Metric", tickangle=30), yaxis=dict(title=""),
-                height=max(320, 80 + 64 * len(pivot_shed.index)),
-                width=180 + 110 * len(pivot_shed.columns),
-            ))
-            figs.append(heat)
-            titles.append("ρ vs analytical shed")
-            slugs.append("e16_rho_vs_shed_heatmap")
+    def _slug(base: str, class_label: str) -> str:
+        return f"{base}_{class_label}" if class_label else base
 
-    # Aggregated (pooled across all scenarios) per-sector ρ bar chart.
-    # Recomputes ρ on the union of every scenario's merged rows so each
-    # (metric, sector) cell is a single ρ from the full study population,
-    # not an average of per-scenario ρ values.
-    pooled_files = sorted(input_dir.glob("E16_*_merged.csv"))
-    if pooled_files:
-        agg_bar = _e16_rho_per_sector_bar_aggregated(pooled_files)
-        if agg_bar.data:
-            figs.append(agg_bar)
-            titles.append("ρ vs analytical shed — pooled across all scenarios")
-            slugs.append("e16_rho_vs_shed_per_sector_pooled")
+    def _title_suffix(class_label: str) -> str:
+        return f" ({class_label})" if class_label else ""
+
+    def _emit_cross_scenario(sub_df, sub_pooled_files, sub_ceil,
+                             class_label: str) -> "pd.Index | None":
+        """Append the cross-scenario E16 figures for one stress-class
+        subset. Returns the pivot_shed.index used for the heatmap so the
+        per-scenario per-sector bar loop later can reuse the same order."""
+
+        # ρ vs analytical shed — extended per-sector heatmap whose y-axis
+        # lists (scenario, sector) pairs so every combination is visible in
+        # one matrix. Falls back to the legacy total-only heatmap when there
+        # is only one scenario (a 1×N matrix crashes Kaleido on axis scaling).
+        pivot_shed = sub_df.pivot_table(index="scenario", columns="metric",
+                                        values="rho_vs_shed")
+        pivot_shed = pivot_shed.reindex(index=_scenario_order(pivot_shed.index))
+        pivot_shed = pivot_shed.dropna(axis=1, how="all").dropna(axis=0, how="all")
+        z = pivot_shed.values
+        if z.size:
+            if pivot_shed.shape[0] >= 2:
+                heat = _e16_per_sector_heatmap(sub_df)
+                if heat.data:
+                    figs.append(heat)
+                    titles.append(
+                        f"ρ vs analytical shed — per scenario × sector"
+                        f"{_title_suffix(class_label)}"
+                    )
+                    slugs.append(
+                        _slug("e16_rho_vs_shed_heatmap_per_sector", class_label)
+                    )
+            else:
+                # Single-scenario fallback: legacy total-only heatmap.
+                text = np.where(np.isfinite(z),
+                                np.array([f"{v:.2f}" for v in z.ravel()],
+                                         dtype=object).reshape(z.shape), "")
+                heat = go.Figure(go.Heatmap(
+                    z=z, x=metric_label(list(pivot_shed.columns)),
+                    y=[pretty_scenario(s) for s in pivot_shed.index],
+                    colorscale="RdBu", zmid=0, zmin=-1, zmax=1,
+                    colorbar=dict(
+                        title=dict(
+                            text="ρ vs shed", side="right",
+                            font=dict(size=_E16_FONT_SIZES["colorbar"]),
+                        ),
+                        tickfont=dict(size=_E16_FONT_SIZES["colorbar"]),
+                        thickness=14, len=0.9,
+                    ),
+                    text=text, texttemplate="%{text}",
+                    textfont=dict(size=_E16_FONT_SIZES["annotation"]),
+                    hovertemplate="<b>%{y}</b><br>%{x}: ρ = %{z:.3f}<extra></extra>",
+                ))
+                heat.update_layout(**_e16_layout(
+                    title=(
+                        "Spearman ρ between metric and analytical single-removal shed"
+                        + _title_suffix(class_label)
+                    ),
+                    xaxis=dict(title="Metric", tickangle=30), yaxis=dict(title=""),
+                    height=max(320, 80 + 64 * len(pivot_shed.index)),
+                    width=180 + 110 * len(pivot_shed.columns),
+                ))
+                figs.append(heat)
+                titles.append(f"ρ vs analytical shed{_title_suffix(class_label)}")
+                slugs.append(_slug("e16_rho_vs_shed_heatmap", class_label))
+
+        # Aggregated (pooled across this class's scenarios) per-sector ρ bar.
+        if sub_pooled_files:
+            agg_bar = _e16_rho_per_sector_bar_aggregated(sub_pooled_files)
+            if agg_bar.data:
+                figs.append(agg_bar)
+                titles.append(
+                    f"ρ vs analytical shed — pooled across scenarios"
+                    f"{_title_suffix(class_label)}"
+                )
+                slugs.append(
+                    _slug("e16_rho_vs_shed_per_sector_pooled", class_label)
+                )
+
+        # ρ vs shed vs ρ vs MC scatter — does shed-quality predict MC-quality?
+        fig = go.Figure()
+        metrics = list(sub_df["metric"].drop_duplicates())
+        cmap = {m: QUAL[i % len(QUAL)] for i, m in enumerate(metrics)}
+        for m in metrics:
+            sub = sub_df[sub_df["metric"] == m]
+            m_label = metric_label(m)
+            fig.add_trace(go.Scatter(
+                x=sub["rho_vs_shed"], y=sub["rho_vs_mc"],
+                mode="markers", name=m_label,
+                marker=dict(color=cmap[m], size=11,
+                            line=dict(color="#222", width=0.5)),
+                hovertext=[pretty_scenario(s) for s in sub["scenario"]],
+                hovertemplate=("<b>%{hovertext}</b><br>" + m_label
+                               + "<br>ρ vs shed = %{x:+.3f}"
+                               "<br>ρ vs MC = %{y:+.3f}<extra></extra>"),
+            ))
+        fig.add_shape(type="line", x0=-1, y0=-1, x1=1, y1=1,
+                      line=dict(color="#888", dash="dash", width=1.2))
+        fig.add_hline(y=0, line=dict(color="#bbb", width=1, dash="dot"))
+        fig.add_vline(x=0, line=dict(color="#bbb", width=1, dash="dot"))
+        fig.update_layout(**_e16_layout(
+            title=(
+                "ρ vs analytical shed (x) vs ρ vs MC actual (y)"
+                + _title_suffix(class_label)
+            ),
+            xaxis=dict(title="Spearman ρ vs shed", range=[-1.05, 1.05],
+                       gridcolor="#e5e5e5"),
+            yaxis=dict(title="Spearman ρ vs MC actual", range=[-1.05, 1.05],
+                       gridcolor="#e5e5e5"),
+            height=620, width=720,
+            legend=dict(title="Metric"),
+        ))
+        figs.append(fig)
+        titles.append(f"Metric ρ — shed vs MC{_title_suffix(class_label)}")
+        slugs.append(_slug("e16_rho_shed_vs_mc", class_label))
+
+        # Ceiling: how well does the analytical shed itself predict MC?
+        if sub_ceil is not None and not sub_ceil.empty:
+            c = sub_ceil.sort_values("rho_shed_vs_mc", ascending=True)
+            err_hi = (c["ci_hi"] - c["rho_shed_vs_mc"]).clip(lower=0)
+            err_lo = (c["rho_shed_vs_mc"] - c["ci_lo"]).clip(lower=0)
+            fig2 = go.Figure(go.Bar(
+                y=[pretty_scenario(s) for s in c["scenario"]],
+                x=c["rho_shed_vs_mc"], orientation="h",
+                error_x=dict(type="data", symmetric=False,
+                             array=err_hi, arrayminus=err_lo,
+                             thickness=1.2, width=4, color="#222"),
+                marker=dict(color="#00897b", line=dict(color="#004d40", width=0.5)),
+                text=[f"ρ={v:+.2f}" for v in c["rho_shed_vs_mc"]],
+                textposition="outside", cliponaxis=False,
+                hovertemplate=("<b>%{y}</b><br>ρ = %{x:+.3f}"
+                               "<br>n = %{customdata[0]}<extra></extra>"),
+                customdata=np.c_[c["n"].values],
+                showlegend=False,
+            ))
+            fig2.add_vline(x=0, line=dict(color="#444", width=1, dash="dot"))
+            fig2.update_layout(**_e16_layout(
+                title=(
+                    "Ceiling: ρ between analytical shed and MC actual_total"
+                    + _title_suffix(class_label)
+                ),
+                xaxis=dict(title="Spearman ρ", range=[-1.05, 1.10],
+                           gridcolor="#e5e5e5"),
+                yaxis=dict(title=""),
+                height=max(220, 80 + 44 * len(c)), width=900,
+            ))
+            figs.append(fig2)
+            titles.append(f"Ceiling ρ{_title_suffix(class_label)}")
+            slugs.append(_slug("e16_ceiling_rho", class_label))
+
+        return pivot_shed.index if z.size else None
+
+    # Cross-scenario figures: one set per stress class (or one combined set
+    # if only baselines are present, preserving legacy slug names).
+    all_scenarios = list(df["scenario"].drop_duplicates())
+    classes = _e16_split_scenarios_by_stress(all_scenarios)
+    if len(classes) <= 1:
+        _emit_cross_scenario(df, pooled_files_all, ceil, class_label="")
+        scenario_order_for_bars = (
+            df.pivot_table(index="scenario", columns="metric", values="rho_vs_shed")
+              .pipe(lambda p: p.reindex(index=_scenario_order(p.index)))
+              .dropna(axis=1, how="all").dropna(axis=0, how="all").index
+        )
+    else:
+        seen_orders: List = []
+        for class_label, scens in classes:
+            sub_df = df[df["scenario"].isin(scens)]
+            sub_pooled = [
+                f for f in pooled_files_all
+                if f.stem.removeprefix("E16_").removesuffix("_merged") in set(scens)
+            ]
+            sub_ceil = (
+                ceil[ceil["scenario"].isin(scens)] if not ceil.empty else ceil
+            )
+            sub_order = _emit_cross_scenario(sub_df, sub_pooled, sub_ceil,
+                                             class_label=class_label)
+            if sub_order is not None:
+                seen_orders.append(sub_order)
+        # Concatenate the per-class orders so the per-scenario bars below
+        # still iterate every scenario in a stable, class-grouped order.
+        if seen_orders:
+            scenario_order_for_bars = pd.Index(np.concatenate([o.values for o in seen_orders]))
+        else:
+            scenario_order_for_bars = pd.Index(df["scenario"].drop_duplicates())
+
     # Per-scenario per-sector grouped bar — emitted for *every* scenario so
-    # the per-sector ρ view is always available, even when the cross-grid
-    # heatmap above is also drawn. Order matches ``_scenario_order``.
-    for scenario in (pivot_shed.index if z.size else df["scenario"].unique()):
+    # the per-sector ρ view is always available, regardless of stress class.
+    # Order matches the cross-scenario figures above (baseline block first,
+    # then relaxed block in mixed runs).
+    for scenario in scenario_order_for_bars:
         bar = _e16_rho_per_sector_bar(df, scenario)
         if bar.data:
             figs.append(bar)
             titles.append(f"{pretty_scenario(scenario)} — ρ vs shed, per sector")
             slugs.append(f"e16_{scenario}_rho_vs_shed_per_sector")
 
-    # ρ vs shed vs ρ vs MC scatter — does shed-quality predict MC-quality?
-    fig = go.Figure()
-    metrics = list(df["metric"].drop_duplicates())
-    cmap = {m: QUAL[i % len(QUAL)] for i, m in enumerate(metrics)}
-    for m in metrics:
-        sub = df[df["metric"] == m]
-        m_label = metric_label(m)
-        fig.add_trace(go.Scatter(
-            x=sub["rho_vs_shed"], y=sub["rho_vs_mc"],
-            mode="markers", name=m_label,
-            marker=dict(color=cmap[m], size=11,
-                        line=dict(color="#222", width=0.5)),
-            hovertext=[pretty_scenario(s) for s in sub["scenario"]],
-            hovertemplate=("<b>%{hovertext}</b><br>" + m_label
-                           + "<br>ρ vs shed = %{x:+.3f}"
-                           "<br>ρ vs MC = %{y:+.3f}<extra></extra>"),
-        ))
-    fig.add_shape(type="line", x0=-1, y0=-1, x1=1, y1=1,
-                  line=dict(color="#888", dash="dash", width=1.2))
-    fig.add_hline(y=0, line=dict(color="#bbb", width=1, dash="dot"))
-    fig.add_vline(x=0, line=dict(color="#bbb", width=1, dash="dot"))
-    fig.update_layout(**_e16_layout(
-        title="ρ vs analytical shed (x) vs ρ vs MC actual (y)",
-        xaxis=dict(title="Spearman ρ vs shed", range=[-1.05, 1.05],
-                   gridcolor="#e5e5e5"),
-        yaxis=dict(title="Spearman ρ vs MC actual", range=[-1.05, 1.05],
-                   gridcolor="#e5e5e5"),
-        height=620, width=720,
-        legend=dict(title="Metric"),
-    ))
-    figs.append(fig)
-    titles.append("Metric ρ — shed vs MC")
-    slugs.append("e16_rho_shed_vs_mc")
-
-    # Ceiling: how well does the analytical shed itself predict MC?
-    if not ceil.empty:
-        ceil = ceil.sort_values("rho_shed_vs_mc", ascending=True)
-        err_hi = (ceil["ci_hi"] - ceil["rho_shed_vs_mc"]).clip(lower=0)
-        err_lo = (ceil["rho_shed_vs_mc"] - ceil["ci_lo"]).clip(lower=0)
-        fig2 = go.Figure(go.Bar(
-            y=[pretty_scenario(s) for s in ceil["scenario"]],
-            x=ceil["rho_shed_vs_mc"], orientation="h",
-            error_x=dict(type="data", symmetric=False,
-                         array=err_hi, arrayminus=err_lo,
-                         thickness=1.2, width=4, color="#222"),
-            marker=dict(color="#00897b", line=dict(color="#004d40", width=0.5)),
-            text=[f"ρ={v:+.2f}" for v in ceil["rho_shed_vs_mc"]],
-            textposition="outside", cliponaxis=False,
-            hovertemplate=("<b>%{y}</b><br>ρ = %{x:+.3f}"
-                           "<br>n = %{customdata[0]}<extra></extra>"),
-            customdata=np.c_[ceil["n"].values],
-            showlegend=False,
-        ))
-        fig2.add_vline(x=0, line=dict(color="#444", width=1, dash="dot"))
-        fig2.update_layout(**_e16_layout(
-            title="Ceiling: ρ between analytical shed and MC actual_total",
-            xaxis=dict(title="Spearman ρ", range=[-1.05, 1.10],
-                       gridcolor="#e5e5e5"),
-            yaxis=dict(title=""),
-            height=max(220, 80 + 44 * len(ceil)), width=900,
-        ))
-        figs.append(fig2)
-        titles.append("Ceiling ρ")
-        slugs.append("e16_ceiling_rho")
-
     # ── Per-scenario raw scatter + top-K overlap (only if the
     #    refactored experiment emitted merged CSVs) ────────────────────────
-    merged_files = sorted(input_dir.glob("E16_*_merged.csv"))
     available_metrics = [m for m in df["metric"].drop_duplicates() if m]
-    for mf in merged_files:
+    for mf in pooled_files_all:
         scenario = mf.stem.removeprefix("E16_").removesuffix("_merged")
         try:
             merged = pd.read_csv(mf)
