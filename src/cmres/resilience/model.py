@@ -335,10 +335,16 @@ class CascadingModel(StepModel):
             include_coupling_points=self._include_coupling_points,
         )
         log.info("Network solve complete")
+        # The performance metric always counts end-user shed only:
+        # ``include_coupling_points`` steers the shed *objective* above
+        # (resolving degenerate ties toward running load-bearing CPs), but a
+        # curtailed CP's service loss is already captured as downstream
+        # unserved load — counting its input draw too would double-count and
+        # make the additive and load-bearing families incomparable.
         return (
             self._performance_metric.calc(
                 result.network,
-                include_coupling_points=self._include_coupling_points,
+                include_coupling_points=False,
             ),
             result,
         )
@@ -393,23 +399,6 @@ class CascadingModel(StepModel):
             and not c.ignored
         )
 
-        if self._include_coupling_points:
-            # Mirror monee.problem.metric: when CPs are counted as loads,
-            # an "all shed" fallback must also include the CP nameplate
-            # on the input carrier, otherwise the fallback under-reports
-            # shed for grids whose criticality lives on the CP side.
-            from monee.problem.utils import cp_input_rated_mw
-            for component in net.nodes + net.branches:
-                if not component.active or component.ignored:
-                    continue
-                carrier_rated = cp_input_rated_mw(component)
-                if carrier_rated is None:
-                    continue
-                carrier, rated_mw = carrier_rated
-                if carrier == "power":
-                    power += rated_mw
-                elif carrier == "gas":
-                    gas += rated_mw
         return (power, heat, gas)
 
     def step(self, net, step, step_state, step_result, base_net):

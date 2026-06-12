@@ -33,8 +33,9 @@ Merge all shards of a finished experiment into the final ``mc_result.npz``:
 
 Experiment grid
 ---------------
-One experiment per test grid (see experiments/re/test_grids.py).  Currently
-two grids are enabled: ``simbench_lv`` and ``large_urban_balanced``.
+One experiment per test grid (see experiments/re/test_grids.py): the 15-grid
+roster spanning the ``_backup`` / ``_loadbearing`` / ``_control`` scenario
+families over six CP-density stems.
 
 Note: earlier revisions multiplied this by 6 "impact scenarios".  Those
 scenarios turned out to be unconsumed by the failure model and contributed

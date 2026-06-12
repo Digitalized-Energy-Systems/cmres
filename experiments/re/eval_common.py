@@ -52,27 +52,43 @@ _NON_CP_BRANCH_TYPES = ("PowerLine", "GasPipe", "WaterPipe", "HeatExchanger")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Stress-class split — shared by every cross-scenario plotter so the
-# baseline / ``_relaxed`` partitioning logic lives in exactly one place.
+# Scenario-family split — shared by every cross-scenario plotter so the
+# ``_backup`` / ``_loadbearing`` / ``_control`` partitioning logic lives in
+# exactly one place (see test_grids.py module docstring for the family
+# semantics: backup = additive CPs + rich gas donor, loadbearing = CPs
+# replace primary generation, control = additive CPs + no donor surplus).
 # ─────────────────────────────────────────────────────────────────────────────
 
-RELAXED_SUFFIX = "_relaxed"
+FAMILY_ORDER = ("backup", "loadbearing", "control")
 
 
-def is_relaxed(scenario) -> bool:
-    """True iff the scenario key carries the ``_relaxed`` headroom suffix."""
-    return str(scenario).endswith(RELAXED_SUFFIX)
+def scenario_family(scenario) -> str:
+    """Family of a scenario key (``backup`` / ``loadbearing`` / ``control``).
+
+    Unknown keys (legacy names, ad-hoc grids) map to ``"other"`` instead of
+    raising so older result CSVs can still be plotted.
+    """
+    s = str(scenario)
+    for fam in FAMILY_ORDER:
+        if s.endswith(f"_{fam}"):
+            return fam
+    return "other"
 
 
-def stress_class(scenario) -> str:
-    """``"relaxed"`` for ``_relaxed`` variants, ``"baseline"`` otherwise."""
-    return "relaxed" if is_relaxed(scenario) else "baseline"
+def scenario_stem(scenario) -> str:
+    """Scenario key with the family suffix stripped — the density stem
+    (e.g. ``simbench_lv_xxl``), used as palette / order key so the same
+    density shares a hue across families."""
+    s = str(scenario)
+    fam = scenario_family(s)
+    return s[: -(len(fam) + 1)] if fam != "other" else s
 
 
-def split_scenarios_by_stress(scenarios) -> List[Tuple[str, List[str]]]:
-    """Partition scenarios into ``[("baseline", [...]), ("relaxed", [...])]``.
+def split_scenarios_by_family(scenarios) -> List[Tuple[str, List[str]]]:
+    """Partition scenarios into ``[(family, [scenarios...]), ...]`` in
+    ``FAMILY_ORDER`` (+ trailing ``"other"`` group if any).
 
-    Empty classes are dropped so the legacy 11-grid case collapses to a single
+    Empty classes are dropped so a single-family run collapses to one
     group — letting callers detect "no split needed" via ``len(result) <= 1``
     and keep their original (unsuffixed) figure slugs.
 
@@ -80,16 +96,10 @@ def split_scenarios_by_stress(scenarios) -> List[Tuple[str, List[str]]]:
     matters for figures whose colour mapping or axis ticks read in source
     order (e.g. ``_scenario_order`` already returns the canonical sequence).
     """
-    baseline: List[str] = []
-    relaxed: List[str] = []
+    groups = {fam: [] for fam in FAMILY_ORDER + ("other",)}
     for s in scenarios:
-        (relaxed if is_relaxed(s) else baseline).append(s)
-    out: List[Tuple[str, List[str]]] = []
-    if baseline:
-        out.append(("baseline", baseline))
-    if relaxed:
-        out.append(("relaxed", relaxed))
-    return out
+        groups[scenario_family(s)].append(s)
+    return [(fam, members) for fam, members in groups.items() if members]
 
 
 # Canonical 10-metric line-up used by both ``cp_cn_evaluation`` (scatter /

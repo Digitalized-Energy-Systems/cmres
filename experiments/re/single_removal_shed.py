@@ -16,7 +16,7 @@ CLI for SLURM
 
 Per-shard run::
 
-    python single_removal_shed.py simbench_lv \\
+    python single_removal_shed.py simbench_lv_mid_backup \\
         --output-dir data/out/single_removal_shed \\
         --shard 1 --n-shards 8
 
@@ -26,7 +26,7 @@ deactivate-solve-reactivate loop, and writes
 
 Final merge::
 
-    python single_removal_shed.py simbench_lv \\
+    python single_removal_shed.py simbench_lv_mid_backup \\
         --output-dir data/out/single_removal_shed \\
         --merge --n-shards 8
 
@@ -190,12 +190,20 @@ def _shed_from_solved(
     same way. ``include_ext_grid=False`` matches the prior local
     implementation (ext-grid imbalance is not counted as shed).
 
+    The metric always counts end-user shed only — the ``include_coupling_points``
+    parameter is accepted for call-site compatibility but ignored: CP
+    curtailment is an objective-side concern (see ``_solve_load_shed``);
+    counting the CP input draw as shed would double-count the downstream
+    service loss and make the additive and load-bearing grid families
+    incomparable.
+
     Returns (power_mw, heat_mw, gas_mw, total_mw).
     """
+    del include_coupling_points
     power, heat, gas = mp.calc_general_resilience_performance(
         net,
         include_ext_grid=False,
-        include_coupling_points=include_coupling_points,
+        include_coupling_points=False,
     )
     return float(power), float(heat), float(gas), float(power + heat + gas)
 
@@ -376,7 +384,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument(
         "grid",
-        help="Grid name from test_grids.ALL_GRIDS (e.g. simbench_lv).",
+        help="Grid name from test_grids.ALL_GRIDS (e.g. simbench_lv_mid_backup).",
     )
     parser.add_argument(
         "--output-dir", type=Path,

@@ -22,8 +22,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
-from eval_common import split_scenarios_by_stress  # noqa: E402  # canonical
-                                                  # baseline / `_relaxed`
+from eval_common import split_scenarios_by_family  # noqa: E402  # canonical
+                                                  # scenario families
                                                   # partition, used by every
                                                   # cross-scenario plotter.
 
@@ -421,7 +421,7 @@ def plot_e2_ablation(input_dir: Path, output_dir: Path) -> Optional[Path]:
         slugs.append(f"e2_ablation_{scenario}")
 
     # Pooled heatmap of Δ vs full (signed, diverging) — split by stress
-    # class when both baseline and ``_relaxed`` scenarios are present so a
+    # family when several scenario families are present so a
     # 22-row matrix doesn't overflow the printed page.
     def _emit_delta_heatmap(sub_pooled, class_label):
         delta = sub_pooled[sub_pooled["variant"] != "full"].pivot_table(
@@ -460,7 +460,7 @@ def plot_e2_ablation(input_dir: Path, output_dir: Path) -> Optional[Path]:
         titles.append(f"E2 ablation — pooled Δρ heatmap{title_suffix}")
         slugs.append(f"e2_ablation_pooled_heatmap{slug_suffix}")
 
-    classes = split_scenarios_by_stress(pooled["scenario"].drop_duplicates())
+    classes = split_scenarios_by_family(pooled["scenario"].drop_duplicates())
     if len(classes) <= 1:
         _emit_delta_heatmap(pooled, class_label="")
     else:
@@ -817,7 +817,7 @@ def plot_e7_mc_validity(input_dir: Path, output_dir: Path) -> Optional[Path]:
     if rhw_path.exists():
         rhw = pd.read_csv(rhw_path)
         if not rhw.empty:
-            classes = split_scenarios_by_stress(rhw["scenario"].drop_duplicates())
+            classes = split_scenarios_by_family(rhw["scenario"].drop_duplicates())
             if len(classes) <= 1:
                 _emit_rhw(rhw, class_label="")
             else:
@@ -827,7 +827,7 @@ def plot_e7_mc_validity(input_dir: Path, output_dir: Path) -> Optional[Path]:
     if sum_path.exists():
         s = pd.read_csv(sum_path)
         if not s.empty and "AV_reduction_factor" in s.columns:
-            classes = split_scenarios_by_stress(s["scenario"].drop_duplicates())
+            classes = split_scenarios_by_family(s["scenario"].drop_duplicates())
             if len(classes) <= 1:
                 _emit_av(s, class_label="")
             else:
@@ -1127,8 +1127,8 @@ def plot_e11_null_models(input_dir: Path, output_dir: Path) -> Optional[Path]:
     slugs: List[str] = []
 
     # One panel per statistic: grouped bar, x = scenario, group = null kind,
-    # y = z-score, with shaded |z| > 1.96 region. Split by stress class when
-    # both baseline and ``_relaxed`` scenarios are present so the per-stat
+    # y = z-score, with shaded |z| > 1.96 region. Split by scenario family
+    # when several families are present so the per-stat
     # panel widths stay readable.
     stats = list(df["statistic"].drop_duplicates())
     nulls = sorted(df["null_kind"].dropna().unique())
@@ -1181,7 +1181,7 @@ def plot_e11_null_models(input_dir: Path, output_dir: Path) -> Optional[Path]:
         titles.append(f"E11 null z-scores{title_suffix}")
         slugs.append(f"e11_null_z_scores{slug_suffix}")
 
-    classes = split_scenarios_by_stress(df["scenario"].drop_duplicates())
+    classes = split_scenarios_by_family(df["scenario"].drop_duplicates())
     if len(classes) <= 1:
         _emit_null_z(df, class_label="")
     else:
@@ -1936,9 +1936,9 @@ def plot_e16_single_removal(input_dir: Path, output_dir: Path) -> Optional[Path]
     (emitted by the refactored ``experiment_e16_single_removal_validation``),
     appends per-metric scatter panels and a top-K overlap curve per scenario.
 
-    When the input mixes baseline and ``_relaxed`` grids the cross-scenario
+    When the input mixes scenario families the cross-scenario
     figures (heatmap, pooled bar, shed-vs-MC scatter, ceiling) are emitted
-    once per stress class so each fits ≤11 grids on its axis — single-class
+    once per family so each fits a handful of grids on its axis — single-family
     runs keep the original layout and slugs.
     """
     input_dir, output_dir = Path(input_dir), Path(output_dir)
@@ -1964,7 +1964,7 @@ def plot_e16_single_removal(input_dir: Path, output_dir: Path) -> Optional[Path]
 
     def _emit_cross_scenario(sub_df, sub_pooled_files, sub_ceil,
                              class_label: str) -> "pd.Index | None":
-        """Append the cross-scenario E16 figures for one stress-class
+        """Append the cross-scenario E16 figures for one family
         subset. Returns the pivot_shed.index used for the heatmap so the
         per-scenario per-sector bar loop later can reuse the same order."""
 
@@ -2109,10 +2109,10 @@ def plot_e16_single_removal(input_dir: Path, output_dir: Path) -> Optional[Path]
 
         return pivot_shed.index if z.size else None
 
-    # Cross-scenario figures: one set per stress class (or one combined set
+    # Cross-scenario figures: one set per scenario family (or one combined set
     # if only baselines are present, preserving legacy slug names).
     all_scenarios = list(df["scenario"].drop_duplicates())
-    classes = split_scenarios_by_stress(all_scenarios)
+    classes = split_scenarios_by_family(all_scenarios)
     if len(classes) <= 1:
         _emit_cross_scenario(df, pooled_files_all, ceil, class_label="")
         scenario_order_for_bars = (
@@ -2143,9 +2143,9 @@ def plot_e16_single_removal(input_dir: Path, output_dir: Path) -> Optional[Path]
             scenario_order_for_bars = pd.Index(df["scenario"].drop_duplicates())
 
     # Per-scenario per-sector grouped bar — emitted for *every* scenario so
-    # the per-sector ρ view is always available, regardless of stress class.
+    # the per-sector ρ view is always available, regardless of family.
     # Order matches the cross-scenario figures above (baseline block first,
-    # then relaxed block in mixed runs).
+    # per-family blocks in mixed runs).
     for scenario in scenario_order_for_bars:
         bar = _e16_rho_per_sector_bar(df, scenario)
         if bar.data:

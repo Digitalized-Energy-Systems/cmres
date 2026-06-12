@@ -1,22 +1,29 @@
 """
 Test multi-energy system (MES) networks for resilience simulation research.
 
-Three grids of increasing size and coupling diversity:
+All grids share one topology (simbench ``1-LV-rural3--1-no_sw`` + generated
+gas / heat layers) and differ in coupling-point density and supply sizing.
+Three scenario families demonstrate how CPs affect resilience:
 
-  Grid 1 – Urban residential district  (20 kV / gas / heat, high CP density)
-  Grid 2 – Industrial energy hub        (110 kV / gas only, gas-backup focus)
-  Grid 3 – Regional integrated MES      (120 kV / gas / heat, ring, all CP types)
+  ``_backup``      – additive CPs, asymmetric headroom: electricity tight
+                     (h=0.04), gas rich (h=0.30). Electrical failures can be
+                     rescued by CHPs drawing on the gas surplus → "CPs help".
+  ``_loadbearing`` – CPs replace primary generation (``cp_capacity_invariant``),
+                     symmetric h=0.10 sized CP-aware so the CP fleet is fully
+                     fuelable at baseline. Gas-side failures cascade through
+                     the load-bearing CHPs → "CPs hurt".
+  ``_control``     – additive CPs, both carriers tight (h=0.04). Negative
+                     control: without donor-carrier surplus CPs cannot help.
 
-Each ``create_*`` function returns a monee Network ready for energy-flow or
-resilience simulation.  Companion ``make_*_timeseries`` functions return a
-matching TimeseriesData with sinusoidal demand profiles.
+Headroom ``h`` per carrier is split 50/50: in-grid generation is sized at
+``(1 + h/2) ×`` effective demand and the ext-grid slack bound at
+``±(h/2) ×`` effective demand, where effective demand includes the rated CP
+input draw (and generation is credited with the rated CP output) in the
+CP-aware ``_loadbearing`` family. Heat is never rescaled — the heat-side ext
+grid mass flow is hydraulically fixed by the water sinks.
 
-Physical parameters are chosen to match real infrastructure:
-  - 20 kV cable:     r = x = 3e-4 Ω/m, max_i_ka = 0.30 kA  → ~10 MVA/line
-  - 110 kV OHL:      r = x = 7e-5 Ω/m, max_i_ka = 0.40 kA  → ~76 MVA/line
-  - 120 kV cable:    r = x = 3e-4 Ω/m, max_i_ka = 0.30 kA  → ~62 MVA/line
-  - Gas pipes:  d = 0.10–0.50 m, Weymouth-friction regime
-  - Heat pipes: d = 0.10–0.20 m, Darcy-Weisbach regime
+Every baseline (no-fault) grid must solve to ≈ zero end-user load shed; see
+``experiments/re/analyze_baseline_shed.py --assert-clean``.
 
 Coupling point parameters:
   - CHP:  η_el = 0.40, η_th = 0.40  (80 % total, typical micro-CHP)
@@ -50,12 +57,12 @@ from monee.network import (
 class MESContainer:
     """A network bundled with the ext-grid bounds the solver should use.
 
-    ``include_coupling_points`` propagates to both the min-load-shedding
-    optimisation (CPs become demand-weighted loads on their input carrier)
-    and the performance metric (CP nameplate shed counted alongside
-    end-user load shed). Set to True for the ``same_cap`` variants where
-    CPs replace primary generation and therefore should themselves be
-    treated as input-side demand.
+    ``include_coupling_points`` affects the min-load-shedding *objective*
+    only (CPs become demand-weighted loads on their input carrier, which
+    resolves degenerate ties toward keeping load-bearing CPs running). The
+    performance *metric* always counts end-user shed only — a dead
+    load-bearing CP shows up there as downstream unserved load. True for
+    the ``_loadbearing`` family where CPs replace primary generation.
     """
 
     network: mm.Network
@@ -204,56 +211,9 @@ def _balance_demand_for_cp_replacement(net) -> None:
 
     No-op when ``net`` has no CPs (e.g. density=0 or central=True).
     """
-    # ``net.grids`` chokes on multi-grid CP control nodes (whose ``.grid`` is
-    # a list and therefore unhashable inside the set comprehension in monee).
-    # Walk the Junction nodes directly to find the gas grid object — it's the
-    # only thing we need from there (``higher_heating_value``).
-    gas_grid = None
-    for n in net.nodes_by_type(mm.Junction):
-        g = n.grid
-        if g is not None and not isinstance(g, list) and getattr(g, "name", None) == "gas":
-            gas_grid = g
-            break
-    hhv = float(getattr(gas_grid, "higher_heating_value", 15.3)) if gas_grid else 15.3
-
-    p_in_mw = 0.0  # CP electricity draw [MW]
-    g_in_mw = 0.0  # CP gas draw [MW]
-
-    for cp in net.compounds:
-        m = cp.model
-        cn = type(m).__name__
-        if cn in ("CHP", "CHPHG"):
-            kgps = abs(float(getattr(m, "mass_flow_setpoint", 0.0) or 0.0))
-            g_in_mw += kgps * 3.6 * hhv
-        elif cn == "PowerToHeat":
-            # load_p_mw = heat_energy_mw / η, set in PowerToHeat.__init__.
-            p_in_mw += abs(float(getattr(m, "load_p_mw", 0.0) or 0.0))
-
-    for br in net.branches:
-        m = br.model
-        cn = type(m).__name__
-        if cn == "PowerToHeatHG":
-            h = abs(float(getattr(m, "heat_energy_mw", 0.0) or 0.0))
-            eta = float(getattr(m, "efficiency", 0.0) or 0.0)
-            if eta > 1e-6:
-                p_in_mw += h / eta
-        elif cn == "GasToHeatHG":
-            h = abs(float(getattr(m, "heat_energy_mw", 0.0) or 0.0))
-            eta = float(getattr(m, "efficiency", 0.0) or 0.0)
-            if eta > 1e-6:
-                g_in_mw += h / eta
-        elif cn == "GasToPower":
-            p = abs(float(getattr(m, "el_mw", 0.0) or 0.0))
-            eta = float(getattr(m, "efficiency", 0.0) or 0.0)
-            if eta > 1e-6:
-                g_in_mw += p / eta
-        elif cn == "PowerToGas":
-            # mass_flow_setpoint stored on the branch (positive magnitude);
-            # the constructor flips its sign onto gas_kgps internally.
-            kgps_out = abs(float(getattr(m, "gas_kgps", 0.0) or 0.0))
-            eta = float(getattr(m, "efficiency", 0.0) or 0.0)
-            if eta > 1e-6:
-                p_in_mw += (kgps_out * 3.6 * hhv) / eta
+    io = _cp_io_mw(net)
+    p_in_mw, g_in_mw = io["p_in"], io["g_in"]
+    gas_grid, hhv = _gas_grid_and_hhv(net)
 
     # Apply uniform scaling to PowerLoad (positive = consumption).
     if p_in_mw > 0:
@@ -301,7 +261,7 @@ def _balance_demand_for_cp_replacement(net) -> None:
 
 
 # =============================================================================
-# Headroom helpers (used by the ``_relaxed`` variants)
+# Headroom helpers (per-carrier supply sizing for every grid family)
 # =============================================================================
 
 
@@ -316,6 +276,68 @@ def _gas_grid_and_hhv(net):
         if g is not None and not isinstance(g, list) and getattr(g, "name", None) == "gas":
             return g, float(getattr(g, "higher_heating_value", 15.3))
     return None, 15.3
+
+
+def _cp_io_mw(net) -> dict:
+    """Rated CP input draw and output per carrier at regulation 1, in MW.
+
+    Returns ``{"p_in", "g_in", "p_out", "g_out"}``. Heat outputs are not
+    tracked (heat supply is never rescaled). Per-CP accounting
+    (I = input carrier, O = output carrier, η = conversion efficiency):
+
+      CHP / CHPHG     I=G: mass_flow_setpoint·3.6·HHV   O=P: I·η_power
+      PowerToHeat     I=P: load_p_mw (= q_mw/η)
+      PowerToHeatHG   I=P: heat_energy_mw / η
+      GasToHeatHG     I=G: heat_energy_mw / η
+      GasToPower      I=G: el_mw / η                    O=P: el_mw
+      PowerToGas      I=P: gas_kgps·3.6·HHV / η         O=G: gas_kgps·3.6·HHV
+    """
+    _, hhv = _gas_grid_and_hhv(net)
+    io = dict(p_in=0.0, g_in=0.0, p_out=0.0, g_out=0.0)
+
+    for cp in net.compounds:
+        m = cp.model
+        cn = type(m).__name__
+        if cn in ("CHP", "CHPHG"):
+            kgps = abs(float(getattr(m, "mass_flow_setpoint", 0.0) or 0.0))
+            gas_mw = kgps * 3.6 * hhv
+            io["g_in"] += gas_mw
+            eta_p = float(getattr(m, "efficiency_power", 0.0) or 0.0)
+            io["p_out"] += gas_mw * eta_p
+        elif cn == "PowerToHeat":
+            # load_p_mw = heat_energy_mw / η, set in PowerToHeat.__init__.
+            io["p_in"] += abs(float(getattr(m, "load_p_mw", 0.0) or 0.0))
+
+    for br in net.branches:
+        m = br.model
+        cn = type(m).__name__
+        if cn == "PowerToHeatHG":
+            h = abs(float(getattr(m, "heat_energy_mw", 0.0) or 0.0))
+            eta = float(getattr(m, "efficiency", 0.0) or 0.0)
+            if eta > 1e-6:
+                io["p_in"] += h / eta
+        elif cn == "GasToHeatHG":
+            h = abs(float(getattr(m, "heat_energy_mw", 0.0) or 0.0))
+            eta = float(getattr(m, "efficiency", 0.0) or 0.0)
+            if eta > 1e-6:
+                io["g_in"] += h / eta
+        elif cn == "GasToPower":
+            p = abs(float(getattr(m, "el_mw", 0.0) or 0.0))
+            eta = float(getattr(m, "efficiency", 0.0) or 0.0)
+            if eta > 1e-6:
+                io["g_in"] += p / eta
+                io["p_out"] += p
+        elif cn == "PowerToGas":
+            # mass_flow_setpoint stored on the branch (positive magnitude);
+            # the constructor flips its sign onto gas_kgps internally.
+            kgps_out = abs(float(getattr(m, "gas_kgps", 0.0) or 0.0))
+            eta = float(getattr(m, "efficiency", 0.0) or 0.0)
+            if eta > 1e-6:
+                gas_mw = kgps_out * 3.6 * hhv
+                io["p_in"] += gas_mw / eta
+                io["g_out"] += gas_mw
+
+    return io
 
 
 def _carrier_totals(net) -> dict:
@@ -381,26 +403,38 @@ def _scale_to_abs_total(items, get_val, set_val, target_abs_total) -> bool:
     return True
 
 
-def _apply_headroom(net, headroom_frac: float) -> dict:
-    """Scale in-grid electricity + gas generation to demand × (1 + headroom/2)
-    and return slack budgets sized at demand × (headroom/2). Heat untouched.
+def _apply_headroom(net, h_el: float, h_gas: float, cp_aware: bool = False) -> dict:
+    """Scale in-grid electricity + gas generation and size ext-grid slack
+    budgets so each carrier has headroom ``h`` over its *effective* demand,
+    split 50/50 between generation and slack. Heat untouched.
 
-    With ``headroom_frac=0.20`` (default for the ``_relaxed`` variants):
-      • PowerGenerator total      = 1.10 × Σ PowerLoad
-      • Σ Source(gas)             = 1.10 × Σ Sink(gas)        (in MW)
-      • slack_el ext-grid bound   = ±0.10 × Σ PowerLoad        (MW)
-      • slack_gas ext-grid bound  = ±0.10 × Σ Sink(gas)        (kg/s)
+    Per carrier with headroom ``h``::
 
-    so the combined supply ceiling (gen + slack) sits at 120 % of demand and
-    the 20 % headroom is split 50/50 between gen and slack on each carrier.
+        gen_target = (1 + h/2) · (D + CPin) − CPout
+        slack      =     (h/2) · (D + CPin)
+
+    where ``D`` is end-user demand and ``CPin`` / ``CPout`` are the rated CP
+    input draw / output on that carrier (zero unless ``cp_aware``).
+
+    ``cp_aware=True`` is meant for the ``_loadbearing`` family: combined with
+    the demand rebalancing of ``_balance_demand_for_cp_replacement``
+    (``D + CPin`` = no-CP demand), total supply capacity ``gen + CPout`` stays
+    invariant across CP densities while the CP fleet is fully fuelable at
+    baseline. For additive CPs (off at baseline) use ``cp_aware=False`` so
+    supply is sized on end-user demand only.
     """
-    gen_target_ratio = 1.0 + headroom_frac / 2.0   # 1.10 for 20 % headroom
-    slack_ratio = headroom_frac / 2.0              # 0.10 for 20 % headroom
-
     t = _carrier_totals(net)
+    io = _cp_io_mw(net) if cp_aware else dict(p_in=0.0, g_in=0.0, p_out=0.0, g_out=0.0)
 
     # Electricity ──────────────────────────────────────────────────────────
-    p_target_mw = t["p_demand_mw"] * gen_target_ratio
+    p_demand_eff = t["p_demand_mw"] + io["p_in"]
+    p_target_mw = (1.0 + h_el / 2.0) * p_demand_eff - io["p_out"]
+    if p_demand_eff > 1e-9 and p_target_mw <= 0:
+        raise RuntimeError(
+            f"Electricity gen target {p_target_mw:.4f} MW ≤ 0: rated CP power "
+            f"output ({io['p_out']:.4f} MW) exceeds (1+h/2)·effective demand "
+            f"({p_demand_eff:.4f} MW). Reduce CP density/size or raise h_el."
+        )
     pgens = list(net.childs_by_type(mm.PowerGenerator))
     p_ok = _scale_to_abs_total(
         pgens,
@@ -408,14 +442,21 @@ def _apply_headroom(net, headroom_frac: float) -> dict:
         set_val=lambda c, v: setattr(c.model, "p_mw", v),
         target_abs_total=p_target_mw,
     )
-    if not p_ok and t["p_demand_mw"] > 1e-9:
+    if not p_ok and p_demand_eff > 1e-9:
         raise RuntimeError(
             "Cannot scale electricity generation to headroom target: "
-            f"current Σ|PowerGenerator.p_mw| = 0 but demand = {t['p_demand_mw']:.4f} MW."
+            f"current Σ|PowerGenerator.p_mw| = 0 but demand = {p_demand_eff:.4f} MW."
         )
 
     # Gas ─────────────────────────────────────────────────────────────────
-    g_target_mw = t["g_demand_mw"] * gen_target_ratio
+    g_demand_eff_mw = t["g_demand_mw"] + io["g_in"]
+    g_target_mw = (1.0 + h_gas / 2.0) * g_demand_eff_mw - io["g_out"]
+    if g_demand_eff_mw > 1e-9 and g_target_mw <= 0:
+        raise RuntimeError(
+            f"Gas gen target {g_target_mw:.4f} MW ≤ 0: rated CP gas output "
+            f"({io['g_out']:.4f} MW) exceeds (1+h/2)·effective demand "
+            f"({g_demand_eff_mw:.4f} MW). Reduce CP density/size or raise h_gas."
+        )
     g_target_kgps = g_target_mw / (3.6 * t["hhv"]) if t["hhv"] > 0 else 0.0
     gsources = [
         c for c in net.childs_by_type(mm.Source)
@@ -427,15 +468,15 @@ def _apply_headroom(net, headroom_frac: float) -> dict:
         set_val=lambda c, v: setattr(c.model, "mass_flow", v),
         target_abs_total=g_target_kgps,
     )
-    if not g_ok and t["g_demand_mw"] > 1e-9:
+    if not g_ok and g_demand_eff_mw > 1e-9:
         raise RuntimeError(
             "Cannot scale gas generation to headroom target: "
-            f"current Σ|Source(gas).mass_flow| = 0 but demand = {t['g_demand_mw']:.4f} MW."
+            f"current Σ|Source(gas).mass_flow| = 0 but demand = {g_demand_eff_mw:.4f} MW."
         )
 
     return dict(
-        slack_el_mw=t["p_demand_mw"] * slack_ratio,
-        slack_gas_kgps=t["g_demand_kgps"] * slack_ratio,
+        slack_el_mw=(h_el / 2.0) * p_demand_eff,
+        slack_gas_kgps=(h_gas / 2.0) * g_demand_eff_mw / (3.6 * t["hhv"]),
     )
 
 
@@ -443,60 +484,76 @@ def _validate_headroom_balance(
     net,
     slack_el_mw: float,
     slack_gas_kgps: float,
-    headroom_frac: float,
+    h_el: float,
+    h_gas: float,
+    cp_aware: bool = False,
     label: str = "",
     tol: float = 0.01,
 ) -> None:
     """Verify the carrier totals match the headroom contract:
 
-      gen   ≈ (1 + headroom/2) × demand     (within ``tol`` relative)
-      slack ≈ (    headroom/2) × demand     (within ``tol`` relative)
+      (gen + CPout) ≈ (1 + h/2) × (demand + CPin)   (within ``tol`` relative)
+      slack         ≈ (    h/2) × (demand + CPin)   (within ``tol`` relative)
 
-    so the 20 % headroom is *actually* reached and *evenly* split between
-    in-grid generation and slack budget. Heat is intentionally not checked.
-    Raises ``AssertionError`` with a diagnostic message on mismatch.
+    with CPin/CPout = 0 unless ``cp_aware``, so the headroom is *actually*
+    reached and *evenly* split between in-grid generation and slack budget.
+    Heat is intentionally not checked. Raises ``AssertionError`` with a
+    diagnostic message on mismatch.
     """
-    expected_gen = 1.0 + headroom_frac / 2.0
-    expected_slack = headroom_frac / 2.0
     t = _carrier_totals(net)
+    io = _cp_io_mw(net) if cp_aware else dict(p_in=0.0, g_in=0.0, p_out=0.0, g_out=0.0)
     prefix = f"[headroom:{label}]" if label else "[headroom]"
 
-    def _check(carrier, demand, gen, slack, slack_human):
-        if demand <= 1e-9:
+    def _check(carrier, h, demand_eff, supply, slack, slack_human):
+        expected_gen = 1.0 + h / 2.0
+        expected_slack = h / 2.0
+        if demand_eff <= 1e-9:
             print(f"{prefix} {carrier}: demand=0 — nothing to check")
             return
-        gen_r, slack_r = gen / demand, slack / demand
+        gen_r, slack_r = supply / demand_eff, slack / demand_eff
         gen_err = gen_r - expected_gen
         slack_err = slack_r - expected_slack
         print(
-            f"{prefix} {carrier}: demand={demand:.4f} MW  "
-            f"gen={gen:.4f} MW (×{gen_r:.4f}, target ×{expected_gen:.2f}, Δ={gen_err:+.4f})  "
+            f"{prefix} {carrier}: demand_eff={demand_eff:.4f} MW  "
+            f"gen+CPout={supply:.4f} MW (×{gen_r:.4f}, target ×{expected_gen:.2f}, Δ={gen_err:+.4f})  "
             f"slack=±{slack_human} (×{slack_r:.4f}, target ×{expected_slack:.2f}, Δ={slack_err:+.4f})"
         )
         assert abs(gen_err) <= tol, (
-            f"{prefix} {carrier} gen/demand={gen_r:.4f}, expected ≈{expected_gen:.4f} "
-            f"(tol={tol})"
+            f"{prefix} {carrier} (gen+CPout)/demand_eff={gen_r:.4f}, "
+            f"expected ≈{expected_gen:.4f} (tol={tol})"
         )
         assert abs(slack_err) <= tol, (
-            f"{prefix} {carrier} slack/demand={slack_r:.4f}, expected ≈{expected_slack:.4f} "
-            f"(tol={tol})"
+            f"{prefix} {carrier} slack/demand_eff={slack_r:.4f}, "
+            f"expected ≈{expected_slack:.4f} (tol={tol})"
         )
 
     _check(
         "electricity",
-        t["p_demand_mw"], t["p_gen_mw"],
+        h_el,
+        t["p_demand_mw"] + io["p_in"],
+        t["p_gen_mw"] + io["p_out"],
         slack_el_mw, f"{slack_el_mw:.4f} MW",
     )
     _check(
         "gas",
-        t["g_demand_mw"], t["g_gen_mw"],
+        h_gas,
+        t["g_demand_mw"] + io["g_in"],
+        t["g_gen_mw"] + io["g_out"],
         slack_gas_kgps * 3.6 * t["hhv"],
         f"{slack_gas_kgps:.6f} kg/s ≈ {slack_gas_kgps * 3.6 * t['hhv']:.4f} MW",
     )
 
 
 def create_large_lv_simbench(density, central=False, cp_capacity_invariant=False,
-                             headroom_frac=None):
+                             h_el=0.20, h_gas=0.20):
+    """Factory for one grid variant.
+
+    ``h_el`` / ``h_gas`` are per-carrier headroom fractions (gen sized at
+    1 + h/2 × effective demand, ext-grid slack at ±h/2 × effective demand).
+    ``cp_capacity_invariant=True`` makes CPs replace primary generation
+    (load-bearing) and switches the headroom sizing to CP-aware so the CP
+    fleet is fuelable at baseline.
+    """
     def create():
         net = simbench.get_simbench_net("1-LV-rural3--1-no_sw")
         mn = from_pandapower_net(net)
@@ -534,37 +591,32 @@ def create_large_lv_simbench(density, central=False, cp_capacity_invariant=False
         if cp_capacity_invariant:
             _balance_demand_for_cp_replacement(mes)
 
-        # ``_relaxed`` variants: apply *after* CP rebalancing so the gen and
-        # slack budgets are sized against the final post-rebalancing demand.
-        slack_overrides = None
-        if headroom_frac is not None:
-            slack_overrides = _apply_headroom(mes, headroom_frac=headroom_frac)
-            _validate_headroom_balance(
-                mes,
-                slack_el_mw=slack_overrides["slack_el_mw"],
-                slack_gas_kgps=slack_overrides["slack_gas_kgps"],
-                headroom_frac=headroom_frac,
-                label=f"density={density},same_cap={cp_capacity_invariant}",
-            )
+        # Headroom is applied *after* CP rebalancing so the gen and slack
+        # budgets are sized against the final post-rebalancing demand. In
+        # CP-aware mode (load-bearing CPs) the budgets additionally cover
+        # the rated CP input draw and credit the rated CP output.
+        slack_overrides = _apply_headroom(
+            mes, h_el=h_el, h_gas=h_gas, cp_aware=cp_capacity_invariant
+        )
+        _validate_headroom_balance(
+            mes,
+            slack_el_mw=slack_overrides["slack_el_mw"],
+            slack_gas_kgps=slack_overrides["slack_gas_kgps"],
+            h_el=h_el,
+            h_gas=h_gas,
+            cp_aware=cp_capacity_invariant,
+            label=f"density={density},same_cap={cp_capacity_invariant}",
+        )
 
         mes.apply_formulation(MISOCP_NETWORK_FORMULATION)
         mes.apply_formulation(make_mccormick_dhs_formulation(num_partitions=16))
 
-        if slack_overrides is not None:
-            slack_el = slack_overrides["slack_el_mw"]
-            slack_gas = slack_overrides["slack_gas_kgps"]
-            return MESContainer(
-                network=mes,
-                ext_grid_el_bounds=(-slack_el, slack_el),
-                ext_grid_gas_bounds=(-slack_gas, slack_gas),
-                ext_grid_heat_bounds=(-6, 6),
-                include_coupling_points=cp_capacity_invariant,
-            )
-
+        slack_el = slack_overrides["slack_el_mw"]
+        slack_gas = slack_overrides["slack_gas_kgps"]
         return MESContainer(
             network=mes,
-            ext_grid_el_bounds=(-0.10, 0.10),
-            ext_grid_gas_bounds=(-0.007, 0.007),
+            ext_grid_el_bounds=(-slack_el, slack_el),
+            ext_grid_gas_bounds=(-slack_gas, slack_gas),
             ext_grid_heat_bounds=(-6, 6),
             include_coupling_points=cp_capacity_invariant,
         )
@@ -575,39 +627,45 @@ def create_large_lv_simbench_ts(
 ):
     return TimeseriesData()
 
+# Per-family factory shorthands (see module docstring for the semantics).
+# "CPs help": tight receiver (el), rich donor (gas); additive CPs.
+def _backup(density):
+    return create_large_lv_simbench(density, h_el=0.04, h_gas=0.30)
+
+
+# "CPs hurt": CPs replace primary generation; CP-aware symmetric sizing.
+def _loadbearing(density):
+    return create_large_lv_simbench(
+        density, cp_capacity_invariant=True, h_el=0.10, h_gas=0.10
+    )
+
+
+# Negative control: no donor surplus anywhere; additive CPs.
+def _control(density):
+    return create_large_lv_simbench(density, h_el=0.04, h_gas=0.04)
+
+
+# NOTE: keep ALL_GRIDS a literal dict with one quoted key per line —
+# slurm_single_removal_shed.sh extracts the grid list from this block via
+# sed, and insertion order defines the SLURM array index → grid mapping.
 ALL_GRIDS = {
-    "simbench_lv_no": (create_large_lv_simbench(0), create_large_lv_simbench_ts),
-    
-    "simbench_lv_low": (create_large_lv_simbench(0.05), create_large_lv_simbench_ts),
-    "simbench_lv": (create_large_lv_simbench(0.1), create_large_lv_simbench_ts),
-    "simbench_lv_high": (create_large_lv_simbench(0.15), create_large_lv_simbench_ts),
-    "simbench_lv_xl": (create_large_lv_simbench(0.2), create_large_lv_simbench_ts),
-    "simbench_lv_xxl": (create_large_lv_simbench(0.25), create_large_lv_simbench_ts),
-    
+    "simbench_lv_no_backup": (_backup(0.0), create_large_lv_simbench_ts),
+    "simbench_lv_low_backup": (_backup(0.05), create_large_lv_simbench_ts),
+    "simbench_lv_mid_backup": (_backup(0.1), create_large_lv_simbench_ts),
+    "simbench_lv_high_backup": (_backup(0.15), create_large_lv_simbench_ts),
+    "simbench_lv_xl_backup": (_backup(0.2), create_large_lv_simbench_ts),
+    "simbench_lv_xxl_backup": (_backup(0.25), create_large_lv_simbench_ts),
 
-    "simbench_lv_low_same_cap": (create_large_lv_simbench(0.05, cp_capacity_invariant=True), create_large_lv_simbench_ts),
-    "simbench_lv_same_cap": (create_large_lv_simbench(0.1, cp_capacity_invariant=True), create_large_lv_simbench_ts),
-    "simbench_lv_high_same_cap": (create_large_lv_simbench(0.15, cp_capacity_invariant=True), create_large_lv_simbench_ts),
-    "simbench_lv_xl_same_cap": (create_large_lv_simbench(0.2, cp_capacity_invariant=True), create_large_lv_simbench_ts),
-    "simbench_lv_xxl_same_cap": (create_large_lv_simbench(0.25, cp_capacity_invariant=True), create_large_lv_simbench_ts),
+    "simbench_lv_no_loadbearing": (_loadbearing(0.0), create_large_lv_simbench_ts),
+    "simbench_lv_low_loadbearing": (_loadbearing(0.05), create_large_lv_simbench_ts),
+    "simbench_lv_mid_loadbearing": (_loadbearing(0.1), create_large_lv_simbench_ts),
+    "simbench_lv_high_loadbearing": (_loadbearing(0.15), create_large_lv_simbench_ts),
+    "simbench_lv_xl_loadbearing": (_loadbearing(0.2), create_large_lv_simbench_ts),
+    "simbench_lv_xxl_loadbearing": (_loadbearing(0.25), create_large_lv_simbench_ts),
 
-    # ``_relaxed`` variants — same 11 topologies, but each carrier
-    # (electricity + gas only; heat untouched) gets 20 % headroom over
-    # demand, split evenly: in-grid generation sized at 1.10 × demand and
-    # slack ext-grid bound at ±0.10 × demand. See ``_apply_headroom`` /
-    # ``_validate_headroom_balance``.
-    "simbench_lv_no_relaxed": (create_large_lv_simbench(0, headroom_frac=0.20), create_large_lv_simbench_ts),
-    "simbench_lv_low_relaxed": (create_large_lv_simbench(0.05, headroom_frac=0.20), create_large_lv_simbench_ts),
-    "simbench_lv_relaxed": (create_large_lv_simbench(0.1, headroom_frac=0.20), create_large_lv_simbench_ts),
-    "simbench_lv_high_relaxed": (create_large_lv_simbench(0.15, headroom_frac=0.20), create_large_lv_simbench_ts),
-    "simbench_lv_xl_relaxed": (create_large_lv_simbench(0.2, headroom_frac=0.20), create_large_lv_simbench_ts),
-    "simbench_lv_xxl_relaxed": (create_large_lv_simbench(0.25, headroom_frac=0.20), create_large_lv_simbench_ts),
-
-    "simbench_lv_low_same_cap_relaxed": (create_large_lv_simbench(0.05, cp_capacity_invariant=True, headroom_frac=0.20), create_large_lv_simbench_ts),
-    "simbench_lv_same_cap_relaxed": (create_large_lv_simbench(0.1, cp_capacity_invariant=True, headroom_frac=0.20), create_large_lv_simbench_ts),
-    "simbench_lv_high_same_cap_relaxed": (create_large_lv_simbench(0.15, cp_capacity_invariant=True, headroom_frac=0.20), create_large_lv_simbench_ts),
-    "simbench_lv_xl_same_cap_relaxed": (create_large_lv_simbench(0.2, cp_capacity_invariant=True, headroom_frac=0.20), create_large_lv_simbench_ts),
-    "simbench_lv_xxl_same_cap_relaxed": (create_large_lv_simbench(0.25, cp_capacity_invariant=True, headroom_frac=0.20), create_large_lv_simbench_ts),
+    "simbench_lv_no_control": (_control(0.0), create_large_lv_simbench_ts),
+    "simbench_lv_mid_control": (_control(0.1), create_large_lv_simbench_ts),
+    "simbench_lv_xxl_control": (_control(0.25), create_large_lv_simbench_ts),
 }
 
 def print_demands(net: mm.Network) -> None:
@@ -692,11 +750,12 @@ def solve(
 
 
 if __name__ == "__main__":
-    import monee.model as mm
+    import sys
 
-    print("URBAN")
+    grid_name = sys.argv[1] if len(sys.argv) > 1 else "simbench_lv_xxl_loadbearing"
+    print(grid_name)
     print("-------")
-    container = create_large_lv_simbench(0.5)()
+    container = ALL_GRIDS[grid_name][0]()
     net = container.network
     print_demands(net)
     res = solve(
@@ -707,15 +766,3 @@ if __name__ == "__main__":
         include_coupling_points=container.include_coupling_points,
     )
     print(res.summary())
-
-    # print("Industrial")
-    # print("-------")
-    # net = create_industrial_hub_net()
-    # net.apply_formulation(MISOCP_NETWORK_FORMULATION)
-    # print(run_energy_flow(net, solver=PyomoSolver()))
-
-    # print("Regional")
-    # print("-------")
-    # net = create_regional_mes_net()
-    # net.apply_formulation(MISOCP_NETWORK_FORMULATION)
-    # print(run_energy_flow(net, solver=PyomoSolver()))

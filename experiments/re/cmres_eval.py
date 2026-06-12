@@ -75,7 +75,7 @@ class ScenarioArtefacts:
     ``monee_net``: the post-solve network used by cp_metric.
     ``mc_npz_path``: optional path to the scenario's mc_result.npz; used by
         E7 for the convergence trace and antithetic effectiveness.
-    ``label``: scenario name (e.g. ``"simbench_lv"``).
+    ``label``: scenario name (e.g. ``"simbench_lv_mid_backup"``).
     ``density``: optional CP density for E3 (caller passes through from
         ``ALL_GRIDS``); ``None`` if unknown.
     ``distribution``: ``"distributed" | "centralized" | None`` for E4.

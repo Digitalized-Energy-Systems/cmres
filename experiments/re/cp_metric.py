@@ -2890,7 +2890,7 @@ def mes_cp_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig()):
                 )
             )
 
-    # When the grid has no CPs (e.g. simbench_lv_no, density=0), the rows
+    # When the grid has no CPs (density-0 stems, e.g. simbench_lv_no_backup), the rows
     # list is empty. Constructing the DataFrame normally would yield an
     # empty frame with no columns, and ``sort_values("score")`` would raise
     # ``KeyError: 'score'``. Build the df with the canonical column schema

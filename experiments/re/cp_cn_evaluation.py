@@ -458,31 +458,17 @@ CARRIER_REPLACE_MAP = {"0": "electricity", "1": "heat", "2": "gas"}
 try:
     from grid_topology_table import SCENARIO_LABEL as _GTT_SCENARIO_LABEL  # noqa: E402
 except Exception:  # pragma: no cover
+    # Mirror of grid_topology_table.SCENARIO_LABEL (families: bk = backup,
+    # lb = loadbearing, ctl = control — see test_grids.py).
     _GTT_SCENARIO_LABEL = {
-        "simbench_lv_no":                "LV-no",
-        "simbench_lv_low":               "LV-s",
-        "simbench_lv":                   "LV-m",
-        "simbench_lv_high":              "LV-l",
-        "simbench_lv_xl":                "LV-xl",
-        "simbench_lv_xxl":               "LV-xxl",
-        "simbench_lv_low_same_cap":      "LV-s-eq",
-        "simbench_lv_same_cap":          "LV-m-eq",
-        "simbench_lv_high_same_cap":     "LV-l-eq",
-        "simbench_lv_xl_same_cap":       "LV-xl-eq",
-        "simbench_lv_xxl_same_cap":      "LV-xxl-eq",
-        # ``_relaxed`` variants (20 % headroom, split 50/50 gen/slack) —
-        # mirror the entries in grid_topology_table.SCENARIO_LABEL.
-        "simbench_lv_no_relaxed":               "LV-no-r",
-        "simbench_lv_low_relaxed":              "LV-s-r",
-        "simbench_lv_relaxed":                  "LV-m-r",
-        "simbench_lv_high_relaxed":             "LV-l-r",
-        "simbench_lv_xl_relaxed":               "LV-xl-r",
-        "simbench_lv_xxl_relaxed":              "LV-xxl-r",
-        "simbench_lv_low_same_cap_relaxed":     "LV-s-eq-r",
-        "simbench_lv_same_cap_relaxed":         "LV-m-eq-r",
-        "simbench_lv_high_same_cap_relaxed":    "LV-l-eq-r",
-        "simbench_lv_xl_same_cap_relaxed":      "LV-xl-eq-r",
-        "simbench_lv_xxl_same_cap_relaxed":     "LV-xxl-eq-r",
+        f"simbench_lv_{stem}_{family}": f"{stem_label}-{family_label}"
+        for stem, stem_label in {
+            "no": "LV-no", "low": "LV-s", "mid": "LV-m",
+            "high": "LV-l", "xl": "LV-xl", "xxl": "LV-xxl",
+        }.items()
+        for family, family_label in {
+            "backup": "bk", "loadbearing": "lb", "control": "ctl",
+        }.items()
     }
 
 # Public alias kept for backwards compatibility — downstream modules
@@ -1966,9 +1952,10 @@ def cp_only_pooled_metric_comparison(
 ):
     """Pooled CP-only view across all network types, broken out by cp_type.
 
-    ``class_label`` (``"baseline"`` / ``"relaxed"`` / ``""``) is appended to
-    the output filename so the caller can split the pooled view by stress
-    class without overwriting a single shared HTML.
+    ``class_label`` (a scenario family: ``"backup"`` / ``"loadbearing"`` /
+    ``"control"``, or ``""``) is appended to the output filename so the
+    caller can split the pooled view by family without overwriting a single
+    shared HTML.
     """
     slug_suffix = f"_{class_label}" if class_label else ""
     label = f"pooled-{class_label}" if class_label else "pooled"
@@ -2066,11 +2053,12 @@ def pooled_resilience_per_scenario(perf_df: pandas.DataFrame, output_dir: str):
             ))
         return fig, scens
 
-    # Split by stress class so the 22-grid case doesn't render a 2.5k-px-wide
-    # bar chart. Filter on the raw network_type (the dataframe column that
-    # carries the unstyled key) since stress-class detection keys off the
-    # ``_relaxed`` suffix of the technical name, not the pretty label.
-    classes = _ec.split_scenarios_by_stress(pooled["network_type"].drop_duplicates())
+    # Split by scenario family so a full-roster run doesn't render a
+    # 2.5k-px-wide bar chart. Filter on the raw network_type (the dataframe
+    # column that carries the unstyled key) since family detection keys off
+    # the ``_backup``/``_loadbearing``/``_control`` suffix of the technical
+    # name, not the pretty label.
+    classes = _ec.split_scenarios_by_family(pooled["network_type"].drop_duplicates())
     Path(output_dir).mkdir(exist_ok=True, parents=True)
 
     def _emit(sub_pooled, class_label):
@@ -2278,8 +2266,8 @@ def cross_carrier_impact_per_scenario(
             f"{output_dir}/cross_carrier_impact_per_scenario{slug_suffix}.html"
         )
 
-    # Split by stress class so 22 scenarios don't become 8 subplot rows.
-    classes = _ec.split_scenarios_by_stress(nets)
+    # Split by scenario family so a full roster doesn't become 8 subplot rows.
+    classes = _ec.split_scenarios_by_family(nets)
     if len(classes) <= 1:
         _emit(nets, class_label="")
     else:
@@ -2506,9 +2494,10 @@ def pooled_metric_comparison(pooled_df, output_dir, class_label: str = ""):
     pooled_df must have the same columns as the per-network df produced by
     cp_metric_vs_actual_impact, plus a 'network_type' column.
 
-    ``class_label`` (``"baseline"`` / ``"relaxed"`` / ``""``) is appended to
-    the output filename so the caller can split the pooled view by stress
-    class without overwriting a single shared HTML.
+    ``class_label`` (a scenario family: ``"backup"`` / ``"loadbearing"`` /
+    ``"control"``, or ``""``) is appended to the output filename so the
+    caller can split the pooled view by family without overwriting a single
+    shared HTML.
     """
     import numpy as _np
     import plotly.graph_objects as go
@@ -2932,36 +2921,38 @@ def pooled_metric_comparison(pooled_df, output_dir, class_label: str = ""):
     )
 
 
+# Density stems shared with test_grids._DENSITIES (kept static here so this
+# module stays importable without test_grids' heavy simbench/monee deps).
+_STEM_DENSITY = {
+    "no": 0.0,
+    "low": 0.05,
+    "mid": 0.1,
+    "high": 0.15,
+    "xl": 0.2,
+    "xxl": 0.25,
+}
+
+
 def _scenario_density_distribution(network_type: str):
-    """Map a simbench scenario name to (CP density, distribution label).
+    """Map a scenario name to (CP density, distribution label).
 
     Returns ``(None, None)`` for scenarios that don't follow the
-    ``simbench_lv[...]`` naming convention so the CMRES E3/E4
+    ``simbench_lv_<stem>_<family>`` naming convention so the CMRES E3/E4
     experiments can simply skip them.
 
-    The ``_relaxed`` suffix (20 % carrier headroom variant, see
-    ``test_grids._apply_headroom``) is stripped first because it's a stress
-    knob, not a topology variant — the relaxed grid has the same CP density
-    and distribution as its baseline counterpart.
+    The family suffix (``_backup`` / ``_loadbearing`` / ``_control``, see
+    ``test_grids.py``) is stripped first because it's a supply-sizing /
+    CP-role knob, not a topology variant — every family member shares the
+    CP density and distribution of its density stem.
     """
     name = str(network_type)
-    if name.endswith("_relaxed"):
-        name = name[: -len("_relaxed")]
+    fam = _ec.scenario_family(name)
+    if fam != "other":
+        name = name[: -(len(fam) + 1)]
     distribution = "centralized" if "centralized" in name else "distributed"
-    if name.endswith("_no") or name == "simbench_lv_no":
-        return 0.0, distribution
-    if name.endswith("_low_high"):
-        return 0.875, distribution  # informal mid between low and high
-    if name.endswith("_low"):
-        return 0.25, distribution
-    if name.endswith("_high"):
-        return 0.75, distribution
-    if name.endswith("_max"):
-        return 1.0, distribution
-    if name.endswith("_centralized"):
-        return 0.5, "centralized"
-    if name == "simbench_lv":
-        return 0.5, distribution
+    for stem, density in _STEM_DENSITY.items():
+        if name.endswith(f"_{stem}"):
+            return density, distribution
     return None, distribution
 
 
@@ -3004,7 +2995,7 @@ def evaluate(folder_id):
         print(network_type)
         # Plain run_energy_flow is a hard feasibility solve and goes infeasible
         # whenever the demanded load exceeds what the (sparse) coupling points
-        # plus the heat slack can deliver — e.g. simbench_lv_low: ~0.534 MW
+        # plus the heat slack can deliver — e.g. a low-density grid: ~0.534 MW
         # heat demand vs ~0.012 MW heat injection from 6 CHPHGs + 1 P2HHG. Try
         # the hard solve first (fast path); if it reports infeasible, fall back
         # to the same load-shedding optimisation that produced the pickle in
@@ -3086,12 +3077,11 @@ def evaluate(folder_id):
 
     if len(per_network_dfs) > 1:
         pooled_df = pandas.concat(per_network_dfs, ignore_index=True)
-        # Split by stress class so the per-metric scatter grid + Spearman
-        # heatmap stay readable when both baseline and ``_relaxed`` networks
-        # are present (legacy single-class runs collapse to the original
-        # unsuffixed filename).
+        # Split by scenario family so the per-metric scatter grid + Spearman
+        # heatmap stay readable when several families are present
+        # (single-family runs collapse to the original unsuffixed filename).
         nets = list(pooled_df["network_type"].drop_duplicates())
-        classes = _ec.split_scenarios_by_stress(nets)
+        classes = _ec.split_scenarios_by_family(nets)
         if len(classes) <= 1:
             pooled_metric_comparison(pooled_df, OUTPUT + "/pooled")
             cp_only_pooled_metric_comparison(pooled_df, OUTPUT + "/pooled")

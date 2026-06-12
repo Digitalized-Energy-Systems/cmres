@@ -382,28 +382,26 @@ def _grid_order(grids: List[str]) -> List[str]:
     return known + rest
 
 
-# Canonical stress-class helpers live in eval_common so every cross-scenario
-# plotter shares the same partitioning logic.
+# Canonical scenario-family helpers live in eval_common so every
+# cross-scenario plotter shares the same partitioning logic.
 from eval_common import (  # noqa: E402
-    RELAXED_SUFFIX as _RELAXED_SUFFIX,
-    is_relaxed as _is_relaxed,
-    split_scenarios_by_stress as _split_scenarios_by_stress,
+    scenario_family as _scenario_family,
+    scenario_stem as _grid_base,
+    split_scenarios_by_family as _split_scenarios_by_family,
 )
 
-
-def _grid_base(g: str) -> str:
-    """Strip the ``_relaxed`` suffix so each (baseline, relaxed) pair
-    resolves to the same key for palette / order purposes."""
-    return g[: -len(_RELAXED_SUFFIX)] if _is_relaxed(g) else g
+# Per-family line dash / opacity so grids sharing a density stem (and hence
+# a hue, see _grid_color_map) stay visually distinguishable across families.
+_FAMILY_DASH = {"backup": "solid", "loadbearing": "dash", "control": "dot"}
+_FAMILY_OPACITY = {"backup": 1.0, "loadbearing": 0.7, "control": 0.45}
 
 
 def _grid_color_map(grids: List[str]) -> Dict[str, str]:
-    """Stable colour per grid, with baseline and ``_relaxed`` variants
-    sharing a hue so the eye groups them. Differentiation between the
-    members of a pair is carried by ``_grid_dash`` (Scatter lines) and
-    ``_grid_opacity`` (Bars / Boxes). Palette indexes by *base* name in
-    first-seen order so adding the 11 relaxed variants doesn't shift
-    colours on the legacy plots."""
+    """Stable colour per grid, with all family variants of a density stem
+    sharing a hue so the eye groups them. Differentiation between family
+    members is carried by ``_grid_dash`` (Scatter lines) and
+    ``_grid_opacity`` (Bars / Boxes). Palette indexes by *stem* in
+    first-seen order so adding families doesn't shift colours."""
     palette = list(ev.PALETTE_QUAL)
     bases_in_order: List[str] = []
     seen: set = set()
@@ -417,15 +415,15 @@ def _grid_color_map(grids: List[str]) -> Dict[str, str]:
 
 
 def _grid_dash(g: str) -> str:
-    """Line dash style: ``dash`` for ``_relaxed`` variants, ``solid`` otherwise.
-    Use on Scatter ``line`` to keep paired curves distinguishable."""
-    return "dash" if _is_relaxed(g) else "solid"
+    """Line dash style per scenario family. Use on Scatter ``line`` to keep
+    same-stem curves distinguishable."""
+    return _FAMILY_DASH.get(_scenario_family(g), "solid")
 
 
 def _grid_opacity(g: str) -> float:
-    """Marker / bar opacity: lighter for ``_relaxed`` variants so paired
-    boxes / bars sharing a hue stay visually distinguishable."""
-    return 0.55 if _is_relaxed(g) else 1.0
+    """Marker / bar opacity per scenario family so boxes / bars sharing a
+    hue stay visually distinguishable."""
+    return _FAMILY_OPACITY.get(_scenario_family(g), 1.0)
 
 
 def _pooled_baseline(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
@@ -806,7 +804,7 @@ def _emit_pooled_report(
     out_dir: Path,
     class_label: str = "",
 ) -> Path:
-    """Build the pooled cross-grid figures for one stress-class subset and
+    """Build the pooled cross-grid figures for one scenario-family subset and
     write them to ``pooled[_<class>]_report.html`` plus per-figure PDFs
     under ``single/``. ``class_label=""`` keeps the legacy filename so
     runs with only baseline grids stay byte-identical to before.
@@ -862,21 +860,21 @@ def plot_pooled(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
     """Pooled cross-grid comparison report.
 
     ``records`` maps grid name → ``(sweep_df, baseline_row)`` from ``_load``.
-    When the record set spans both baseline and ``_relaxed`` grids the
-    output is split into one report per stress class (``pooled_baseline_*``
-    and ``pooled_relaxed_*``); otherwise the legacy single ``pooled_*``
+    When the record set spans several scenario families the output is
+    split into one report per family (``pooled_backup_*``,
+    ``pooled_loadbearing_*``, ``pooled_control_*``); otherwise a single ``pooled_*``
     filenames are kept for backwards compatibility. Returns the path of
     the last report written (mostly for the existing single-class call
     sites that ignore the return value).
     """
     grids = _grid_order(list(records))
-    classes = _split_scenarios_by_stress(grids)
+    classes = _split_scenarios_by_family(grids)
 
     if len(classes) <= 1:
         # Legacy / single-class run — emit unsuffixed filenames.
         return _emit_pooled_report(records, grids, out_dir, class_label="")
 
-    # Mixed run — one report per stress class so each fits ≤11 grids.
+    # Mixed run — one report per scenario family so each stays compact.
     last_path: Path | None = None
     for class_label, subset in classes:
         sub_records = {g: records[g] for g in subset}

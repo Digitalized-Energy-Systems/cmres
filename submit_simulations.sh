@@ -9,7 +9,7 @@
 #     SUBMIT_MERGE=0 bash submit_simulations.sh   # don't auto-submit merge
 #
 # Run a single grid only:
-#     GRID_NAME=simbench_lv_high bash submit_simulations.sh
+#     GRID_NAME=simbench_lv_high_backup bash submit_simulations.sh
 #     GRID_IDX=5                 bash submit_simulations.sh
 #
 # It submits two SLURM jobs:
@@ -26,7 +26,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-N_GRIDS=${N_GRIDS:-22}
+N_GRIDS=${N_GRIDS:-15}
 N_SHARDS=${N_SHARDS:-96}
 SUBMIT_MERGE=${SUBMIT_MERGE:-1}
 GRID_NAME=${GRID_NAME:-}
