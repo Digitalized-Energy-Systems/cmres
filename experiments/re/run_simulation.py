@@ -63,8 +63,6 @@ from pathlib import Path
 
 import numpy as np  # noqa: E402
 
-from monee.model.formulation import MISOCP_NETWORK_FORMULATION  # noqa: E402
-
 from test_grids import ALL_GRIDS  # noqa: E402
 
 import cmres.log  # noqa: E402
@@ -113,7 +111,9 @@ def build_network_and_timeseries(grid_name: str):
     create_fn, timeseries_fn = ALL_GRIDS[grid_name]
     container = create_fn()
     net = container.network
-    net.apply_formulation(MISOCP_NETWORK_FORMULATION)
+    # The test_grids factory already applies the formulation set
+    # (EL_MISOCP + McCormick heat); re-applying here was redundant and
+    # kept run_simulation out of sync with single_removal_shed.
     td = timeseries_fn(net, n_steps=TIME_STEPS, seed=SEED)
     return container, td
 

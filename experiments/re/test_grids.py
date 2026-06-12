@@ -45,8 +45,8 @@ from monee import (
 )
 from monee.io.from_pandapower import from_pandapower_net
 from monee.model.formulation import (
-    MISOCP_NETWORK_FORMULATION,
-    make_mccormick_dhs_formulation,
+    EL_MISOCP_FORMULATION,
+    make_heat_convex_milp_formulation,
 )
 from monee.network import (
     generate_supply_return_mes_based_on_power_net,
@@ -608,8 +608,17 @@ def create_large_lv_simbench(density, central=False, cp_capacity_invariant=False
             label=f"density={density},same_cap={cp_capacity_invariant}",
         )
 
-        mes.apply_formulation(MISOCP_NETWORK_FORMULATION)
-        mes.apply_formulation(make_mccormick_dhs_formulation(num_partitions=16))
+        # Convex MILP/MISOCP set for the Gurobi shed problem: branch-flow
+        # MISOCP on electricity + McCormick district heating on the heat
+        # pipes (``include_heat_exchangers=False`` keeps the legacy
+        # pipes-only behaviour of ``make_mccormick_dhs_formulation``); gas
+        # stays on the model-default equations.
+        mes.apply_formulation(EL_MISOCP_FORMULATION)
+        mes.apply_formulation(
+            make_heat_convex_milp_formulation(
+                num_partitions=16, include_heat_exchangers=False
+            )
+        )
 
         slack_el = slack_overrides["slack_el_mw"]
         slack_gas = slack_overrides["slack_gas_kgps"]

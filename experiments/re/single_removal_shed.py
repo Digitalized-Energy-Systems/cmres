@@ -208,6 +208,56 @@ def _shed_from_solved(
     return float(power), float(heat), float(gas), float(power + heat + gas)
 
 
+def _connected_shed_from_solved(net) -> Tuple[float, float, float, float]:
+    """Per-carrier shed over *connected* loads only (MW).
+
+    The total metric (``_shed_from_solved``) counts two very different
+    things at once: curtailment of loads the optimiser chose to shed, and
+    the full nameplate of loads that were topologically disconnected by the
+    removal (``ignored`` / inactive). The latter is unrecoverable no matter
+    how the system is dispatched, so for "how well can the remaining system
+    serve what it can still reach" this function counts only the former:
+    ``upper − delivered`` over active, non-ignored loads, mirroring the
+    per-load expressions of ``GeneralResiliencePerformanceMetric`` so that
+    ``total − connected`` is exactly the disconnected nameplate share.
+
+    Returns (power_mw, heat_mw, gas_mw, total_mw).
+    """
+    def _reg(m):
+        v = mm.value(getattr(m, "regulation", 1))
+        return 1.0 if v is None else float(v)
+
+    passive_hx = getattr(mm, "PassiveHeatExchangerLoad", mm.HeatExchangerLoad)
+    p = h = g = 0.0
+    for c in net.childs:
+        if c.ignored or not c.active:
+            continue
+        m = c.model
+        if isinstance(m, mm.PowerLoad):
+            p += float(mm.upper(m.p_mw) or 0.0) \
+                - float(mm.value(m.p_mw) or 0.0) * _reg(m)
+        elif isinstance(m, mm.HeatLoad):
+            h += float(mm.upper(m.q_mw_heat) or 0.0) \
+                - float(mm.value(m.q_mw_heat) or 0.0) * _reg(m)
+        elif isinstance(m, (mm.HeatExchangerLoad, passive_hx)):
+            h += float(mm.upper(m.q_mw) or 0.0) \
+                - float(mm.value(m.q_mw) or 0.0) * _reg(m)
+        elif isinstance(m, mm.Sink) and hasattr(c.grid, "higher_heating_value"):
+            f = 3.6 * float(c.grid.higher_heating_value)
+            g += (
+                float(mm.upper(m.mass_flow) or 0.0)
+                - float(mm.value(m.mass_flow) or 0.0) * _reg(m)
+            ) * f
+    for b in net.branches:
+        if b.ignored or not b.active:
+            continue
+        m = b.model
+        if isinstance(m, (mm.HeatExchangerLoad, passive_hx)):
+            h += float(mm.upper(m.q_mw) or 0.0) \
+                - float(mm.value(m.q_mw) or 0.0) * _reg(m)
+    return float(p), float(h), float(g), float(p + h + g)
+
+
 def compute_single_removal_shed(
     net_factory,
     ext_grid_bounds: dict,
@@ -257,9 +307,14 @@ def compute_single_removal_shed(
         _shed_from_solved(base.network, include_coupling_points=include_coupling_points)
         if base is not None else (0.0, 0.0, 0.0, 0.0)
     )
+    base_pc, base_hc, base_gc, base_tc = (
+        _connected_shed_from_solved(base.network)
+        if base is not None else (0.0, 0.0, 0.0, 0.0)
+    )
     log.info(
-        "baseline: total_shed=%.4f MW (p=%.4f, h=%.4f, g=%.4f) in %.1fs",
-        base_t, base_p, base_h, base_g, time.time() - t0,
+        "baseline: total_shed=%.4f MW (p=%.4f, h=%.4f, g=%.4f; connected-only "
+        "total=%.4f) in %.1fs",
+        base_t, base_p, base_h, base_g, base_tc, time.time() - t0,
     )
 
     rows = [
@@ -270,6 +325,10 @@ def compute_single_removal_shed(
             "heat_shed": base_h,
             "gas_shed": base_g,
             "total_shed": base_t,
+            "power_shed_conn": base_pc,
+            "heat_shed_conn": base_hc,
+            "gas_shed_conn": base_gc,
+            "total_shed_conn": base_tc,
             "solve_status": "ok" if base is not None else "fail",
             "elapsed_s": float(time.time() - t0),
         }
@@ -290,6 +349,8 @@ def compute_single_removal_shed(
                 "cp_id": cp_id, "kind": kind,
                 "power_shed": float("nan"), "heat_shed": float("nan"),
                 "gas_shed": float("nan"), "total_shed": float("nan"),
+                "power_shed_conn": float("nan"), "heat_shed_conn": float("nan"),
+                "gas_shed_conn": float("nan"), "total_shed_conn": float("nan"),
                 "solve_status": "deactivate_fail",
                 "elapsed_s": float(time.time() - t1),
             })
@@ -301,20 +362,25 @@ def compute_single_removal_shed(
                 **bounds,
             )
             if res is None:
-                p, h, g, tot = float("nan"), float("nan"), float("nan"), float("nan")
+                p = h = g = tot = float("nan")
+                pc = hc = gc = totc = float("nan")
                 status = "solve_fail"
             else:
                 p, h, g, tot = _shed_from_solved(
                     res.network, include_coupling_points=include_coupling_points
                 )
+                pc, hc, gc, totc = _connected_shed_from_solved(res.network)
                 status = "ok"
         except Exception:
             log.exception("shed solve failed for %s", cp_id)
-            p, h, g, tot = float("nan"), float("nan"), float("nan"), float("nan")
+            p = h = g = tot = float("nan")
+            pc = hc = gc = totc = float("nan")
             status = "solve_exception"
         rows.append({
             "cp_id": cp_id, "kind": kind,
             "power_shed": p, "heat_shed": h, "gas_shed": g, "total_shed": tot,
+            "power_shed_conn": pc, "heat_shed_conn": hc,
+            "gas_shed_conn": gc, "total_shed_conn": totc,
             "solve_status": status,
             "elapsed_s": float(time.time() - t1),
         })

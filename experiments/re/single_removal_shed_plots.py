@@ -262,24 +262,35 @@ def _hist_total(sweep: pd.DataFrame, grid: str, baseline_total: float) -> go.Fig
     return _srs_finalize(fig, legend="right")
 
 
-def _top_components(sweep: pd.DataFrame, grid: str, top_n: int = 20) -> go.Figure:
-    top = sweep.sort_values("total_shed", ascending=False).head(top_n).iloc[::-1]
+def _top_components(
+    sweep: pd.DataFrame, grid: str, top_n: int = 20, conn: bool = False
+) -> go.Figure:
+    """Top-N components by shed, stacked per carrier.
+
+    ``conn=True`` reads the ``*_shed_conn`` columns (curtailment of loads
+    that remain *connected* after the removal — disconnected loads are
+    unrecoverable regardless of dispatch, so the connected-only view shows
+    the shed the optimisation actually decides about).
+    """
+    suffix = "_conn" if conn else ""
+    top = sweep.sort_values(f"total_shed{suffix}", ascending=False).head(top_n).iloc[::-1]
     fig = go.Figure()
     for carrier, color in zip(
         ("power_shed", "heat_shed", "gas_shed"),
         (ev.NETWORK_COLOR_MAP["electricity"], ev.NETWORK_COLOR_MAP["heat"], ev.NETWORK_COLOR_MAP["gas"]),
     ):
         fig.add_trace(go.Bar(
-            x=top[carrier],
+            x=top[f"{carrier}{suffix}"],
             y=top["cp_id"].astype(str),
             orientation="h",
             name=carrier.replace("_shed", ""),
             marker_color=color,
         ))
+    label = "connected-load shed" if conn else "total shed"
     fig.update_layout(
         barmode="stack",
-        title=f"{pretty_scenario(grid)}: top-{top_n} components by total shed (per-carrier breakdown)",
-        xaxis_title="Load shed (MW)",
+        title=f"{pretty_scenario(grid)}: top-{top_n} components by {label} (per-carrier breakdown)",
+        xaxis_title=("Connected-load shed (MW)" if conn else "Load shed (MW)"),
         yaxis_title="Component (cp_id)",
         height=600, width=950,
         margin=dict(l=200),
@@ -508,19 +519,26 @@ def _pooled_total_shed_box(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
 
 
 def _pooled_excess_shed_box(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
-                            grids: List[str]) -> go.Figure:
+                            grids: List[str], conn: bool = False) -> go.Figure:
     """One box per grid of (total_shed − baseline_total_shed), restricted to
     components that actually cause extra shed (delta > 0). Makes the "how
-    much worse can it get under fault?" comparison directly readable."""
+    much worse can it get under fault?" comparison directly readable.
+
+    ``conn=True`` uses the ``total_shed_conn`` column instead — the
+    curtailment of loads that remain connected after the removal. Since
+    disconnected loads are unrecoverable, the connected-only excess is the
+    part of the fault response that dispatch (and hence CPs) can influence.
+    """
+    col = "total_shed_conn" if conn else "total_shed"
     fig = go.Figure()
     color = _grid_color_map(grids)
     n_total = []
     for g in grids:
         sweep, baseline = records[g]
-        if sweep.empty:
+        if sweep.empty or col not in sweep.columns:
             continue
-        base_t = float(baseline["total_shed"]) if baseline is not None else 0.0
-        delta = sweep["total_shed"] - base_t
+        base_t = float(baseline.get(col, 0.0)) if baseline is not None else 0.0
+        delta = sweep[col] - base_t
         positive = delta[delta > 1e-9]
         n_total.append((g, int(len(positive)), int(len(sweep))))
         if positive.empty:
@@ -533,9 +551,12 @@ def _pooled_excess_shed_box(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
             hovertemplate=("<b>" + pretty_scenario(g)
                            + "</b><br>Δ shed = %{y:.4f} MW<extra></extra>"),
         ))
+    label = "connected-load shed" if conn else "total_shed"
     fig.update_layout(
-        title=("Excess shed under fault: total_shed − baseline per component"),
-        xaxis_title="Grid", yaxis_title="Excess shed Δ (MW, log)",
+        title=(f"Excess shed under fault: {label} − baseline per component"),
+        xaxis_title="Grid",
+        yaxis_title=("Excess connected shed Δ (MW, log)" if conn
+                     else "Excess shed Δ (MW, log)"),
         yaxis_type="log",
         height=520, width=max(720, 90 * len(grids) + 180),
     )
@@ -714,8 +735,11 @@ def _pooled_mean_shed_by_carrier(records: Dict[str, Tuple[pd.DataFrame, pd.Serie
             customdata=np.c_[sub["n"].values],
         ))
     fig.update_layout(
-        barmode="group",
-        title="Average per-component shed per grid, broken down by sector",
+        # Stacked: bar height = mean *total* shed per component, so grids
+        # stay directly comparable on the full shedding while the segments
+        # show the per-sector composition.
+        barmode="stack",
+        title="Average per-component shed per grid, stacked by sector",
         xaxis_title="Grid",
         yaxis_title="Mean shed per component (MW)",
         height=460, width=max(720, 110 * len(grids) + 200),
@@ -831,8 +855,7 @@ def _emit_pooled_report(
         "Top-10 components per grid",
         "Solve-time per grid",
     ]
-    suffix = f"_{class_label}" if class_label else ""
-    slugs = [f"pooled{suffix}_{s}" for s in (
+    slug_names = [
         "baseline",
         "total_shed_box",
         "excess_shed_box",
@@ -842,7 +865,16 @@ def _emit_pooled_report(
         "kind_summary",
         "top10_components",
         "solve_time",
-    )]
+    ]
+    # Connected-only excess view — needs the ``*_shed_conn`` columns
+    # recorded by current single_removal_shed.py runs; skipped silently on
+    # legacy CSVs so old result sets still render.
+    if any("total_shed_conn" in s.columns for s, _ in records.values()):
+        figs.insert(3, _pooled_excess_shed_box(records, grids, conn=True))
+        titles.insert(3, "Excess connected-load shed (delta over baseline) per grid")
+        slug_names.insert(3, "excess_shed_conn_box")
+    suffix = f"_{class_label}" if class_label else ""
+    slugs = [f"pooled{suffix}_{s}" for s in slug_names]
     out_html = out_dir / f"pooled{suffix}_report.html"
     heading = (
         f"single-removal shed — pooled ({class_label}, {len(grids)} grids)"
@@ -903,16 +935,24 @@ def plot_grid(grid: str, csv_path: Path, out_dir: Path):
         "Total shed by component kind",
         "Per-component solve time",
     ]
-    # Namespace slugs by grid so multiple grids in the same `--dir` don't
-    # clobber each other's per-figure PDFs under ``single/``.
-    slugs = [f"{grid}_{s}" for s in (
+    slug_names = [
         "hist_total_shed",
         "top20_components",
         "pareto",
         "per_carrier_box",
         "by_kind",
         "solve_time",
-    )]
+    ]
+    # Connected-only view (curtailment of still-connected loads, excluding
+    # the unrecoverable nameplate of disconnected ones). Needs the
+    # ``*_shed_conn`` columns; skipped on legacy CSVs.
+    if "total_shed_conn" in sweep.columns:
+        figs.insert(2, _top_components(sweep, grid, top_n=20, conn=True))
+        titles.insert(2, "Top-20 components by connected-load shed")
+        slug_names.insert(2, "top20_components_conn")
+    # Namespace slugs by grid so multiple grids in the same `--dir` don't
+    # clobber each other's per-figure PDFs under ``single/``.
+    slugs = [f"{grid}_{s}" for s in slug_names]
     out_html = out_dir / f"{grid}_report.html"
     ev.write_all_in_one(figs, f"single-removal shed — {pretty_scenario(grid)}", Path("."), str(out_html),
                         write_single_files=True, titles=titles, slugs=slugs)

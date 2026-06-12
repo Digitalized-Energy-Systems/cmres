@@ -554,6 +554,9 @@ def resilience_per_scenario(perf_df: pandas.DataFrame, folder_id):
     resilience_per_carrier_per_scenario["experiment"] = (
         resilience_per_carrier_per_scenario["experiment"].map(pretty_scenario)
     )
+    # Stacked so the bar height = total performance drop across sectors —
+    # full sheddings stay directly comparable between scenarios while the
+    # segments still show the per-sector composition.
     eval.create_bar(
         resilience_per_carrier_per_scenario,
         x_label="experiment",
@@ -566,7 +569,7 @@ def resilience_per_scenario(perf_df: pandas.DataFrame, folder_id):
         yaxis_title="mean performance loss in MW",
         xaxis_title="scenario",
         title="Performance drop by scenario, by carrier",
-        barmode="group",
+        barmode="stack",
         width=1200,
         height=450,
     )
@@ -2066,7 +2069,10 @@ def pooled_resilience_per_scenario(perf_df: pandas.DataFrame, output_dir: str):
         suffix = f" ({class_label})" if class_label else ""
         slug_suffix = f"_{class_label}" if class_label else ""
         fig.update_layout(
-            barmode="group",
+            # Stacked: bar height = total performance drop, so the full
+            # sheddings stay comparable across scenarios while the segments
+            # show the per-sector composition.
+            barmode="stack",
             template=eval.CMRES_TEMPLATE,
             title=f"Pooled performance drop by scenario, by carrier{suffix}",
             xaxis=dict(title="Scenario"),
