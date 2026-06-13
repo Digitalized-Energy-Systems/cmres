@@ -47,7 +47,7 @@ class CentralFaultyMoneeWorldStepHook(StepHook):
         )
         observer.gather(
             "balance_gas",
-            net.childs_by_type(mm.ExtHydrGrid)[1].model.mass_flow,
+            net.childs_by_type(mm.ExtHydrGrid)[1].model.mass_flow_kgs,
         )
 
 

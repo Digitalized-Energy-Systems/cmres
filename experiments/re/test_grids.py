@@ -5,14 +5,16 @@ All grids share one topology (simbench ``1-LV-rural3--1-no_sw`` + generated
 gas / heat layers) and differ in coupling-point density and supply sizing.
 Three scenario families demonstrate how CPs affect resilience:
 
-  ``_backup``      – additive CPs, asymmetric headroom: electricity tight
-                     (h=0.04), gas rich (h=0.30). Electrical failures can be
-                     rescued by CHPs drawing on the gas surplus → "CPs help".
-  ``_loadbearing`` – CPs replace primary generation (``cp_capacity_invariant``),
+  ``_backup``      - additive CPs, asymmetric headroom: electricity tight
+                     (h=0.04), gas rich and CP-aware (h=0.30 floor, raised so
+                     the gas surplus stays 50 % above the CP fleet's rated gas
+                     draw at every density). Electrical failures can be rescued
+                     by CHPs drawing on the gas surplus → "CPs help".
+  ``_loadbearing`` - CPs replace primary generation (``cp_capacity_invariant``),
                      symmetric h=0.10 sized CP-aware so the CP fleet is fully
                      fuelable at baseline. Gas-side failures cascade through
                      the load-bearing CHPs → "CPs hurt".
-  ``_control``     – additive CPs, both carriers tight (h=0.04). Negative
+  ``_control``     - additive CPs, both carriers tight (h=0.04). Negative
                      control: without donor-carrier surplus CPs cannot help.
 
 Headroom ``h`` per carrier is split 50/50: in-grid generation is sized at
@@ -110,10 +112,10 @@ def make_urban_district_timeseries(
     for c in net.childs_by_type(mm.Sink):
         if c.grid.name == "gas":
             amp = 0.30
-            base = float(mm.value(c.model.mass_flow))
+            base = float(mm.value(c.model.mass_flow_kgs))
             td.add_child_series(
                 c.id,
-                "mass_flow",
+                "mass_flow_kgs",
                 _sinusoidal_profile(n_steps, base, amplitude=amp, rng=rng),
             )
     return td
@@ -133,10 +135,10 @@ def make_industrial_hub_timeseries(
             _sinusoidal_profile(n_steps, base, amplitude=0.15, noise=0.02, rng=rng),
         )
     for c in net.childs_by_type(mm.Sink):
-        base = float(mm.value(c.model.mass_flow))
+        base = float(mm.value(c.model.mass_flow_kgs))
         td.add_child_series(
             c.id,
-            "mass_flow",
+            "mass_flow_kgs",
             _sinusoidal_profile(n_steps, base, amplitude=0.20, noise=0.03, rng=rng),
         )
     return td
@@ -156,10 +158,10 @@ def make_regional_mes_timeseries(
     for c in net.childs_by_type(mm.Sink):
         if c.grid.name == "gas":
             amp = 0.30
-            base = float(mm.value(c.model.mass_flow))
+            base = float(mm.value(c.model.mass_flow_kgs))
             td.add_child_series(
                 c.id,
-                "mass_flow",
+                "mass_flow_kgs",
                 _sinusoidal_profile(n_steps, base, amplitude=amp, rng=rng),
             )
     return td
@@ -238,7 +240,10 @@ def _balance_demand_for_cp_replacement(net) -> None:
             c for c in net.childs_by_type(mm.Sink)
             if c.grid is not None and getattr(c.grid, "name", None) == "gas"
         ]
-        total_g_kgps = sum(float(mm.value(c.model.mass_flow) or 0.0) for c in sinks)
+        # Sink.mass_flow_kgs is stored with consumption (negative) sign in
+        # monee; take magnitudes for the demand total and preserve each
+        # Sink's sign when scaling.
+        total_g_kgps = sum(abs(float(mm.value(c.model.mass_flow_kgs) or 0.0)) for c in sinks)
         total_g_mw = total_g_kgps * 3.6 * hhv
         if total_g_mw > 0:
             if g_in_mw >= total_g_mw:
@@ -247,11 +252,11 @@ def _balance_demand_for_cp_replacement(net) -> None:
                     f"gas Sink {total_g_mw:.4f} MW; setting Sink mass_flow to 1e-9 kg/s each."
                 )
                 for c in sinks:
-                    c.model.mass_flow = 1e-9
+                    c.model.mass_flow_kgs = 1e-9
             else:
                 scale = (total_g_mw - g_in_mw) / total_g_mw
                 for c in sinks:
-                    c.model.mass_flow = float(mm.value(c.model.mass_flow) or 0.0) * scale
+                    c.model.mass_flow_kgs = float(mm.value(c.model.mass_flow_kgs) or 0.0) * scale
 
     if p_in_mw > 0 or g_in_mw > 0:
         print(
@@ -299,7 +304,7 @@ def _cp_io_mw(net) -> dict:
         m = cp.model
         cn = type(m).__name__
         if cn in ("CHP", "CHPHG"):
-            kgps = abs(float(getattr(m, "mass_flow_setpoint", 0.0) or 0.0))
+            kgps = abs(float(getattr(m, "mass_flow_setpoint_kgs", 0.0) or 0.0))
             gas_mw = kgps * 3.6 * hhv
             io["g_in"] += gas_mw
             eta_p = float(getattr(m, "efficiency_power", 0.0) or 0.0)
@@ -329,8 +334,8 @@ def _cp_io_mw(net) -> dict:
                 io["p_out"] += p
         elif cn == "PowerToGas":
             # mass_flow_setpoint stored on the branch (positive magnitude);
-            # the constructor flips its sign onto gas_kgps internally.
-            kgps_out = abs(float(getattr(m, "gas_kgps", 0.0) or 0.0))
+            # the constructor flips its sign onto gas_mass_flow_kgs internally.
+            kgps_out = abs(float(getattr(m, "gas_mass_flow_kgs", 0.0) or 0.0))
             eta = float(getattr(m, "efficiency", 0.0) or 0.0)
             if eta > 1e-6:
                 gas_mw = kgps_out * 3.6 * hhv
@@ -364,17 +369,19 @@ def _carrier_totals(net) -> dict:
         c for c in net.childs_by_type(mm.Sink)
         if c.grid is not None and getattr(c.grid, "name", None) == "gas"
     ]
+    # Sink.mass_flow_kgs is stored with a consumption (negative) sign — take
+    # absolute for the demand magnitude.
     g_demand_kgps = sum(
-        float(mm.value(c.model.mass_flow) or 0.0) for c in g_sinks
+        abs(float(mm.value(c.model.mass_flow_kgs) or 0.0)) for c in g_sinks
     )
 
     g_sources = [
         c for c in net.childs_by_type(mm.Source)
         if c.grid is not None and getattr(c.grid, "name", None) == "gas"
     ]
-    # Source.mass_flow stored with a negative sign — take absolute.
+    # Source.mass_flow_kgs stored with a negative sign — take absolute.
     g_gen_kgps = sum(
-        abs(float(mm.value(c.model.mass_flow) or 0.0)) for c in g_sources
+        abs(float(mm.value(c.model.mass_flow_kgs) or 0.0)) for c in g_sources
     )
 
     return dict(
@@ -464,8 +471,8 @@ def _apply_headroom(net, h_el: float, h_gas: float, cp_aware: bool = False) -> d
     ]
     g_ok = _scale_to_abs_total(
         gsources,
-        get_val=lambda c: float(mm.value(c.model.mass_flow) or 0.0),
-        set_val=lambda c, v: setattr(c.model, "mass_flow", v),
+        get_val=lambda c: float(mm.value(c.model.mass_flow_kgs) or 0.0),
+        set_val=lambda c, v: setattr(c.model, "mass_flow_kgs", v),
         target_abs_total=g_target_kgps,
     )
     if not g_ok and g_demand_eff_mw > 1e-9:
@@ -545,7 +552,7 @@ def _validate_headroom_balance(
 
 
 def create_large_lv_simbench(density, central=False, cp_capacity_invariant=False,
-                             h_el=0.20, h_gas=0.20):
+                             h_el=0.20, h_gas=0.20, donor_gas_cp_margin=None):
     """Factory for one grid variant.
 
     ``h_el`` / ``h_gas`` are per-carrier headroom fractions (gen sized at
@@ -553,6 +560,18 @@ def create_large_lv_simbench(density, central=False, cp_capacity_invariant=False
     ``cp_capacity_invariant=True`` makes CPs replace primary generation
     (load-bearing) and switches the headroom sizing to CP-aware so the CP
     fleet is fuelable at baseline.
+
+    ``donor_gas_cp_margin`` (additive ``_backup`` family only) makes the *gas*
+    headroom CP-aware: the gas surplus available to ramp the (gas-input) CP
+    fleet during a fault is ``h_gas × gas_demand``, while the fleet's rated gas
+    draw at regulation 1 is ``Σ CP_gas_in``. With a fixed ``h_gas`` that surplus
+    falls behind the fleet as CP density grows (the fleet draw is ≈30 % of gas
+    demand already at density 0.1), so ``_backup`` collapses onto ``_control``
+    at the higher densities — the gas-rich "donor" can no longer fuel the
+    backup CHPs. When set, ``h_gas`` is raised (never lowered) to
+    ``Σ CP_gas_in · (1 + margin) / gas_demand`` so the donor surplus stays
+    ``(1 + margin)×`` the fleet draw at every density. No effect when there are
+    no gas-input CPs (density 0) or for the load-bearing family.
     """
     def create():
         net = simbench.get_simbench_net("1-LV-rural3--1-no_sw")
@@ -591,19 +610,38 @@ def create_large_lv_simbench(density, central=False, cp_capacity_invariant=False
         if cp_capacity_invariant:
             _balance_demand_for_cp_replacement(mes)
 
+        # Donor-carrier sizing for the additive ``_backup`` family: raise the
+        # gas headroom so the gas surplus (= h_gas × gas_demand) stays
+        # (1 + margin)× the CP fleet's rated gas draw at *this* density.
+        # Without this the fixed h_gas is outpaced by the growing CHP fleet and
+        # backup converges onto control. See docstring.
+        h_gas_eff = h_gas
+        if donor_gas_cp_margin is not None:
+            io = _cp_io_mw(mes)
+            t = _carrier_totals(mes)
+            if t["g_demand_mw"] > 1e-9 and io["g_in"] > 0:
+                needed_h = io["g_in"] * (1.0 + donor_gas_cp_margin) / t["g_demand_mw"]
+                h_gas_eff = max(h_gas, needed_h)
+                print(
+                    f"[backup:donor_gas] density={density} CP gas draw="
+                    f"{io['g_in']:.4f} MW ({100 * io['g_in'] / t['g_demand_mw']:.1f}% of "
+                    f"gas demand); h_gas {h_gas:.2f} → {h_gas_eff:.3f} "
+                    f"(surplus ≥ draw × {1.0 + donor_gas_cp_margin:.2f})"
+                )
+
         # Headroom is applied *after* CP rebalancing so the gen and slack
         # budgets are sized against the final post-rebalancing demand. In
         # CP-aware mode (load-bearing CPs) the budgets additionally cover
         # the rated CP input draw and credit the rated CP output.
         slack_overrides = _apply_headroom(
-            mes, h_el=h_el, h_gas=h_gas, cp_aware=cp_capacity_invariant
+            mes, h_el=h_el, h_gas=h_gas_eff, cp_aware=cp_capacity_invariant
         )
         _validate_headroom_balance(
             mes,
             slack_el_mw=slack_overrides["slack_el_mw"],
             slack_gas_kgps=slack_overrides["slack_gas_kgps"],
             h_el=h_el,
-            h_gas=h_gas,
+            h_gas=h_gas_eff,
             cp_aware=cp_capacity_invariant,
             label=f"density={density},same_cap={cp_capacity_invariant}",
         )
@@ -637,9 +675,15 @@ def create_large_lv_simbench_ts(
     return TimeseriesData()
 
 # Per-family factory shorthands (see module docstring for the semantics).
-# "CPs help": tight receiver (el), rich donor (gas); additive CPs.
+# "CPs help": tight receiver (el), rich donor (gas); additive CPs. The gas
+# headroom is CP-aware (``donor_gas_cp_margin``) so the donor surplus stays
+# 50 % above the CP fleet's rated gas draw at every density — a fixed h_gas is
+# outpaced by the growing CHP fleet (≈30 % of gas demand already at d=0.1) and
+# backup would otherwise collapse onto control at the higher densities.
 def _backup(density):
-    return create_large_lv_simbench(density, h_el=0.04, h_gas=0.30)
+    return create_large_lv_simbench(
+        density, h_el=0.04, h_gas=0.30, donor_gas_cp_margin=0.5
+    )
 
 
 # "CPs hurt": CPs replace primary generation; CP-aware symmetric sizing.
@@ -697,7 +741,7 @@ def print_demands(net: mm.Network) -> None:
             gname = getattr(c.grid, "name", "?")
             if gname == "gas":
                 hhv = getattr(c.grid, "higher_heating_value", 15.3)
-                mw = float(mm.value(m.mass_flow)) * 3.6 * hhv
+                mw = abs(float(mm.value(m.mass_flow_kgs))) * 3.6 * hhv
                 rows.append(("gas", "Sink", c.id, mw))
             else:
                 # water sinks: no MW without ΔT context
@@ -734,18 +778,18 @@ def solve(
     include_coupling_points=False,
 ):
     optimization_problem = mp.create_min_load_shedding_problem(
-        bounds_el=(0.9, 1.1),
-        bounds_gas=(0.9, 1.1),
-        bounds_heat=(0.7, 1.3),
-        ext_grid_el_bounds=ext_grid_el_bounds,
-        ext_grid_gas_bounds=ext_grid_gas_bounds,
-        ext_grid_heat_bounds=ext_grid_heat_bounds,
+        bounds_vm=(0.9, 1.1),
+        bounds_pressure=(0.9, 1.1),
+        bounds_t=(0.7, 1.3),
+        bounds_ext_el=ext_grid_el_bounds,
+        bounds_ext_gas=ext_grid_gas_bounds,
+        bounds_ext_heat=ext_grid_heat_bounds,
         include_ext_grids=True,
         include_coupling_points=include_coupling_points,
         check_vm=True,
         check_pressure=True,
-        check_temperature=True,
-        check_line_loading=True,
+        check_t=True,
+        check_lp=True,
         priority_safety_factor=1000.0,
     )
 

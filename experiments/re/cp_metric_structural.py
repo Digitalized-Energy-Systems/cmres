@@ -48,9 +48,9 @@ def _gas_demand_mw(model, grid) -> float:
     """Convert a gas Sink's mass_flow to MW using the same convention as
     the resilience metric (kg/s × HHV [kWh/kg] × 3.6).
     """
-    hhv = float(getattr(grid, "higher_heating_value", 15.3))
+    hhv = float(getattr(grid, "higher_heating_value_kwh_per_kg", 15.3))
     try:
-        m = float(mm.upper(model.mass_flow))
+        m = float(mm.upper(model.mass_flow_kgs))
     except Exception:
         m = 0.0
     if not math.isfinite(m):
@@ -67,7 +67,7 @@ def _carrier_loads(monee_net):
       - power: PowerLoad.p_mw
       - heat:  HeatLoad.q_mw_heat (children) and HeatExchangerLoad.q_mw
               (children + branches)
-      - gas:   Sink.mass_flow × HHV × 3.6 (gas-grid sinks only)
+      - gas:   |Sink.mass_flow_kgs| × HHV × 3.6 (gas-grid sinks only)
     """
     out: Dict[str, List[Tuple[int, float, int, str]]] = {
         "power": [], "heat": [], "gas": [],
@@ -349,7 +349,7 @@ def _cp_rated_capacity(cp, label: str) -> float:
         if label == "GasToPower":
             return abs(float(getattr(cp.model, "el_mw", 0.0) or 0.0))
         if label == "PowerToGas":
-            m_dot = abs(float(getattr(cp.model, "gas_kgps", 0.0) or 0.0))
+            m_dot = abs(float(getattr(cp.model, "gas_mass_flow_kgs", 0.0) or 0.0))
             return m_dot * 15.3 * 3.6  # kg/s × HHV × 3.6 → MW
     except Exception:
         return 1.0

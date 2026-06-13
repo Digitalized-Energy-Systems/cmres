@@ -363,7 +363,7 @@ class CascadingModel(StepModel):
         successful-solve metric measure the same thing. Specifically:
           - power: PowerLoad.p_mw
           - heat:  HeatLoad.q_mw_heat  +  HeatExchangerLoad.q_mw  +  PassiveHeatExchangerLoad.q_mw
-          - gas:   Sink.mass_flow × 3.6 × HHV  (kg/s × kWh/kg → MW)
+          - gas:   |Sink.mass_flow_kgs| × 3.6 × HHV  (kg/s × kWh/kg → MW)
 
         Earlier this counted only HeatExchangerLoad, so on simbench LV grids
         (which use HeatLoad children) the fallback reported heat=0 even when
@@ -391,10 +391,10 @@ class CascadingModel(StepModel):
             if isinstance(b.model, (mm.HeatExchangerLoad, passive_hx)):
                 heat += mm.upper(b.model.q_mw)
         gas = sum(
-            mm.upper(c.model.mass_flow) * 3.6 * c.grid.higher_heating_value
+            abs(mm.upper(c.model.mass_flow_kgs)) * 3.6 * c.grid.higher_heating_value_kwh_per_kg
             for c in net.childs
             if isinstance(c.model, mm.Sink)
-            and hasattr(c.grid, "higher_heating_value")
+            and hasattr(c.grid, "higher_heating_value_kwh_per_kg")
             and c.active
             and not c.ignored
         )

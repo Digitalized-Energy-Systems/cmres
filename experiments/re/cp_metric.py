@@ -600,8 +600,8 @@ def _water_grid(monee_net):
 def _get_gas_hhv(monee_net) -> float:
     try:
         gg = _gas_grid(monee_net)
-        if gg is not None and hasattr(gg, "higher_heating_value"):
-            return float(gg.higher_heating_value)
+        if gg is not None and hasattr(gg, "higher_heating_value_kwh_per_kg"):
+            return float(gg.higher_heating_value_kwh_per_kg)
     except Exception:
         pass
     return 15.3  # kWh/kg typical NG (≈55 MJ/kg)
@@ -671,7 +671,7 @@ def build_gas_susceptance(monee_net, cfg: CPMetricConfig):
         if fi is None or ti is None:
             continue
 
-        m0_raw = _val(pipe.model.mass_flow, 0.0)
+        m0_raw = _val(pipe.model.mass_flow_kgs, 0.0)
         m0 = abs(float(m0_raw)) if _is_finite(m0_raw) else 0.0
         # Floor m0 to keep low-flow pipes in B; b will be capped post-hoc.
         m0_eff = max(m0, cfg.SUSCEPTANCE_FLOW_FLOOR_KGPS)
@@ -741,7 +741,7 @@ def build_heat_susceptance(monee_net, cfg: CPMetricConfig):
         if Rm is None or Rm <= 0 or not _is_finite(Rm):
             continue
 
-        m0_raw = _val(pipe.model.mass_flow, 0.0)
+        m0_raw = _val(pipe.model.mass_flow_kgs, 0.0)
         m0 = abs(float(m0_raw)) if _is_finite(m0_raw) else 0.0
         m0_eff = max(m0, cfg.SUSCEPTANCE_FLOW_FLOOR_KGPS)
 
@@ -1935,8 +1935,8 @@ def _cp_throughput_proxy(cp_or_branch, label: str, monee_net=None) -> float:
             return max(p_mw / sn_mva, 1e-6)
 
         if label == "PowerToGas":
-            # Use fixed rated capacity (gas_kgps), not the solved Pyomo Var (to_mass_flow=0 when idle)
-            m_dot = abs(_safe(getattr(cp_or_branch.model, "gas_kgps", 0.0)))
+            # Use fixed rated capacity (gas_mass_flow_kgs), not the solved Pyomo Var (to_mass_flow=0 when idle)
+            m_dot = abs(_safe(getattr(cp_or_branch.model, "gas_mass_flow_kgs", 0.0)))
             hhv = _get_gas_hhv(monee_net) if monee_net is not None else 15.3
             # HHV is stored in kWh/kg; power [MW] = m_dot [kg/s] * HHV [kWh/kg] * 3.6 [MJ/kWh]
             return max((m_dot * hhv * 3.6) / sn_mva, 1e-6)
@@ -3281,12 +3281,12 @@ def mes_all_components_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig())
 
     # ---- Local metric ----
     # Uses only information locally available to the device (1-hop at most):
-    #   loading            – |flow| / limit: own utilisation (local measurement)
+    #   loading            - |flow| / limit: own utilisation (local measurement)
     #                        For CPs without a meaningful limit: rated throughput proxy.
-    #   n_critical_nbrs    – neighbours with degree ≤ 2 (1-hop info only):
+    #   n_critical_nbrs    - neighbours with degree ≤ 2 (1-hop info only):
     #                        counts neighbours for whom this component is on their
     #                        only or critical path; computable without global routing.
-    #   carrier_coupling   – number of distinct energy carriers this component connects
+    #   carrier_coupling   - number of distinct energy carriers this component connects
     #                        (observable from own port configuration, no network traversal).
     #
     # local_score = loading × (1 + n_critical_nbrs) × carrier_coupling
@@ -3354,7 +3354,7 @@ def mes_all_components_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig())
         return float(len(critical_nbrs))
 
     def _carrier_coupling(row):
-        """Number of distinct energy carriers this component connects (1–3)."""
+        """Number of distinct energy carriers this component connects (1-3)."""
         cp_type = row.get("cp_type", "")
         if cp_type in ("CHP", "CHPHG"):
             return 2.0  # power + heat (matches existing CHP convention)
@@ -3406,8 +3406,8 @@ def mes_all_components_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig())
 
     # ---- Self-only metric (zero-hop) ----
     # Uses exclusively the component's own observable state — no network traversal:
-    #   loading          – own utilisation |flow| / limit
-    #   carrier_coupling – number of carriers connected (readable from own ports)
+    #   loading          - own utilisation |flow| / limit
+    #   carrier_coupling - number of carriers connected (readable from own ports)
     # self_score = loading × carrier_coupling
     df_all["self_score"] = (
         df_all["loading"]
@@ -3696,9 +3696,9 @@ def _ext_capacity_per_carrier_mw(monee_net) -> Dict[str, float]:
             grid = getattr(c, "grid", None)
             if grid is None:
                 continue
-            mag = _bound_mag(c.model.mass_flow)
-            if hasattr(grid, "higher_heating_value"):
-                cap["gas"] += mag * 3.6 * float(grid.higher_heating_value)
+            mag = _bound_mag(c.model.mass_flow_kgs)
+            if hasattr(grid, "higher_heating_value_kwh_per_kg"):
+                cap["gas"] += mag * 3.6 * float(grid.higher_heating_value_kwh_per_kg)
             else:
                 # Heat slack: convert ṁ to MW via cp · ΔT, using cfg-style
                 # defaults so we don't need a config object here.
@@ -3730,9 +3730,10 @@ def _total_demand_per_carrier_mw(monee_net) -> Dict[str, float]:
                 heat += float(mm.upper(m.q_mw) or 0.0)
             elif isinstance(m, mm.Sink):
                 grid = getattr(c, "grid", None)
-                if grid is not None and hasattr(grid, "higher_heating_value"):
-                    gas += float(mm.upper(m.mass_flow) or 0.0) * 3.6 \
-                        * float(grid.higher_heating_value)
+                if grid is not None and hasattr(grid, "higher_heating_value_kwh_per_kg"):
+                    # mass_flow_kgs is stored negative (consumption); abs for demand.
+                    gas += abs(float(mm.upper(m.mass_flow_kgs) or 0.0)) * 3.6 \
+                        * float(grid.higher_heating_value_kwh_per_kg)
         except Exception:
             continue
     for b in monee_net.branches:

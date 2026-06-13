@@ -219,8 +219,8 @@ def get_title(fig, index, titles):
 # bootstrap CIs). Keeping them in filenames makes the same figure produce a
 # *different* filename on every run, which in turn breaks reproducibility for
 # the paper draft. Strip them before slugifying.
-_STATS_SUFFIX_RE = re.compile(r"\s+[—–-]\s+.*$")
-# Anything that's not a–z, 0–9, "_" or "-" gets replaced with "_". Greek/math
+_STATS_SUFFIX_RE = re.compile(r"\s+(?:—|–|-)\s+.*$")
+# Anything that's not a-z, 0-9, "_" or "-" gets replaced with "_". Greek/math
 # characters end up stripped — by design, slug filenames stay ASCII.
 _NON_SLUG_CHAR_RE = re.compile(r"[^a-z0-9_-]+")
 _MULTI_USCORE_RE = re.compile(r"_+")
@@ -255,7 +255,7 @@ def _figure_slug(fig, index: int, titles, slugs):
       1. ``slugs[index]`` if the caller supplied a slugs list with this entry
          set to a non-empty string — used as-is after a defensive slugify.
       2. The figure's layout title or ``titles[index]``, with the run-time
-         stats-line suffix (after " — ", " – ", or " - ") stripped, then
+         stats-line suffix (after " — ", " - ", or " - ") stripped, then
          aggressively slugified and truncated to ``_MAX_SLUG_LEN`` chars.
       3. ``"figure"`` as the last-resort default.
 

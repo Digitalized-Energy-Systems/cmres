@@ -459,7 +459,7 @@ def null_model_configuration(
 
 
 def null_model_er(G: nx.Graph, seed: Optional[int] = None) -> nx.Graph:
-    """Erdős–Rényi multilayer null with matched per-layer edge counts.
+    """Erdős-Rényi multilayer null with matched per-layer edge counts.
 
     Each layer (and the coupling layer) is rewired to a random graph with
     the same number of edges, drawn uniformly without replacement. This is
@@ -561,7 +561,7 @@ def community_partition(G: nx.Graph, seed: Optional[int] = None) -> Dict:
     """Greedy-modularity community partition on the multilayer graph.
 
     Returns a dict ``node → community_id``. We use ``networkx`` greedy
-    modularity (Clauset–Newman–Moore) instead of Louvain so the only
+    modularity (Clauset-Newman-Moore) instead of Louvain so the only
     dependency is networkx itself (Louvain requires ``python-louvain``).
     Output community ids are integers ≥ 0.
     """

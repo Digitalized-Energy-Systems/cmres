@@ -5,7 +5,7 @@ Reports per row (in column order):
     2.  total # nodes              (buses + gas + heat junctions)
     3.  total # branches           (electricity + gas + heat)
     4.  # CPs                      (size of net.cps)
-    5. – 7. rated capacity / demand per sector (electricity / gas / heat) in
+    5. - 7. rated capacity / demand per sector (electricity / gas / heat) in
               MW, each cell formatted as ``gen/CP/demand``
               (primary generation / CP output / load).
 
@@ -99,7 +99,7 @@ def _gas_hhv(net: mm.Network, default: float = 15.3) -> float:
     for n in net.nodes:
         g = getattr(n, "grid", None)
         if g is not None and getattr(g, "name", "") == "gas":
-            return float(getattr(g, "higher_heating_value", default))
+            return float(getattr(g, "higher_heating_value_kwh_per_kg", default))
     return default
 
 
@@ -114,12 +114,12 @@ def _generation_capacity(net: mm.Network, hhv: float) -> Tuple[float, float, flo
             p_e += abs(float(mm.value(c.model.p_mw)))
         except Exception:
             pass
-    # Gas: Source on gas grid (mass_flow → MW via HHV; mass_flow internally negated)
+    # Gas: Source on gas grid (mass_flow_kgs → MW via HHV; internally negated)
     for c in net.childs_by_type(mm.Source):
         if getattr(getattr(c, "grid", None), "name", "") != "gas":
             continue
         try:
-            p_g += abs(float(mm.value(c.model.mass_flow))) * 3.6 * hhv
+            p_g += abs(float(mm.value(c.model.mass_flow_kgs))) * 3.6 * hhv
         except Exception:
             pass
     # Heat: dedicated heat generators (q_mw_heat / q_mw stored on the model)
@@ -165,7 +165,7 @@ def _demand(net: mm.Network, hhv: float) -> Tuple[float, float, float]:
         if getattr(getattr(c, "grid", None), "name", "") != "gas":
             continue
         try:
-            d_g += abs(float(mm.value(c.model.mass_flow))) * 3.6 * hhv
+            d_g += abs(float(mm.value(c.model.mass_flow_kgs))) * 3.6 * hhv
         except Exception:
             pass
     for c in net.childs_by_type(mm.HeatLoad):
@@ -209,7 +209,7 @@ def _cp_capacity(net: mm.Network, hhv: float) -> Tuple[float, float, float]:
         if not isinstance(m, (mm.CHP, mm.CHPHG)):
             continue
         try:
-            mfs = abs(float(getattr(m, "mass_flow_setpoint", 0.0)))
+            mfs = abs(float(getattr(m, "mass_flow_setpoint_kgs", 0.0)))
             eta_p = float(getattr(m, "efficiency_power", 0.0))
             eta_h = float(getattr(m, "efficiency_heat", 0.0))
         except Exception:
@@ -230,7 +230,7 @@ def _cp_capacity(net: mm.Network, hhv: float) -> Tuple[float, float, float]:
             continue
         if isinstance(m, mm.PowerToGas):
             try:
-                kgps = abs(float(mm.value(getattr(m, "gas_kgps", 0.0))))
+                kgps = abs(float(mm.value(getattr(m, "gas_mass_flow_kgs", 0.0))))
                 cap_g += kgps * 3.6 * hhv
             except Exception:
                 pass

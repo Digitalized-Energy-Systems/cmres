@@ -1325,7 +1325,7 @@ def cp_metric_vs_actual_impact(monee_net, impact_df_nt, network_type):
     figures.append(heatmap_fig)
     titles.append("Pairwise Rank Correlation (Spearman ρ) Between All Metrics")
 
-    # 3. Bump chart – rank of each component across all metrics
+    # 3. Bump chart - rank of each component across all metrics
     metric_names = [label for _, label in METRICS]
     rank_cols    = [f"rank_{col}" for col, _ in METRICS]
     cp_colors    = eval.PALETTE_QUAL
@@ -3017,17 +3017,17 @@ def evaluate(folder_id):
             print(f"  plain energy flow failed ({type(e_hard).__name__}: {e_hard}) "
                   f"— falling back to min-load-shedding optimisation")
             opt = mp.create_min_load_shedding_problem(
-                bounds_el=(0.9, 1.1),
-                bounds_gas=(0.9, 1.1),
-                bounds_heat=(0.7, 1.3),
-                ext_grid_el_bounds=(-0.25, 0.25),
-                ext_grid_gas_bounds=(-1.5, 1.5),
-                ext_grid_heat_bounds=(-100, 100),
+                bounds_vm=(0.9, 1.1),
+                bounds_pressure=(0.9, 1.1),
+                bounds_t=(0.7, 1.3),
+                bounds_ext_el=(-0.25, 0.25),
+                bounds_ext_gas=(-1.5, 1.5),
+                bounds_ext_heat=(-100, 100),
                 include_ext_grids=True,
                 check_vm=True,
                 check_pressure=True,
-                check_temperature=True,
-                check_line_loading=True,
+                check_t=True,
+                check_lp=True,
                 priority_safety_factor=1000.0,
             )
             try:

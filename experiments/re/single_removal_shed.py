@@ -153,18 +153,18 @@ def _solve_load_shed(
     # shed) without us having to hand-pick a weight magnitude.
     opt = mp.create_min_load_shedding_problem(
         generator_weight=0.1,
-        bounds_el=(0.9, 1.1),
-        bounds_gas=(0.9, 1.1),
-        bounds_heat=(0.7, 1.3),
-        ext_grid_el_bounds=ext_grid_el_bounds,
-        ext_grid_gas_bounds=ext_grid_gas_bounds,
-        ext_grid_heat_bounds=ext_grid_heat_bounds,
+        bounds_vm=(0.9, 1.1),
+        bounds_pressure=(0.9, 1.1),
+        bounds_t=(0.7, 1.3),
+        bounds_ext_el=ext_grid_el_bounds,
+        bounds_ext_gas=ext_grid_gas_bounds,
+        bounds_ext_heat=ext_grid_heat_bounds,
         include_ext_grids=True,
         include_coupling_points=include_coupling_points,
         check_vm=True,
         check_pressure=True,
-        check_temperature=True,
-        check_line_loading=True,
+        check_t=True,
+        check_lp=True,
         priority_safety_factor=1000.0,
     )
     try:
@@ -242,11 +242,13 @@ def _connected_shed_from_solved(net) -> Tuple[float, float, float, float]:
         elif isinstance(m, (mm.HeatExchangerLoad, passive_hx)):
             h += float(mm.upper(m.q_mw) or 0.0) \
                 - float(mm.value(m.q_mw) or 0.0) * _reg(m)
-        elif isinstance(m, mm.Sink) and hasattr(c.grid, "higher_heating_value"):
-            f = 3.6 * float(c.grid.higher_heating_value)
+        elif isinstance(m, mm.Sink) and hasattr(c.grid, "higher_heating_value_kwh_per_kg"):
+            f = 3.6 * float(c.grid.higher_heating_value_kwh_per_kg)
+            # Sink.mass_flow_kgs is stored with a consumption (negative) sign;
+            # take magnitudes so gas shed stays positive like the other carriers.
             g += (
-                float(mm.upper(m.mass_flow) or 0.0)
-                - float(mm.value(m.mass_flow) or 0.0) * _reg(m)
+                abs(float(mm.upper(m.mass_flow_kgs) or 0.0))
+                - abs(float(mm.value(m.mass_flow_kgs) or 0.0)) * _reg(m)
             ) * f
     for b in net.branches:
         if b.ignored or not b.active:

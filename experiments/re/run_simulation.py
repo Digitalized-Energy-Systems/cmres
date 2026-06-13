@@ -461,7 +461,7 @@ def main():
         nargs="?",
         type=int,
         default=None,
-        help=f"1-based experiment index (1–{len(EXPERIMENTS)}).  Omit to run all.",
+        help=f"1-based experiment index (1-{len(EXPERIMENTS)}).  Omit to run all.",
     )
     parser.add_argument(
         "--name",
@@ -540,7 +540,7 @@ def main():
         else:
             idx = args.index - 1
             if not (0 <= idx < len(EXPERIMENTS)):
-                log.error("index must be 1–%d", len(EXPERIMENTS))
+                log.error("index must be 1-%d", len(EXPERIMENTS))
                 sys.exit(1)
             merge_shards(EXPERIMENTS[idx])
         return
@@ -558,7 +558,7 @@ def main():
     if args.index is not None:
         idx = args.index - 1
         if not (0 <= idx < len(EXPERIMENTS)):
-            log.error("index must be 1–%d", len(EXPERIMENTS))
+            log.error("index must be 1-%d", len(EXPERIMENTS))
             sys.exit(1)
         grid = EXPERIMENTS[idx]
         if args.resume and is_done(grid):

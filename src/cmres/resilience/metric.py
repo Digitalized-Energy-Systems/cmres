@@ -61,7 +61,7 @@ class SimpleResilienceMetric(ResilienceMetric):
     def gather(self, network: Network, time):
         ext_hydr_grids = network.childs_by_type(md.ExtHydrGrid)
         for grid in ext_hydr_grids:
-            self.gas_balance_measurements.append(grid.model.mass_flow)
+            self.gas_balance_measurements.append(grid.model.mass_flow_kgs)
 
         ext_power_grids = network.childs_by_type(md.ExtPowerGrid)
         for grid in ext_power_grids:

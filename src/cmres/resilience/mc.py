@@ -69,10 +69,10 @@ class ComponentRegistry:
 
     Iteration order
     ---------------
-    1. ``net.nodes``     – independent nodes only
-    2. ``net.branches``  – independent branches, plus HeatExchanger regardless
-    3. ``net.childs``    – independent children only
-    4. ``net.compounds`` – all compounds
+    1. ``net.nodes``     - independent nodes only
+    2. ``net.branches``  - independent branches, plus HeatExchanger regardless
+    3. ``net.childs``    - independent children only
+    4. ``net.compounds`` - all compounds
 
     Identity
     --------

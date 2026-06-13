@@ -19,18 +19,18 @@ def solve(
 ):
 
     optimization_problem = mp.create_min_load_shedding_problem(
-        bounds_el=(0.9, 1.1),
-        bounds_gas=(0.9, 1.1),
-        bounds_heat=(0.8, 1.15),
-        ext_grid_el_bounds=ext_grid_el_bounds,
-        ext_grid_gas_bounds=ext_grid_gas_bounds,
-        ext_grid_heat_bounds=ext_grid_heat_bounds,
+        bounds_vm=(0.9, 1.1),
+        bounds_pressure=(0.9, 1.1),
+        bounds_t=(0.8, 1.15),
+        bounds_ext_el=ext_grid_el_bounds,
+        bounds_ext_gas=ext_grid_gas_bounds,
+        bounds_ext_heat=ext_grid_heat_bounds,
         include_ext_grids=True,
         include_coupling_points=include_coupling_points,
         check_vm=True,
         check_pressure=True,
-        check_temperature=True,
-        check_line_loading=True,
+        check_t=True,
+        check_lp=True,
         priority_safety_factor=1000.0,
     )
 
