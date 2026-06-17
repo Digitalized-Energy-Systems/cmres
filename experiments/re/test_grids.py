@@ -665,7 +665,17 @@ def create_large_lv_simbench(density, central=False, cp_capacity_invariant=False
             ext_grid_el_bounds=(-slack_el, slack_el),
             ext_grid_gas_bounds=(-slack_gas, slack_gas),
             ext_grid_heat_bounds=(-6, 6),
-            include_coupling_points=cp_capacity_invariant,
+            # The min-shed *objective* must match the performance *metric*,
+            # which counts end-user shed only. Adding CP input draw to the
+            # objective (the old ``=cp_capacity_invariant``) made the solver
+            # shed real end-user load to keep the power-drawing P2G/P2H CPs
+            # fed when power was tight — a non-zero baseline shed of 2-15% in
+            # the load-bearing family that is a pure objective/metric mismatch
+            # (the grid is feasible: see analyze_baseline_shed.py). Keeping it
+            # False for every family also makes the objective uniform across
+            # backup / loadbearing / control. The CHPs still dispatch, so
+            # essential load-bearing CPs are kept alive by the shed penalty.
+            include_coupling_points=False,
         )
     return create
 
