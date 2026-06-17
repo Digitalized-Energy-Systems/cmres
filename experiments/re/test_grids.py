@@ -692,7 +692,7 @@ def create_large_lv_simbench_ts(
 # backup would otherwise collapse onto control at the higher densities.
 def _backup(density):
     return create_large_lv_simbench(
-        density, h_el=0.04, h_gas=0.30, donor_gas_cp_margin=0.5
+        density, h_el=0.10, h_gas=0.10, donor_gas_cp_margin=0.5
     )
 
 
