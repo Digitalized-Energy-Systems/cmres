@@ -607,8 +607,8 @@ def create_large_lv_simbench(density, central=False, cp_capacity_invariant=False
         # draw from end-user demand on the input carrier keeps the primary
         # supply matched to the no-CP baseline. Applied BEFORE
         # ``apply_formulation`` so the formulations see the adjusted values.
-        if cp_capacity_invariant:
-            _balance_demand_for_cp_replacement(mes)
+        # if cp_capacity_invariant:
+        #     _balance_demand_for_cp_replacement(mes)
 
         # Donor-carrier sizing for the additive ``_backup`` family: raise the
         # gas headroom so the gas surplus (= h_gas × gas_demand) stays
