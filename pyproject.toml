@@ -23,7 +23,6 @@ dependencies = [
   "pandas",
   "matplotlib",
   "numpy",
-  "peext",
   "torch",
   "networkx",
   "numba",
