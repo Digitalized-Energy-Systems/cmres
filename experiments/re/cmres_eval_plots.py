@@ -34,6 +34,8 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 import cmres.evaluation.evaluation as eval
+import pub_style  # shared scare-style publication theme (bar outline, CVD
+                  # hatch, top legend, compact sizing)
 
 # Lazy proxy: ``cp_cn_evaluation`` imports back from this module
 # (``SECTOR_COLORS`` etc.), so a top-level ``from cp_cn_evaluation import
@@ -1483,6 +1485,59 @@ def _e16_scatter(merged: pd.DataFrame, metric: str, scenario: str) -> go.Figure:
     return fig
 
 
+def _e16_sector_hbar(metric_labels: List[str], traces: list, *,
+                     title: str) -> go.Figure:
+    """Render a horizontal grouped per-sector ρ bar in the shared scare style.
+
+    ``metric_labels`` is the bottom→top y-category order (highest ρ on top).
+    ``traces`` is a list of ``(tag, rho_array, err_hi, err_lo, n_arr)`` where
+    ``tag`` is a sector key (``total`` / ``multi`` / ``power`` / ``heat`` /
+    ``gas``). Sector hue is kept; a CVD hatch is layered on top; legend rides
+    on top horizontally and the figure height tracks the metric count so the
+    bars stay slim instead of ballooning.
+
+    Horizontal because the metric names ("PTDF stress + phys. BC", …) are long
+    — down the y-axis they read cleanly without the −25° tick rotation the old
+    vertical layout needed, and the figure no longer grows to ~1400 px wide.
+    """
+    bar = go.Figure()
+    any_trace = False
+    for tag, rho, err_hi, err_lo, n_arr in traces:
+        if rho is None or not rho.notna().any():
+            continue
+        any_trace = True
+        err_x = (
+            dict(type="data", symmetric=False,
+                 array=list(err_hi), arrayminus=list(err_lo),
+                 thickness=1.2, width=4, color=pub_style.MUTED_COLOR)
+            if err_hi is not None else None
+        )
+        bar.add_trace(go.Bar(
+            name=pub_style.SECTOR_PRETTY.get(tag, tag),
+            y=metric_labels, x=rho, orientation="h",
+            marker=pub_style.sector_marker(tag),
+            error_x=err_x,
+            customdata=np.c_[n_arr.values] if n_arr is not None else None,
+            hovertemplate=(
+                f"<b>{pub_style.SECTOR_PRETTY.get(tag, tag)}</b><br>"
+                "metric = %{y}<br>ρ = %{x:+.3f}<br>n = %{customdata[0]}<extra></extra>"
+            ),
+        ))
+    if not any_trace:
+        return go.Figure()
+    bar.add_vline(x=0, line=dict(color="#444", width=1, dash="dot"))
+    bar.update_layout(barmode="group")
+    n_series = len(bar.data)
+    pub_style.apply_theme(
+        bar, title=title,
+        height=pub_style.hbar_height(len(metric_labels), n_series),
+        width=pub_style.BAR_FIG_WIDTH, font_bump=1, legend_top=True,
+    )
+    bar.update_xaxes(title="Spearman ρ", range=[-1.10, 1.10])
+    bar.update_yaxes(title="")
+    return bar
+
+
 def _e16_rho_per_sector_bar(df: pd.DataFrame, scenario: str) -> go.Figure:
     """Grouped bar chart for one scenario: per metric, one bar per
     *sector slice* (total / multi / electricity / heat / gas), with sector
@@ -1502,50 +1557,27 @@ def _e16_rho_per_sector_bar(df: pd.DataFrame, scenario: str) -> go.Figure:
         return go.Figure()
     order = sub.sort_values("rho_vs_total_shed",
                             na_position="last")["metric"].tolist()
-    bar = go.Figure()
-    any_trace = False
+    sub_t = sub.set_index("metric").reindex(order).reset_index()
+    metric_labels = metric_label(list(sub_t["metric"]))
+    traces = []
     for tag in SECTOR_ORDER:
         rho_col = f"rho_vs_{tag}_shed"
-        hi_col = f"ci_hi_{tag}_shed"
-        lo_col = f"ci_lo_{tag}_shed"
-        n_col = f"n_{tag}" if tag != "total" else "n"
         if rho_col not in sub.columns:
             continue
-        sub_t = sub.set_index("metric").reindex(order).reset_index()
         rho = sub_t[rho_col].astype(float)
         if not rho.notna().any():
             continue
-        any_trace = True
-        hi = sub_t.get(hi_col, pd.Series(dtype=float))
-        lo = sub_t.get(lo_col, pd.Series(dtype=float))
+        hi = sub_t.get(f"ci_hi_{tag}_shed", pd.Series(dtype=float))
+        lo = sub_t.get(f"ci_lo_{tag}_shed", pd.Series(dtype=float))
         err_hi = (hi - rho).clip(lower=0) if not hi.empty else None
         err_lo = (rho - lo).clip(lower=0) if not lo.empty else None
+        n_col = f"n_{tag}" if tag != "total" else "n"
         n_arr = sub_t[n_col] if n_col in sub_t.columns else sub_t.get("n")
-        bar.add_trace(go.Bar(
-            name=SECTOR_PRETTY[tag],
-            x=metric_label(list(sub_t["metric"])), y=rho,
-            marker=sector_marker(tag),
-            error_y=bar_error_kwargs(err_hi=err_hi, err_lo=err_lo)
-                if err_hi is not None else None,
-            customdata=np.c_[n_arr.values] if n_arr is not None else None,
-            hovertemplate=(
-                f"<b>{SECTOR_PRETTY[tag]}</b><br>"
-                "metric = %{x}<br>ρ = %{y:+.3f}<br>n = %{customdata[0]}<extra></extra>"
-            ),
-        ))
-    if not any_trace:
-        return go.Figure()
-    bar.add_hline(y=0, line=dict(color="#444", width=1, dash="dot"))
-    bar.update_layout(**_e16_layout(
+        traces.append((tag, rho, err_hi, err_lo, n_arr))
+    return _e16_sector_hbar(
+        metric_labels, traces,
         title=f"{pretty_scenario(scenario)}: Spearman ρ vs analytical shed, per sector",
-        barmode="group",
-        xaxis=dict(title="Metric", tickangle=-25),
-        yaxis=dict(title="Spearman ρ", range=[-1.10, 1.10],
-                   gridcolor="#e5e5e5"),
-        height=460, width=120 + 110 * max(len(order), 1),
-        legend=dict(title="Sector"),
-    ))
-    return bar
+    )
 
 
 def _e16_top_overlap(merged: pd.DataFrame, scenario: str,
@@ -1695,11 +1727,11 @@ def _e16_rho_per_sector_bar_aggregated(
         return go.Figure()
     # Order metrics by the headline (total) ρ, NaN-last, matching the
     # per-scenario bar so the two figures read in the same direction.
-    rho_df = rho_df.sort_values("rho_total", ascending=False, na_position="last")
-    metrics_order = rho_df["metric"].tolist()
+    # Ascending so the highest-ρ metric lands on top of the horizontal bar.
+    rho_df = rho_df.sort_values("rho_total", ascending=True, na_position="first")
+    metric_labels = metric_label(rho_df["metric"].tolist())
 
-    bar = go.Figure()
-    any_trace = False
+    traces = []
     for tag, _col, _kind in sector_specs:
         rho_col = f"rho_{tag}"
         if rho_col not in rho_df.columns:
@@ -1707,44 +1739,20 @@ def _e16_rho_per_sector_bar_aggregated(
         rho = rho_df[rho_col].astype(float)
         if not rho.notna().any():
             continue
-        any_trace = True
         hi = rho_df.get(f"ci_hi_{tag}", pd.Series(dtype=float))
         lo = rho_df.get(f"ci_lo_{tag}", pd.Series(dtype=float))
         err_hi = (hi - rho).clip(lower=0) if not hi.empty else None
         err_lo = (rho - lo).clip(lower=0) if not lo.empty else None
         n_arr = rho_df[f"n_{tag}"]
-        bar.add_trace(go.Bar(
-            name=SECTOR_PRETTY[tag],
-            x=metric_label(list(rho_df["metric"])), y=rho,
-            marker=sector_marker(tag),
-            error_y=bar_error_kwargs(err_hi=err_hi, err_lo=err_lo)
-                if err_hi is not None else None,
-            customdata=np.c_[n_arr.values],
-            hovertemplate=(
-                f"<b>{SECTOR_PRETTY[tag]}</b><br>"
-                "metric = %{x}<br>ρ = %{y:+.3f}<br>n = %{customdata[0]}<extra></extra>"
-            ),
-        ))
-    if not any_trace:
-        return go.Figure()
-    bar.add_hline(y=0, line=dict(color="#444", width=1, dash="dot"))
+        traces.append((tag, rho, err_hi, err_lo, n_arr))
     n_total_row = int(rho_df["n_total"].max()) if "n_total" in rho_df.columns else 0
-    bar.update_layout(**_e16_layout(
+    return _e16_sector_hbar(
+        metric_labels, traces,
         title=(
             f"Pooled across all scenarios (n={n_total_row}): "
             "Spearman ρ vs analytical shed, per sector"
         ),
-        barmode="group",
-        # categoryarray uses the same display-label translation so the
-        # explicit sort order survives the relabel.
-        xaxis=dict(title="Metric", tickangle=-25, categoryorder="array",
-                   categoryarray=metric_label(metrics_order)),
-        yaxis=dict(title="Spearman ρ", range=[-1.10, 1.10],
-                   gridcolor="#e5e5e5"),
-        height=480, width=160 + 120 * max(len(metrics_order), 1),
-        legend=dict(title="Sector"),
-    ))
-    return bar
+    )
 
 
 def _e16_per_sector_heatmap(df: pd.DataFrame) -> go.Figure:
@@ -2083,8 +2091,8 @@ def plot_e16_single_removal(input_dir: Path, output_dir: Path) -> Optional[Path]
                 x=c["rho_shed_vs_mc"], orientation="h",
                 error_x=dict(type="data", symmetric=False,
                              array=err_hi, arrayminus=err_lo,
-                             thickness=1.2, width=4, color="#222"),
-                marker=dict(color="#00897b", line=dict(color="#004d40", width=0.5)),
+                             thickness=1.2, width=4, color=pub_style.MUTED_COLOR),
+                marker=pub_style.bar_marker("#00897b"),
                 text=[f"ρ={v:+.2f}" for v in c["rho_shed_vs_mc"]],
                 textposition="outside", cliponaxis=False,
                 hovertemplate=("<b>%{y}</b><br>ρ = %{x:+.3f}"
@@ -2093,16 +2101,17 @@ def plot_e16_single_removal(input_dir: Path, output_dir: Path) -> Optional[Path]
                 showlegend=False,
             ))
             fig2.add_vline(x=0, line=dict(color="#444", width=1, dash="dot"))
-            fig2.update_layout(**_e16_layout(
+            pub_style.apply_theme(
+                fig2,
                 title=(
                     "Ceiling: ρ between analytical shed and MC actual_total"
                     + _title_suffix(class_label)
                 ),
-                xaxis=dict(title="Spearman ρ", range=[-1.05, 1.10],
-                           gridcolor="#e5e5e5"),
-                yaxis=dict(title=""),
-                height=max(220, 80 + 44 * len(c)), width=900,
-            ))
+                height=pub_style.hbar_height(len(c)),
+                width=pub_style.BAR_FIG_WIDTH, font_bump=1, no_legend=True,
+            )
+            fig2.update_xaxes(title="Spearman ρ", range=[-1.05, 1.10])
+            fig2.update_yaxes(title="")
             figs.append(fig2)
             titles.append(f"Ceiling ρ{_title_suffix(class_label)}")
             slugs.append(_slug("e16_ceiling_rho", class_label))

@@ -25,6 +25,8 @@ from cmres_eval_plots import (
     SECTOR_COLORS, SECTOR_PRETTY,
     bar_error_kwargs, outlined_marker,
 )
+import pub_style  # shared scare-style publication theme (bar outline, CVD
+                  # hatch, top legend, compact horizontal sizing)
 
 # Default simulation-output directory used when no --input-dir is passed
 # on the CLI. The slurm worker submits without arguments and inherits this.
@@ -556,22 +558,14 @@ def resilience_per_scenario(perf_df: pandas.DataFrame, folder_id):
     )
     # Stacked so the bar height = total performance drop across sectors —
     # full sheddings stay directly comparable between scenarios while the
-    # segments still show the per-sector composition.
-    eval.create_bar(
+    # segments still show the per-sector composition. Kept VERTICAL: the
+    # scenarios form an ordered density series that reads left-to-right and
+    # the stacked composition is clearest in columns.
+    _stacked_carrier_bar(
         resilience_per_carrier_per_scenario,
-        x_label="experiment",
-        y_label="resilience_mean",
-        color="carrier",
-        color_discrete_map=eval.NETWORK_COLOR_MAP,
-        pattern_shape_map=eval.NETWORK_PATTERN_MAP,
-        legend_text="carrier",
-        template=eval.CMRES_TEMPLATE,
-        yaxis_title="mean performance loss in MW",
-        xaxis_title="scenario",
+        cat_col="experiment", value_col="resilience_mean",
         title="Performance drop by scenario, by carrier",
-        barmode="stack",
-        width=1200,
-        height=450,
+        yaxis_title="mean performance loss in MW", xaxis_title="scenario",
     )
     unique_network_types = sort_scenarios(
         pandas.unique(resilience_per_carrier_per_scenario["network_type"])
@@ -602,7 +596,9 @@ def resilience_per_scenario(perf_df: pandas.DataFrame, folder_id):
                 )
                 for carrier in ["electricity", "heat", "gas"]
             ],
-            ["#ffa000", "#d32f2f", "#388e3c"],
+            [pub_style.SECTOR_COLOR["electricity"],
+             pub_style.SECTOR_COLOR["heat"],
+             pub_style.SECTOR_COLOR["gas"]],
             ["electricity", "heat", "gas"],
             [f"<b>{pretty_scenario(net_type)}</b>" for net_type in unique_network_types],
             len(unique_experiments),
@@ -610,6 +606,14 @@ def resilience_per_scenario(perf_df: pandas.DataFrame, folder_id):
             yaxis_title="<b>mean performance loss in MW</b>",
             multi_level_distance=-0.4,
         )
+    )
+    # Overlay the shared dark outline + CVD hatch on the kept sector hues so
+    # the multi-level stacked bars match the rest of the report. Sizing is
+    # left to the multilevel builder — this view is inherently wide (one
+    # column block per scenario × experiment).
+    pub_style.style_bar_traces(
+        resilience_per_carrier_per_scenario_hist_2,
+        pattern_map=pub_style.SECTOR_PATTERN,
     )
 
     eval.write_all_in_one(
@@ -803,6 +807,90 @@ def impact_over_metrics(
     )
 
 
+_CARRIER_ORDER = ("electricity", "heat", "gas", "multi")
+
+
+def _stacked_carrier_bar(df, *, cat_col, value_col, title,
+                         yaxis_title, xaxis_title):
+    """Vertical stacked per-carrier bar in the shared publication style:
+    kept sector hues + CVD hatch + dark outline, legend on top, compact
+    width that tracks the category count."""
+    import plotly.graph_objects as go
+
+    carriers = [c for c in _CARRIER_ORDER if c in set(df["carrier"].astype(str))]
+    cats = list(dict.fromkeys(df[cat_col].astype(str)))
+    fig = go.Figure()
+    for carrier in carriers:
+        sub = (
+            df[df["carrier"].astype(str) == carrier]
+            .set_index(df[df["carrier"].astype(str) == carrier][cat_col].astype(str))
+            .reindex(cats)
+        )
+        fig.add_trace(go.Bar(
+            name=pub_style.SECTOR_PRETTY.get(carrier, carrier),
+            x=cats, y=sub[value_col],
+            marker=pub_style.sector_marker(carrier),
+            hovertemplate=(
+                f"<b>%{{x}}</b><br>{pub_style.SECTOR_PRETTY.get(carrier, carrier)}"
+                ": %{y:.3g}<extra></extra>"
+            ),
+        ))
+    fig.update_layout(barmode="stack")
+    pub_style.apply_theme(
+        fig, title=title,
+        height=460, width=pub_style.vbar_width(len(cats), base=520),
+        font_bump=1, legend_top=True,
+    )
+    fig.update_xaxes(title=xaxis_title, tickangle=-30)
+    fig.update_yaxes(title=yaxis_title)
+    return fig
+
+
+def _impact_carrier_hbar(agg_df, cat_col, value_col, *, cat_title, title):
+    """Horizontal carrier-grouped impact bar in the shared publication style.
+
+    One bar series per carrier (kept cmres sector hue + CVD hatch, dark
+    outline), categories down the y-axis (so long component-type / scenario
+    labels read cleanly), legend on top. Categories are ordered by total
+    value so the biggest contributor sits on top. Replaces the old vertical
+    ``eval.create_bar`` calls which had no legend and grew very wide.
+    """
+    import plotly.graph_objects as go
+
+    carriers = [c for c in _CARRIER_ORDER if c in set(agg_df["carrier"].astype(str))]
+    if not carriers:
+        return pub_style.empty_fig("no impact rows", title)
+    cats = (
+        agg_df.groupby(cat_col)[value_col].sum()
+        .sort_values(ascending=True).index.tolist()
+    )
+    labels = [str(c) for c in cats]
+    fig = go.Figure()
+    for carrier in carriers:
+        sub = (
+            agg_df[agg_df["carrier"].astype(str) == carrier]
+            .set_index(cat_col).reindex(cats)
+        )
+        fig.add_trace(go.Bar(
+            name=pub_style.SECTOR_PRETTY.get(carrier, carrier),
+            y=labels, x=sub[value_col], orientation="h",
+            marker=pub_style.sector_marker(carrier),
+            hovertemplate=(
+                f"<b>%{{y}}</b><br>{pub_style.SECTOR_PRETTY.get(carrier, carrier)}"
+                ": %{x:.3g}<extra></extra>"
+            ),
+        ))
+    fig.update_layout(barmode="group")
+    pub_style.apply_theme(
+        fig, title=title,
+        height=pub_style.hbar_height(len(cats), len(carriers)),
+        width=pub_style.BAR_FIG_WIDTH, font_bump=1, legend_top=True,
+    )
+    fig.update_xaxes(title=value_col)
+    fig.update_yaxes(title=cat_title)
+    return fig
+
+
 def impact_aggregated_component_carrier(impact_df: pandas.DataFrame, folder_id):
     new_impact_df = impact_df.copy()
     new_impact_df["impact"] = new_impact_df["impact"].abs()
@@ -831,66 +919,22 @@ def impact_aggregated_component_carrier(impact_df: pandas.DataFrame, folder_id):
     figures = []
     titles = []
     # component type by carrier impacts
-    figures += [
-        eval.create_bar(
-            average_impact_per_component,
-            x_label="type",
-            y_label="impact",
-            color="carrier",
-            color_discrete_map=eval.NETWORK_COLOR_MAP,
-            legend_text="by carrier",
-            template=eval.CMRES_TEMPLATE,
-            yaxis_title="impact",
-            xaxis_title="type",
-            showlegend=False,
-        )
-    ]
+    figures.append(_impact_carrier_hbar(
+        average_impact_per_component, "type", "impact",
+        cat_title="component type", title="Average impacts by component type"))
     titles.append("Average impacts by component type")
-    figures += [
-        eval.create_bar(
-            impact_per_component,
-            x_label="type",
-            y_label="impact",
-            color="carrier",
-            color_discrete_map=eval.NETWORK_COLOR_MAP,
-            legend_text="by carrier",
-            template=eval.CMRES_TEMPLATE,
-            yaxis_title="impact",
-            xaxis_title="type",
-            showlegend=False,
-        )
-    ]
+    figures.append(_impact_carrier_hbar(
+        impact_per_component, "type", "impact",
+        cat_title="component type", title="Total impacts by component type"))
     titles.append("Total impacts by component type")
     # carrier type with carrier impacts
-    figures += [
-        eval.create_bar(
-            average_impact_per_carrier,
-            x_label="type_carrier",
-            y_label="impact",
-            color="carrier",
-            color_discrete_map=eval.NETWORK_COLOR_MAP,
-            legend_text="by carrier",
-            template=eval.CMRES_TEMPLATE,
-            yaxis_title="impact",
-            xaxis_title="carrier",
-            showlegend=False,
-        )
-    ]
+    figures.append(_impact_carrier_hbar(
+        average_impact_per_carrier, "type_carrier", "impact",
+        cat_title="carrier", title="Average impacts by carrier type"))
     titles.append("Average impacts by carrier type")
-    figures += [
-        eval.create_bar(
-            impact_per_carrier,
-            x_label="type_carrier",
-            y_label="impact",
-            color="carrier",
-            color_discrete_map=eval.NETWORK_COLOR_MAP,
-            legend_text="by carrier",
-            template=eval.CMRES_TEMPLATE,
-            yaxis_title="impact",
-            xaxis_title="carrier",
-            showlegend=False,
-        )
-    ]
+    figures.append(_impact_carrier_hbar(
+        impact_per_carrier, "type_carrier", "impact",
+        cat_title="carrier", title="Total impacts by carrier type"))
     titles.append("Total impacts by carrier type")
 
     average_impact_per_carrier_net_type = (
@@ -913,35 +957,15 @@ def impact_aggregated_component_carrier(impact_df: pandas.DataFrame, folder_id):
         + "-"
         + impact_per_carrier_net_type["network_type"].map(pretty_scenario)
     )
-    figures += [
-        eval.create_bar(
-            average_impact_per_carrier_net_type,
-            x_label="carrier_net_type",
-            y_label="impact",
-            color="carrier",
-            color_discrete_map=eval.NETWORK_COLOR_MAP,
-            legend_text="by carrier",
-            template=eval.CMRES_TEMPLATE,
-            yaxis_title="impact",
-            xaxis_title="carrier-density",
-            showlegend=False,
-        )
-    ]
+    figures.append(_impact_carrier_hbar(
+        average_impact_per_carrier_net_type, "carrier_net_type", "impact",
+        cat_title="carrier-density",
+        title="Average impacts by carrier type and density"))
     titles.append("Average impacts by carrier type and density")
-    figures += [
-        eval.create_bar(
-            impact_per_carrier_net_type,
-            x_label="carrier_net_type",
-            y_label="impact",
-            color="carrier",
-            color_discrete_map=eval.NETWORK_COLOR_MAP,
-            legend_text="by carrier",
-            template=eval.CMRES_TEMPLATE,
-            yaxis_title="impact",
-            xaxis_title="carrier-density",
-            showlegend=False,
-        )
-    ]
+    figures.append(_impact_carrier_hbar(
+        impact_per_carrier_net_type, "carrier_net_type", "impact",
+        cat_title="carrier-density",
+        title="Total impacts by carrier type and density"))
     titles.append("Total impacts by carrier type and density")
 
     average_impact_per_net_type = (
@@ -957,35 +981,13 @@ def impact_aggregated_component_carrier(impact_df: pandas.DataFrame, folder_id):
         total_impact_per_net_type["network_type"].map(pretty_scenario)
     )
 
-    figures += [
-        eval.create_bar(
-            average_impact_per_net_type,
-            x_label="network_type",
-            y_label="impact",
-            color="carrier",
-            color_discrete_map=eval.NETWORK_COLOR_MAP,
-            legend_text="by carrier",
-            template=eval.CMRES_TEMPLATE,
-            yaxis_title="impact",
-            xaxis_title="density",
-            showlegend=False,
-        )
-    ]
+    figures.append(_impact_carrier_hbar(
+        average_impact_per_net_type, "network_type", "impact",
+        cat_title="density", title="Average impacts by density"))
     titles.append("Average impacts by density")
-    figures += [
-        eval.create_bar(
-            total_impact_per_net_type,
-            x_label="network_type",
-            y_label="impact",
-            color="carrier",
-            color_discrete_map=eval.NETWORK_COLOR_MAP,
-            legend_text="by carrier",
-            template=eval.CMRES_TEMPLATE,
-            yaxis_title="impact",
-            xaxis_title="density",
-            showlegend=False,
-        )
-    ]
+    figures.append(_impact_carrier_hbar(
+        total_impact_per_net_type, "network_type", "impact",
+        cat_title="density", title="Total impacts by density"))
     titles.append("Total impacts by density")
 
     eval.write_all_in_one(
@@ -1003,6 +1005,112 @@ _COMPOUND_CP_TYPES = _ec._COMPOUND_CP_TYPES
 _NON_CP_BRANCH_TYPES = _ec._NON_CP_BRANCH_TYPES
 _build_branch_lookup = _ec.build_branch_lookup
 _match_impact_id = _ec.match_impact_id
+
+
+def _rho_hbar(metrics, rho, err_hi, err_lo, *, title, color=None,
+              text=None, range_x=(-1.15, 1.30)):
+    """Single-series horizontal Spearman-ρ bar in the shared publication
+    style. ``metrics`` should already be ordered bottom→top (highest ρ on
+    top). Used by every "combined ρ per metric" figure."""
+    import plotly.graph_objects as go
+
+    fig = go.Figure(go.Bar(
+        y=list(metrics), x=list(rho), orientation="h",
+        error_x=dict(type="data", symmetric=False,
+                     array=list(err_hi), arrayminus=list(err_lo),
+                     thickness=1.2, width=4, color=pub_style.MUTED_COLOR),
+        text=text, textposition="outside" if text else None, cliponaxis=False,
+        marker=pub_style.bar_marker(color or pub_style.QUAL_PALETTE[0]),
+        showlegend=False,
+    ))
+    fig.add_vline(x=0, line=dict(color="#444", width=1, dash="dot"))
+    pub_style.apply_theme(
+        fig, title=title, height=pub_style.hbar_height(len(list(metrics))),
+        width=pub_style.BAR_FIG_WIDTH, font_bump=1, no_legend=True,
+    )
+    fig.update_xaxes(title="Spearman ρ (95% CI)", range=list(range_x))
+    fig.update_yaxes(title="")
+    return fig
+
+
+def _filtered_vs_unfiltered_hbar(cmp_df, n_all, n_mc, title):
+    """Horizontal grouped two-series bar: ρ on all-matched vs MC-sampled
+    components. Shared by the per-network and pooled comparison figures.
+
+    ``cmp_df`` columns: ``Metric``, ``rho_all``/``ci_lo_all``/``ci_hi_all``,
+    ``rho_mc``/``ci_lo_mc``/``ci_hi_mc`` (ordered bottom→top)."""
+    import plotly.graph_objects as go
+
+    def _err(hi, lo, val):
+        return dict(type="data", symmetric=False,
+                    array=(cmp_df[hi] - cmp_df[val]).clip(lower=0).tolist(),
+                    arrayminus=(cmp_df[val] - cmp_df[lo]).clip(lower=0).tolist(),
+                    thickness=1.2, width=4, color=pub_style.MUTED_COLOR)
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        name=f"All matched (n={n_all})",
+        y=cmp_df["Metric"], x=cmp_df["rho_all"], orientation="h",
+        error_x=_err("ci_hi_all", "ci_lo_all", "rho_all"),
+        marker=pub_style.bar_marker("#BFBFBF", pattern_shape="/",
+                                    pattern_fg="#7F7F7F"),
+    ))
+    fig.add_trace(go.Bar(
+        name=f"MC-sampled (n={n_mc})",
+        y=cmp_df["Metric"], x=cmp_df["rho_mc"], orientation="h",
+        error_x=_err("ci_hi_mc", "ci_lo_mc", "rho_mc"),
+        marker=pub_style.bar_marker(pub_style.QUAL_PALETTE[0]),
+    ))
+    fig.add_vline(x=0, line=dict(color="#444", width=1, dash="dot"))
+    fig.update_layout(barmode="group")
+    pub_style.apply_theme(
+        fig, title=title, height=pub_style.hbar_height(len(cmp_df), 2),
+        width=pub_style.BAR_FIG_WIDTH, font_bump=1, legend_top=True,
+    )
+    fig.update_xaxes(title="Spearman ρ vs Actual (95% CI)", range=[-1.15, 1.15])
+    fig.update_yaxes(title="")
+    return fig
+
+
+def _ranking_accuracy_panels(acc_df, panels, title):
+    """4-panel horizontal ranking-accuracy figure (Kendall τ / NDCG@k /
+    rNDCG@k / NDCG) in the shared publication style. ``panels`` is a list of
+    ``(subplot_title, val_col, lo_col, hi_col, range)`` and ``acc_df`` is
+    ordered bottom→top. Uniform hue (metric identity = shared y label),
+    dark outline, compact per-panel width, no legend."""
+    from plotly.subplots import make_subplots
+    import plotly.graph_objects as go
+
+    fig = make_subplots(
+        rows=1, cols=len(panels),
+        subplot_titles=[f"{p[0]} (95% CI)" for p in panels],
+        horizontal_spacing=0.04,
+    )
+    for col_idx, (sub_title, val_col, lo_col, hi_col, ref_range) in enumerate(
+        panels, start=1,
+    ):
+        vals = acc_df[val_col].values
+        err_lo = (vals - acc_df[lo_col].values).clip(0)
+        err_hi = (acc_df[hi_col].values - vals).clip(0)
+        fig.add_trace(go.Bar(
+            x=vals, y=acc_df["Metric"], orientation="h",
+            marker=pub_style.bar_marker(pub_style.QUAL_PALETTE[0]),
+            error_x=dict(type="data", symmetric=False,
+                         array=err_hi.tolist(), arrayminus=err_lo.tolist(),
+                         thickness=1.2, width=4, color=pub_style.MUTED_COLOR),
+            text=[f"{v:.2f}" for v in vals],
+            textposition="outside", cliponaxis=False, showlegend=False,
+        ), row=1, col=col_idx)
+        fig.update_xaxes(title_text=sub_title, range=ref_range, row=1, col=col_idx)
+        fig.add_vline(x=0, line=dict(color="#bbb", width=1, dash="dot"),
+                      row=1, col=col_idx)
+        fig.update_yaxes(showticklabels=(col_idx == 1), row=1, col=col_idx)
+    pub_style.apply_theme(
+        fig, title=title, height=pub_style.hbar_height(len(acc_df)),
+        width=300 * len(panels) + 140,
+    )
+    fig.update_layout(margin=dict(l=160, r=50, t=80, b=64))
+    return fig
 
 
 def cp_metric_vs_actual_impact(monee_net, impact_df_nt, network_type):
@@ -1261,39 +1369,36 @@ def cp_metric_vs_actual_impact(monee_net, impact_df_nt, network_type):
             "ci_lo": ci_lo, "ci_hi": ci_hi,
             "err_lo": rho - ci_lo, "err_hi": ci_hi - rho,
         })
-    rho_df = pandas.DataFrame(rho_rows).sort_values("Spearman ρ", ascending=False)
+    # Ascending so the strongest metric lands on top of the horizontal bar.
+    rho_df = pandas.DataFrame(rho_rows).sort_values("Spearman ρ", ascending=True)
 
-    _palette = eval.PALETTE_QUAL[:len(rho_df)]
+    # Horizontal + single publication hue: each bar is a *different* metric
+    # (its identity is the y label), so a per-bar rainbow encodes nothing —
+    # a uniform fill + dark outline reads cleaner and the long metric names
+    # sit legibly down the y-axis instead of rotated under a ~1300 px column.
     rho_bar = go.Figure(go.Bar(
-        x=rho_df["Metric"],
-        y=rho_df["Spearman ρ"],
-        error_y=bar_error_kwargs(
-            err_hi=rho_df["err_hi"].tolist(),
-            err_lo=rho_df["err_lo"].tolist(),
-        ),
-        text=[f"ρ={r:.2f} [{lo:.2f},{hi:.2f}]<br>p={p:.3f}"
-              for r, p, lo, hi in zip(
-                  rho_df["Spearman ρ"], rho_df["p-value"],
-                  rho_df["ci_lo"], rho_df["ci_hi"])],
-        textposition="outside",
-        marker=outlined_marker(_palette[0]),  # uniform fill — palette via individual bars below
-    ))
-    # Recolour bars per-metric using the qualitative palette while keeping the
-    # E16 outline.
-    rho_bar.data[0].marker.color = list(_palette)
-
-    rho_bar.update_layout(
-        # Match E16 vertical-bar dim: ~460h × (120 + 110·N)w so per-metric
-        # bar width is the same as in cmres_eval_plots' E16 sector bars.
-        height=460, width=120 + 110 * max(len(rho_df), 1),
-        template=eval.CMRES_TEMPLATE,
-        yaxis=dict(title="Spearman ρ vs Actual (95% CI)", range=[-1.15, 1.15],
-                   gridcolor="#e5e5e5",
-                   zeroline=True, zerolinecolor="black", zerolinewidth=1),
-        xaxis_title="Metric",
-        margin={"l": 50, "b": 100, "r": 20, "t": 40},
+        y=rho_df["Metric"],
+        x=rho_df["Spearman ρ"],
+        orientation="h",
+        error_x=dict(type="data", symmetric=False,
+                     array=rho_df["err_hi"].tolist(),
+                     arrayminus=rho_df["err_lo"].tolist(),
+                     thickness=1.2, width=4, color=pub_style.MUTED_COLOR),
+        text=[f"ρ={r:.2f} [{lo:.2f},{hi:.2f}]"
+              for r, lo, hi in zip(
+                  rho_df["Spearman ρ"], rho_df["ci_lo"], rho_df["ci_hi"])],
+        textposition="outside", cliponaxis=False,
+        marker=pub_style.bar_marker(pub_style.QUAL_PALETTE[0]),
         showlegend=False,
+    ))
+    rho_bar.add_vline(x=0, line=dict(color="#444", width=1, dash="dot"))
+    pub_style.apply_theme(
+        rho_bar, title="Predictive Power: Spearman ρ vs Actual Impact",
+        height=pub_style.hbar_height(len(rho_df)),
+        width=pub_style.BAR_FIG_WIDTH, font_bump=1, no_legend=True,
     )
+    rho_bar.update_xaxes(title="Spearman ρ vs Actual (95% CI)", range=[-1.15, 1.30])
+    rho_bar.update_yaxes(title="")
     figures.append(rho_bar)
     titles.append("Predictive Power: Spearman ρ vs Actual Impact")
 
@@ -1421,58 +1526,15 @@ def cp_metric_vs_actual_impact(monee_net, impact_df_nt, network_type):
     acc_df = pandas.DataFrame(acc_rows).sort_values("rNDCG@k", ascending=True)
 
     panels = [
-        ("Kendall τ",       "τ_lo",     "τ_hi",     [-1.05, 1.05]),
-        (f"NDCG@{_k_cut}",  "ndcgk_lo", "ndcgk_hi", [-0.05, 1.05]),
-        (f"rNDCG@{_k_cut}", "rndcg_lo", "rndcg_hi", [-1.05, 1.05]),
-        ("NDCG",            "ndcg_lo",  "ndcg_hi",  [-0.05, 1.05]),
+        ("Kendall τ",       "Kendall τ", "τ_lo",     "τ_hi",     [-1.05, 1.05]),
+        (f"NDCG@{_k_cut}",  "NDCG@k",    "ndcgk_lo", "ndcgk_hi", [-0.05, 1.05]),
+        (f"rNDCG@{_k_cut}", "rNDCG@k",   "rndcg_lo", "rndcg_hi", [-1.05, 1.05]),
+        ("NDCG",            "NDCG",      "ndcg_lo",  "ndcg_hi",  [-0.05, 1.05]),
     ]
-    measure_to_col = {
-        "Kendall τ": "Kendall τ",
-        f"NDCG@{_k_cut}": "NDCG@k",
-        f"rNDCG@{_k_cut}": "rNDCG@k",
-        "NDCG": "NDCG",
-    }
-    acc_fig = make_subplots(
-        rows=1, cols=len(panels),
-        subplot_titles=[f"{m} (95% CI)" for m, *_ in panels],
-    )
-    metric_colors = {row["Metric"]: eval.PALETTE_QUAL[i % 10]
-                     for i, row in acc_df.iterrows()}
-    for col_idx, (measure, lo_col, hi_col, ref_range) in enumerate(panels, start=1):
-        data_col = measure_to_col[measure]
-        vals   = acc_df[data_col].values
-        err_lo = (vals - acc_df[lo_col].values).clip(0)
-        err_hi = (acc_df[hi_col].values - vals).clip(0)
-        acc_fig.add_trace(go.Bar(
-            x=vals,
-            y=acc_df["Metric"],
-            orientation="h",
-            marker=dict(
-                color=[metric_colors[m] for m in acc_df["Metric"]],
-                line=dict(color="#222", width=0.4),
-            ),
-            error_x=bar_error_kwargs(
-                err_hi=err_hi.tolist(), err_lo=err_lo.tolist(),
-            ),
-            text=[f"{v:.3f} [{lo:.2f},{hi:.2f}]"
-                  for v, lo, hi in zip(vals, acc_df[lo_col], acc_df[hi_col])],
-            textposition="outside",
-            showlegend=False,
-        ), row=1, col=col_idx)
-        acc_fig.update_xaxes(title_text=measure, range=ref_range,
-                             gridcolor="#e5e5e5",
-                             zeroline=True, zerolinecolor="black", zerolinewidth=1,
-                             row=1, col=col_idx)
-        acc_fig.update_yaxes(title_text="Metric" if col_idx == 1 else "",
-                             row=1, col=col_idx)
-
-    acc_fig.update_layout(
-        # 4 horizontal-bar panels side by side. Per-panel width matches
-        # the E16 single-bar figure (~460 px); per-bar height bumped to
-        # 60 px so individual bars are visually similar to E16's bars.
-        height=120 + 60 * len(acc_df), width=460 * len(panels) + 60,
-        template=eval.CMRES_TEMPLATE,
-        margin={"l": 160, "b": 50, "r": 80, "t": 60},
+    acc_fig = _ranking_accuracy_panels(
+        acc_df, panels,
+        title=("Ranking accuracy: Kendall τ, NDCG@" + str(_k_cut)
+               + ", rNDCG@" + str(_k_cut) + ", NDCG (bootstrap 95% CI)"),
     )
     figures.append(acc_fig)
     best = acc_df.iloc[-1]["Metric"]
@@ -1554,36 +1616,9 @@ def cp_metric_vs_actual_impact(monee_net, impact_df_nt, network_type):
             })
         cmp_df = pandas.DataFrame(cmp_rows).sort_values("rho_mc", ascending=True)
 
-        cmp_fig = go.Figure()
-        cmp_fig.add_trace(go.Bar(
-            name=f"All matched (n={n_all})",
-            x=cmp_df["Metric"], y=cmp_df["rho_all"],
-            error_y=bar_error_kwargs(
-                err_hi=(cmp_df["ci_hi_all"] - cmp_df["rho_all"]).tolist(),
-                err_lo=(cmp_df["rho_all"] - cmp_df["ci_lo_all"]).tolist(),
-            ),
-            marker=outlined_marker("lightgrey"),
-        ))
-        cmp_fig.add_trace(go.Bar(
-            name=f"MC-sampled (n={n_mc})",
-            x=cmp_df["Metric"], y=cmp_df["rho_mc"],
-            error_y=bar_error_kwargs(
-                err_hi=(cmp_df["ci_hi_mc"] - cmp_df["rho_mc"]).tolist(),
-                err_lo=(cmp_df["rho_mc"] - cmp_df["ci_lo_mc"]).tolist(),
-            ),
-            marker=outlined_marker(eval.PALETTE_QUAL[0]),
-        ))
-        cmp_fig.update_layout(
-            barmode="group",
-            # Match E16 grouped-bar dim: 460h × (120 + 110·N)w.
-            height=460, width=120 + 110 * max(len(cmp_df), 1),
-            template=eval.CMRES_TEMPLATE,
-            yaxis=dict(title="Spearman ρ vs Actual (95% CI)", range=[-1.15, 1.15],
-                       gridcolor="#e5e5e5",
-                       zeroline=True, zerolinecolor="black"),
-            xaxis=dict(title="Metric"),
-            margin={"l": 60, "b": 100, "r": 20, "t": 50},
-            legend=dict(title="Population"),
+        cmp_fig = _filtered_vs_unfiltered_hbar(
+            cmp_df, n_all, n_mc,
+            title="Filtered vs unfiltered: ρ on all matched vs MC-sampled",
         )
         figures.append(cmp_fig)
         titles.append(
@@ -1788,28 +1823,13 @@ def _cp_only_metric_comparison_core(
             "Metric": lab, "rho": rho, "p": pval, "lo": lo, "hi": hi,
         })
     rho_df = pandas.DataFrame(rho_rows).sort_values("rho", ascending=True)
-    rho_fig = go.Figure(go.Bar(
-        x=rho_df["rho"], y=rho_df["Metric"], orientation="h",
-        error_x=bar_error_kwargs(
-            err_hi=(rho_df["hi"] - rho_df["rho"]).clip(lower=0).tolist(),
-            err_lo=(rho_df["rho"] - rho_df["lo"]).clip(lower=0).tolist(),
-        ),
-        text=[f"ρ={r:.2f} [{lo:.2f},{hi:.2f}]<br>p={p:.3f}"
-              for r, lo, hi, p in zip(
-                  rho_df["rho"], rho_df["lo"], rho_df["hi"], rho_df["p"])],
-        textposition="outside",
-        marker=outlined_marker(eval.PALETTE_QUAL[0]),
-    ))
-    rho_fig.update_layout(
-        # Horizontal-bar equivalent of the E16 vertical-bar dim — bar
-        # thickness 60 px so individual bars match E16 visual weight.
-        height=120 + 60 * max(len(rho_df), 1), width=900,
-        template=eval.CMRES_TEMPLATE,
-        xaxis=dict(title="Spearman ρ vs Actual (95% CI)", range=[-1.05, 1.05],
-                   gridcolor="#e5e5e5",
-                   zeroline=True, zerolinecolor="black"),
-        yaxis=dict(title="Metric"),
-        margin={"l": 200, "b": 50, "r": 160, "t": 50},
+    rho_fig = _rho_hbar(
+        rho_df["Metric"], rho_df["rho"],
+        (rho_df["hi"] - rho_df["rho"]).clip(lower=0),
+        (rho_df["rho"] - rho_df["lo"]).clip(lower=0),
+        title=f"CP-only [{label}] combined Spearman ρ (n={len(primary)})",
+        text=[f"ρ={r:.2f}" for r in rho_df["rho"]],
+        range_x=(-1.05, 1.25),
     )
     figures.append(rho_fig)
     titles.append(f"CP-only [{label}] combined Spearman ρ (n={len(primary)})")
@@ -1858,39 +1878,10 @@ def _cp_only_metric_comparison_core(
             (f"rNDCG@{_k_cut}", "rndcg", "rndcg_lo", "rndcg_hi", [-1.05, 1.05]),
             ("NDCG",            "ndcg",  "ndcg_lo",  "ndcg_hi",  [-0.05, 1.05]),
         ]
-        acc_fig = make_subplots(
-            rows=1, cols=len(panels),
-            subplot_titles=[f"{m} (95% CI)" for m, *_ in panels],
-        )
-        for col_idx, (title_, data_col, lo_col, hi_col, ref_range) in enumerate(
-            panels, start=1,
-        ):
-            vals   = acc_df[data_col].values
-            err_lo = (vals - acc_df[lo_col].values).clip(0)
-            err_hi = (acc_df[hi_col].values - vals).clip(0)
-            acc_fig.add_trace(go.Bar(
-                x=vals, y=acc_df["Metric"], orientation="h",
-                marker=outlined_marker(eval.PALETTE_QUAL[col_idx - 1]),
-                error_x=bar_error_kwargs(
-                    err_hi=err_hi.tolist(), err_lo=err_lo.tolist(),
-                ),
-                text=[f"{v:.3f} [{lo:.2f},{hi:.2f}]"
-                      for v, lo, hi in zip(vals, acc_df[lo_col], acc_df[hi_col])],
-                textposition="outside",
-                showlegend=False,
-            ), row=1, col=col_idx)
-            acc_fig.update_xaxes(
-                title_text=title_,
-                range=ref_range, gridcolor="#e5e5e5",
-                zeroline=True, zerolinecolor="black",
-                row=1, col=col_idx,
-            )
-        acc_fig.update_layout(
-            # 4 horizontal-bar panels; per-panel sized to match the E16
-            # bar figure (~460 px each in the value direction).
-            height=120 + 60 * len(acc_df), width=460 * len(panels) + 100,
-            template=eval.CMRES_TEMPLATE,
-            margin={"l": 200, "b": 50, "r": 80, "t": 60},
+        acc_fig = _ranking_accuracy_panels(
+            acc_df, panels,
+            title=(f"CP-only [{label}] ranking accuracy: Kendall τ, NDCG@{_k_cut}, "
+                   f"rNDCG@{_k_cut}, NDCG (n={len(primary)})"),
         )
         figures.append(acc_fig)
         titles.append(
@@ -2044,10 +2035,7 @@ def pooled_resilience_per_scenario(perf_df: pandas.DataFrame, output_dir: str):
                 x=scens,
                 y=[float(y_by_scenario.get(s, 0.0)) for s in scens],
                 name=carrier_label,
-                marker=dict(
-                    color=_sector_color(carrier),
-                    line=dict(color="#222", width=0.4),
-                ),
+                marker=pub_style.sector_marker(_CARRIER_TO_SECTOR[carrier]),
                 hovertemplate=(
                     "scenario=%{x}<br>"
                     f"carrier={carrier_label}<br>"
@@ -2068,20 +2056,17 @@ def pooled_resilience_per_scenario(perf_df: pandas.DataFrame, output_dir: str):
         fig, scens = _build_fig(sub_pooled)
         suffix = f" ({class_label})" if class_label else ""
         slug_suffix = f"_{class_label}" if class_label else ""
-        fig.update_layout(
-            # Stacked: bar height = total performance drop, so the full
-            # sheddings stay comparable across scenarios while the segments
-            # show the per-sector composition.
-            barmode="stack",
-            template=eval.CMRES_TEMPLATE,
-            title=f"Pooled performance drop by scenario, by carrier{suffix}",
-            xaxis=dict(title="Scenario"),
-            yaxis=dict(title="Mean performance loss (MW)", gridcolor="#e5e5e5"),
-            height=460,
-            width=120 + 110 * max(len(scens), 1),
-            legend=dict(title="Carrier"),
-            margin={"l": 70, "b": 60, "r": 30, "t": 60},
+        # Stacked + vertical: bar height = total performance drop (scenarios
+        # are an ordered density series read left-to-right); the segments show
+        # the per-sector composition.
+        fig.update_layout(barmode="stack")
+        pub_style.apply_theme(
+            fig, title=f"Pooled performance drop by scenario, by carrier{suffix}",
+            height=460, width=pub_style.vbar_width(len(scens), base=520),
+            font_bump=1, legend_top=True,
         )
+        fig.update_xaxes(title="Scenario", tickangle=-30)
+        fig.update_yaxes(title="Mean performance loss (MW)")
         eval.write_all_in_one(
             [fig], "Figure", Path("."),
             f"{output_dir}/resilience_per_carrier_per_scenario_pooled{slug_suffix}.html",
@@ -2228,10 +2213,7 @@ def cross_carrier_impact_per_scenario(
                     go.Bar(
                         x=[_sector_label(s) for s in source_order], y=ys,
                         name=f"→ {target_label}",
-                        marker=dict(
-                            color=_sector_color(target),
-                            line=dict(color="#222", width=0.4),
-                        ),
+                        marker=pub_style.sector_marker(_CARRIER_TO_SECTOR[target]),
                         legendgroup=target,
                         showlegend=show_legend,
                         hovertemplate=(
@@ -2250,14 +2232,11 @@ def cross_carrier_impact_per_scenario(
 
         suffix = f" ({class_label})" if class_label else ""
         slug_suffix = f"_{class_label}" if class_label else ""
-        fig.update_layout(
-            barmode="group",
-            height=300 * n_rows + 80,
-            width=420 * n_cols,
-            template=eval.CMRES_TEMPLATE,
-            legend=dict(title="Impacted carrier"),
-            margin={"l": 70, "b": 60, "r": 30, "t": 70},
-            title=f"Cross-carrier impact per scenario{suffix}",
+        fig.update_layout(barmode="group")
+        pub_style.apply_theme(
+            fig, title=f"Cross-carrier impact per scenario{suffix}",
+            height=300 * n_rows + 110, width=min(1000, 360 * n_cols),
+            legend_top=True,
         )
         eval.write_all_in_one(
             [fig], "Figure", Path("."),
@@ -2432,15 +2411,12 @@ def cross_carrier_impact_aggregated(
                 x=[_sector_label(s) for s in source_order],
                 y=mean_arr[:, j],
                 name=f"→ {target_label}",
-                marker=dict(
-                    color=_sector_color(target),
-                    line=dict(color="#222", width=0.4),
-                ),
+                marker=pub_style.sector_marker(_CARRIER_TO_SECTOR[target]),
                 customdata=n_comp_per_source if show_n_components else None,
                 error_y=dict(
                     type="data",
                     array=std_arr[:, j].tolist(),
-                    thickness=1.2, width=3, color="#333",
+                    thickness=1.2, width=4, color=pub_style.MUTED_COLOR,
                     visible=bool(total_stack.shape[0] > 1),
                 ),
                 hovertemplate=(
@@ -2451,16 +2427,14 @@ def cross_carrier_impact_aggregated(
                     + f"<br>n_scenarios={total_stack.shape[0]}<extra></extra>"
                 ),
             ))
-        fig.update_layout(
-            barmode="group",
-            height=520,
-            width=820,
-            template=eval.CMRES_TEMPLATE,
-            legend=dict(title="Impacted carrier"),
-            xaxis=dict(title="Source carrier"),
-            yaxis=dict(title=y_title),
-            margin={"l": 70, "b": 60, "r": 30, "t": 70},
+        fig.update_layout(barmode="group")
+        pub_style.apply_theme(
+            fig, title="Cross-carrier impact (mean ± std across scenarios)",
+            height=440, width=pub_style.vbar_width(len(source_order), 3, base=560),
+            font_bump=1, legend_top=True,
         )
+        fig.update_xaxes(title="Source carrier")
+        fig.update_yaxes(title=y_title)
         return fig
 
     fig_total = _build_fig(
@@ -2675,30 +2649,12 @@ def pooled_metric_comparison(pooled_df, output_dir, class_label: str = ""):
         })
     rho_df = pandas.DataFrame(rho_rows).sort_values("Spearman ρ", ascending=True)
 
-    rho_bar = go.Figure(go.Bar(
-        x=rho_df["Spearman ρ"],
-        y=rho_df["Metric"],
-        orientation="h",
-        marker=outlined_marker(eval.PALETTE_QUAL[0]),
-        error_x=bar_error_kwargs(
-            err_hi=rho_df["err_hi"].tolist(),
-            err_lo=rho_df["err_lo"].tolist(),
-        ),
-        text=[f"ρ={r:.2f} [{lo:.2f},{hi:.2f}]<br>p={p:.3f}"
-              for r, lo, hi, p in zip(rho_df["Spearman ρ"], rho_df["ci_lo"],
-                                      rho_df["ci_hi"], rho_df["p-value"])],
-        textposition="outside",
-    ))
-    rho_bar.update_layout(
-        # Same horizontal-bar dim as the per-network rho_fig — 60 px per
-        # bar so each bar is visually comparable to an E16 bar.
-        height=120 + 60 * max(len(rho_df), 1), width=900,
-        template=eval.CMRES_TEMPLATE,
-        xaxis=dict(title="Spearman ρ", range=[-1.05, 1.05],
-                   gridcolor="#e5e5e5",
-                   zeroline=True, zerolinecolor="black"),
-        yaxis=dict(title="Metric"),
-        margin={"l": 160, "b": 50, "r": 160, "t": 50},
+    rho_bar = _rho_hbar(
+        rho_df["Metric"], rho_df["Spearman ρ"],
+        rho_df["err_hi"], rho_df["err_lo"],
+        title=f"Pooled Spearman ρ with Fisher z 95% CI (n={n_total})",
+        text=[f"ρ={r:.2f}" for r in rho_df["Spearman ρ"]],
+        range_x=(-1.05, 1.25),
     )
     figures.append(rho_bar)
     titles.append(f"Pooled Spearman ρ with Fisher z 95% CI (n={n_total})")
@@ -2723,22 +2679,24 @@ def pooled_metric_comparison(pooled_df, output_dir, class_label: str = ""):
                 name=label,
                 x=[pretty_scenario(nt) for nt in net_types],
                 y=nt_rhos,
-                marker=outlined_marker(eval.PALETTE_QUAL[m_idx % 10]),
+                marker=pub_style.bar_marker(
+                    pub_style.qual_color(m_idx),
+                    pattern_shape=pub_style.qual_pattern(m_idx)),
                 error_y=bar_error_kwargs(err_hi=nt_errs_hi, err_lo=nt_errs_lo),
             ))
-        nt_rho_fig.update_layout(
-            barmode="group",
-            # Match E16 grouped-bar dim: 460h × (120 + 110·N)w where the
-            # x-axis category is the network here.
-            height=460, width=120 + 110 * max(len(net_types), 1),
-            template=eval.CMRES_TEMPLATE,
-            xaxis=dict(title="Network type"),
-            yaxis=dict(title="Spearman ρ", range=[-1.05, 1.05],
-                       gridcolor="#e5e5e5",
-                       zeroline=True, zerolinecolor="black"),
-            legend=dict(title="Metric"),
-            margin={"l": 60, "b": 60, "r": 20, "t": 50},
+        # Kept vertical: network types are the comparison axis and the many
+        # metric series read as grouped columns per network; a horizontal
+        # layout with this many series would be excessively tall.
+        nt_rho_fig.add_hline(y=0, line=dict(color="#444", width=1, dash="dot"))
+        nt_rho_fig.update_layout(barmode="group")
+        pub_style.apply_theme(
+            nt_rho_fig,
+            title="Spearman ρ per network type — check for heterogeneity",
+            height=480, width=pub_style.vbar_width(len(net_types), 10, base=620),
+            font_bump=1, legend_top=True,
         )
+        nt_rho_fig.update_xaxes(title="Network type", tickangle=-30)
+        nt_rho_fig.update_yaxes(title="Spearman ρ", range=[-1.05, 1.05])
         figures.append(nt_rho_fig)
         titles.append("Spearman ρ per network type — check for heterogeneity")
 
@@ -2773,8 +2731,6 @@ def pooled_metric_comparison(pooled_df, output_dir, class_label: str = ""):
             "rNDCG@k": rndcg, "rndcg_lo": rndcg_lo, "rndcg_hi": rndcg_hi,
         })
     acc_df = pandas.DataFrame(acc_rows).sort_values("rNDCG@k", ascending=True)
-    metric_colors = {row["Metric"]: eval.PALETTE_QUAL[i % 10]
-                     for i, row in acc_df.iterrows()}
 
     panels = [
         ("Kendall τ",       "Kendall τ", "τ_lo",     "τ_hi",     [-1.05, 1.05]),
@@ -2782,41 +2738,10 @@ def pooled_metric_comparison(pooled_df, output_dir, class_label: str = ""):
         (f"rNDCG@{_k_cut}", "rNDCG@k",   "rndcg_lo", "rndcg_hi", [-1.05, 1.05]),
         ("NDCG",            "NDCG",      "ndcg_lo",  "ndcg_hi",  [-0.05, 1.05]),
     ]
-    acc_fig = make_subplots(
-        rows=1, cols=len(panels),
-        subplot_titles=[f"{m} (95% CI)" for m, *_ in panels],
-    )
-    for col_idx, (title_, data_col, lo_col, hi_col, ref_range) in enumerate(
-        panels, start=1,
-    ):
-        vals   = acc_df[data_col].values
-        err_lo = (vals - acc_df[lo_col].values).clip(0)
-        err_hi = (acc_df[hi_col].values - vals).clip(0)
-        acc_fig.add_trace(go.Bar(
-            x=vals, y=acc_df["Metric"], orientation="h",
-            marker=dict(
-                color=[metric_colors[m] for m in acc_df["Metric"]],
-                line=dict(color="#222", width=0.4),
-            ),
-            error_x=bar_error_kwargs(
-                err_hi=err_hi.tolist(), err_lo=err_lo.tolist(),
-            ),
-            text=[f"{v:.3f} [{lo:.2f},{hi:.2f}]"
-                  for v, lo, hi in zip(vals, acc_df[lo_col], acc_df[hi_col])],
-            textposition="outside",
-            showlegend=False,
-        ), row=1, col=col_idx)
-        acc_fig.update_xaxes(title_text=title_, range=ref_range,
-                             gridcolor="#e5e5e5",
-                             zeroline=True, zerolinecolor="black", row=1, col=col_idx)
-        acc_fig.update_yaxes(title_text="Metric" if col_idx == 1 else "",
-                             row=1, col=col_idx)
-    acc_fig.update_layout(
-        # 4 horizontal-bar panels; per-panel width matches the E16 single
-        # bar plot (~460 px), per-bar height bumped to 60 px.
-        height=120 + 60 * len(acc_df), width=460 * len(panels) + 100,
-        template=eval.CMRES_TEMPLATE,
-        margin={"l": 160, "b": 50, "r": 80, "t": 60},
+    acc_fig = _ranking_accuracy_panels(
+        acc_df, panels,
+        title=(f"Pooled ranking accuracy: Kendall τ, NDCG@{_k_cut}, "
+               f"rNDCG@{_k_cut}, NDCG (bootstrap 95% CI, n={n_total})"),
     )
     figures.append(acc_fig)
     best = acc_df.iloc[-1]["Metric"]
@@ -2874,36 +2799,9 @@ def pooled_metric_comparison(pooled_df, output_dir, class_label: str = ""):
             })
         cmp_df = pandas.DataFrame(cmp_rows).sort_values("rho_mc", ascending=True)
 
-        cmp_fig = go.Figure()
-        cmp_fig.add_trace(go.Bar(
-            name=f"All matched (n={n_all})",
-            x=cmp_df["Metric"], y=cmp_df["rho_all"],
-            error_y=bar_error_kwargs(
-                err_hi=(cmp_df["ci_hi_all"] - cmp_df["rho_all"]).tolist(),
-                err_lo=(cmp_df["rho_all"] - cmp_df["ci_lo_all"]).tolist(),
-            ),
-            marker=outlined_marker("lightgrey"),
-        ))
-        cmp_fig.add_trace(go.Bar(
-            name=f"MC-sampled (n={n_mc})",
-            x=cmp_df["Metric"], y=cmp_df["rho_mc"],
-            error_y=bar_error_kwargs(
-                err_hi=(cmp_df["ci_hi_mc"] - cmp_df["rho_mc"]).tolist(),
-                err_lo=(cmp_df["rho_mc"] - cmp_df["ci_lo_mc"]).tolist(),
-            ),
-            marker=outlined_marker(eval.PALETTE_QUAL[0]),
-        ))
-        cmp_fig.update_layout(
-            barmode="group",
-            # E16 grouped-bar dim: 460h × (120 + 110·N)w.
-            height=460, width=120 + 110 * max(len(cmp_df), 1),
-            template=eval.CMRES_TEMPLATE,
-            yaxis=dict(title="Spearman ρ vs Actual (95% CI)", range=[-1.15, 1.15],
-                       gridcolor="#e5e5e5",
-                       zeroline=True, zerolinecolor="black"),
-            xaxis=dict(title="Metric"),
-            margin={"l": 60, "b": 100, "r": 20, "t": 50},
-            legend=dict(title="Population"),
+        cmp_fig = _filtered_vs_unfiltered_hbar(
+            cmp_df, n_all, n_mc,
+            title="Filtered vs unfiltered (pooled): ρ on all matched vs MC-sampled",
         )
         figures.append(cmp_fig)
         titles.append(

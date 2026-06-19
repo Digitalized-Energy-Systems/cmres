@@ -308,7 +308,7 @@ def write_all_in_one(
     out_path.mkdir(parents=True, exist_ok=True)
     (out_path / out_filename).parent.mkdir(parents=True, exist_ok=True)
 
-    with open(out_path / out_filename, "w") as file:
+    with open(out_path / out_filename, "w", encoding="utf-8") as file:
         file.write(START_ALL_IN_ONE.format(scenario_name))
         file.write(figures[0].to_html(include_plotlyjs="cdn"))
         for fig in figures[1:]:
