@@ -34,7 +34,7 @@ def solve(
 
     return run_energy_flow_optimization(
         network,
-        solver_name="gurobi",
+        solver="gurobi",
         optimization_problem=optimization_problem,
         exclude_unconnected_nodes=True,
     )

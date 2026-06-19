@@ -165,7 +165,7 @@ def _solve_load_shed(
     try:
         return run_energy_flow_optimization(
             monee_net,
-            solver_name="gurobi",
+            solver="gurobi",
             optimization_problem=opt,
             exclude_unconnected_nodes=True,
         )
