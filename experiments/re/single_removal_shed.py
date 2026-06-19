@@ -63,7 +63,7 @@ from monee import PyomoSolver, run_energy_flow_optimization
 # the ``TimeLimit`` is a safety net so a single stuck solve cannot
 # block the whole sweep.
 from monee.solver.pyo import PER_SOLVER_OPTIONS as _MONEE_GUROBI_OPTS
-_MONEE_GUROBI_OPTS["gurobi"]["MIPGap"] = 5e-3
+_MONEE_GUROBI_OPTS["gurobi"]["MIPGap"] = 1e-4
 _MONEE_GUROBI_OPTS["gurobi"]["TimeLimit"] = 300
 
 log = logging.getLogger(__name__)
@@ -145,32 +145,26 @@ def _solve_load_shed(
     otherwise the analytical shed and the MC actuals will use different
     external slack capacities and the comparison is biased.
     """
-    # ``auto_priority_floor=True`` (monee default) auto-tunes
-    # ``demand_weight`` so demand shed dominates the formulation-level
-    # tightening terms (MISOCP Joule loss, McCormick epigraph, etc.)
-    # that get added to ``pm.obj`` by the solver-side formulations.
-    # That keeps the single-removal metric monotone (baseline ≤ removed
-    # shed) without us having to hand-pick a weight magnitude.
     opt = mp.create_min_load_shedding_problem(
-        generator_weight=0.1,
         bounds_vm=(0.9, 1.1),
-        bounds_pressure=(0.9, 1.1),
-        bounds_t=(0.7, 1.3),
+        bounds_pressure=(0.85, 1.25),
+        bounds_t=(0.8, 1.15),
         bounds_ext_el=ext_grid_el_bounds,
         bounds_ext_gas=ext_grid_gas_bounds,
         bounds_ext_heat=ext_grid_heat_bounds,
         include_ext_grids=True,
         include_coupling_points=include_coupling_points,
+        max_line_loading=100,
         check_vm=True,
         check_pressure=True,
         check_t=True,
         check_lp=True,
-        priority_safety_factor=1000.0,
+        auto_priority_floor=False,
+        lex_objectives=True
     )
     try:
         return run_energy_flow_optimization(
             monee_net,
-            solver=PyomoSolver(),
             solver_name="gurobi",
             optimization_problem=opt,
             exclude_unconnected_nodes=True,
