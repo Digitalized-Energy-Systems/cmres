@@ -160,7 +160,7 @@ def _solve_load_shed(
         check_t=True,
         check_lp=True,
         auto_priority_floor=False,
-        lex_objectives=True
+        lex_objectives=False
     )
     try:
         return run_energy_flow_optimization(

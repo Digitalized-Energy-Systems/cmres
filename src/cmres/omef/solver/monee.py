@@ -29,7 +29,7 @@ def solve(
         check_t=True,
         check_lp=True,
         auto_priority_floor=False,
-        lex_objectives=True
+        lex_objectives=False
     )
 
     return run_energy_flow_optimization(
