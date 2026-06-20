@@ -22,7 +22,11 @@ import plotly.express as px
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import cmres.evaluation.evaluation as ev  # noqa: E402
+import pub_style  # noqa: E402  # shared scare-style publication theme for the
+                   # bar plots (dark outline, CVD hatch, top legend, compact
+                   # horizontal sizing, kept sector colours)
 
 # Re-use the human-readable scenario labels and stable display order from
 # cp_cn_evaluation when available. Falls back to the raw grid name so the
@@ -275,27 +279,26 @@ def _top_components(
     suffix = "_conn" if conn else ""
     top = sweep.sort_values(f"total_shed{suffix}", ascending=False).head(top_n).iloc[::-1]
     fig = go.Figure()
-    for carrier, color in zip(
-        ("power_shed", "heat_shed", "gas_shed"),
-        (ev.NETWORK_COLOR_MAP["electricity"], ev.NETWORK_COLOR_MAP["heat"], ev.NETWORK_COLOR_MAP["gas"]),
-    ):
+    for carrier, sector in (("power_shed", "electricity"),
+                            ("heat_shed", "heat"), ("gas_shed", "gas")):
         fig.add_trace(go.Bar(
             x=top[f"{carrier}{suffix}"],
             y=top["cp_id"].astype(str),
             orientation="h",
-            name=carrier.replace("_shed", ""),
-            marker_color=color,
+            name=pub_style.SECTOR_PRETTY[sector],
+            marker=pub_style.sector_marker(sector),
         ))
     label = "connected-load shed" if conn else "total shed"
-    fig.update_layout(
-        barmode="stack",
+    fig.update_layout(barmode="stack")
+    pub_style.apply_theme(
+        fig,
         title=f"{pretty_scenario(grid)}: top-{top_n} components by {label} (per-carrier breakdown)",
-        xaxis_title=("Connected-load shed (MW)" if conn else "Load shed (MW)"),
-        yaxis_title="Component (cp_id)",
-        height=600, width=950,
-        margin=dict(l=200),
+        height=pub_style.hbar_height(len(top)), width=pub_style.BAR_FIG_WIDTH,
+        font_bump=1, legend_top=True,
     )
-    return _srs_finalize(fig, legend="right")
+    fig.update_xaxes(title=("Connected-load shed (MW)" if conn else "Load shed (MW)"))
+    fig.update_yaxes(title="Component (cp_id)")
+    return fig
 
 
 def _pareto(sweep: pd.DataFrame, grid: str) -> go.Figure:
@@ -352,17 +355,24 @@ def _kind_summary(sweep: pd.DataFrame, grid: str) -> go.Figure:
     g["_order"] = g["kind"].map({k: i for i, k in enumerate(kind_order)})
     g = g.sort_values("_order").drop(columns="_order")
     fig = go.Figure(data=[
-        go.Bar(name="mean total_shed", x=g["kind"], y=g["mean"], marker_color=ev.PALETTE_QUAL[0]),
-        go.Bar(name="max total_shed",  x=g["kind"], y=g["max"],  marker_color=ev.PALETTE_QUAL[1]),
+        go.Bar(name="mean total_shed", x=g["kind"], y=g["mean"],
+               marker=pub_style.bar_marker(pub_style.QUAL_PALETTE[0],
+                                           pattern_shape=pub_style.PATTERN_SHAPES[0])),
+        go.Bar(name="max total_shed", x=g["kind"], y=g["max"],
+               marker=pub_style.bar_marker(pub_style.QUAL_PALETTE[1],
+                                           pattern_shape=pub_style.PATTERN_SHAPES[1])),
     ])
-    fig.update_layout(
-        barmode="group",
-        title=f"{pretty_scenario(grid)}: total shed by component kind (mean vs max)",
-        xaxis_title="Component kind", xaxis=dict(categoryorder="array", categoryarray=kind_order),
-        yaxis_title="Total shed (MW)",
-        height=400, width=750,
+    # Kept vertical: only three (ordinal) component kinds, read left-to-right.
+    fig.update_layout(barmode="group")
+    pub_style.apply_theme(
+        fig, title=f"{pretty_scenario(grid)}: total shed by component kind (mean vs max)",
+        height=400, width=pub_style.vbar_width(len(kind_order), 2, base=480),
+        font_bump=1, legend_top=True,
     )
-    return _srs_finalize(fig, legend="right")
+    fig.update_xaxes(title="Component kind", categoryorder="array",
+                     categoryarray=kind_order)
+    fig.update_yaxes(title="Total shed (MW)")
+    return fig
 
 
 def _solve_time(sweep: pd.DataFrame, grid: str) -> go.Figure:
@@ -412,8 +422,12 @@ def _grid_color_map(grids: List[str]) -> Dict[str, str]:
     sharing a hue so the eye groups them. Differentiation between family
     members is carried by ``_grid_dash`` (Scatter lines) and
     ``_grid_opacity`` (Bars / Boxes). Palette indexes by *stem* in
-    first-seen order so adding families doesn't shift colours."""
-    palette = list(ev.PALETTE_QUAL)
+    first-seen order so adding families doesn't shift colours.
+
+    Uses the publication ``QUAL_PALETTE`` (blues/purples/teals/…) rather than
+    the cmres carrier-anchored palette so a grid-coloured bar never reads as a
+    sector bar."""
+    palette = list(pub_style.QUAL_PALETTE)
     bases_in_order: List[str] = []
     seen: set = set()
     for g in grids:
@@ -466,18 +480,20 @@ def _pooled_baseline(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
     for carrier in ("electricity", "heat", "gas"):
         fig.add_trace(go.Bar(
             y=[pretty_scenario(g) for g in df["grid"]],
-            x=df[carrier], name=carrier, orientation="h",
-            marker_color=ev.NETWORK_COLOR_MAP[carrier],
-            hovertemplate=("<b>%{y}</b><br>" + carrier
+            x=df[carrier], name=pub_style.SECTOR_PRETTY[carrier], orientation="h",
+            marker=pub_style.sector_marker(carrier),
+            hovertemplate=("<b>%{y}</b><br>" + pub_style.SECTOR_PRETTY[carrier]
                            + ": %{x:.4f} MW<extra></extra>"),
         ))
-    fig.update_layout(
-        barmode="stack",
-        title="Baseline shed per grid (no fault), stacked by carrier",
-        xaxis_title="Baseline load shed (MW)", yaxis_title="",
-        height=80 + 36 * max(1, len(df)), width=900,
+    fig.update_layout(barmode="stack")
+    pub_style.apply_theme(
+        fig, title="Baseline shed per grid (no fault), stacked by carrier",
+        height=pub_style.hbar_height(len(df), 3), width=pub_style.BAR_FIG_WIDTH,
+        font_bump=1, legend_top=True,
     )
-    return _srs_finalize(fig, legend="right")
+    fig.update_xaxes(title="Baseline load shed (MW)")
+    fig.update_yaxes(title="")
+    return fig
 
 
 def _pooled_total_shed_box(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
@@ -674,22 +690,25 @@ def _pooled_kind_summary(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
         fig.add_trace(go.Bar(
             name=pretty_scenario(g),
             x=sub["kind"], y=sub["mean"],
-            marker_color=color[g],
+            marker=pub_style.bar_marker(color[g]),
             opacity=_grid_opacity(g),
             hovertemplate=("<b>" + pretty_scenario(g)
                            + "</b><br>kind = %{x}<br>mean shed = %{y:.4f} MW"
                            "<br>n = %{customdata[0]}<extra></extra>"),
             customdata=np.c_[sub["count"].fillna(0).astype(int).values],
         ))
-    fig.update_layout(
-        barmode="group",
-        title="Mean total shed by component kind, per grid",
-        xaxis=dict(title="Component kind",
-                   categoryorder="array", categoryarray=kinds_present),
-        yaxis_title="Mean total shed (MW)",
-        height=460, width=max(640, 90 * max(1, len(kinds_present) * len(grids)) + 200),
+    fig.update_layout(barmode="group")
+    pub_style.apply_theme(
+        fig, title="Mean total shed by component kind, per grid",
+        height=460,
+        width=min(pub_style._FIG_WIDTH,
+                  max(560, 70 * max(1, len(kinds_present) * len(grids)) + 200)),
+        font_bump=1, legend_top=True,
     )
-    return _srs_finalize(fig, legend="right")
+    fig.update_xaxes(title="Component kind", categoryorder="array",
+                     categoryarray=kinds_present)
+    fig.update_yaxes(title="Mean total shed (MW)")
+    return fig
 
 
 def _pooled_mean_shed_by_carrier(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
@@ -726,25 +745,27 @@ def _pooled_mean_shed_by_carrier(records: Dict[str, Tuple[pd.DataFrame, pd.Serie
         if sub.empty:
             continue
         fig.add_trace(go.Bar(
-            name=c, x=[pretty_scenario(g) for g in sub["grid"]],
+            name=pub_style.SECTOR_PRETTY[c],
+            x=[pretty_scenario(g) for g in sub["grid"]],
             y=sub["mean_shed"],
-            marker_color=ev.NETWORK_COLOR_MAP[c],
-            hovertemplate=("<b>%{x}</b><br>" + c
+            marker=pub_style.sector_marker(c),
+            hovertemplate=("<b>%{x}</b><br>" + pub_style.SECTOR_PRETTY[c]
                            + ": mean = %{y:.4f} MW"
                            "<br>n = %{customdata[0]}<extra></extra>"),
             customdata=np.c_[sub["n"].values],
         ))
-    fig.update_layout(
-        # Stacked: bar height = mean *total* shed per component, so grids
-        # stay directly comparable on the full shedding while the segments
-        # show the per-sector composition.
-        barmode="stack",
-        title="Average per-component shed per grid, stacked by sector",
-        xaxis_title="Grid",
-        yaxis_title="Mean shed per component (MW)",
-        height=460, width=max(720, 110 * len(grids) + 200),
+    # Stacked: bar height = mean *total* shed per component, so grids stay
+    # directly comparable on the full shedding while the segments show the
+    # per-sector composition.
+    fig.update_layout(barmode="stack")
+    pub_style.apply_theme(
+        fig, title="Average per-component shed per grid, stacked by sector",
+        height=460, width=pub_style.vbar_width(len(grids), base=560),
+        font_bump=1, legend_top=True,
     )
-    return _srs_finalize(fig, legend="right")
+    fig.update_xaxes(title="Grid", tickangle=-30)
+    fig.update_yaxes(title="Mean shed per component (MW)")
+    return fig
 
 
 def _pooled_solve_time(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
@@ -800,26 +821,24 @@ def _pooled_top_components(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
         return go.Figure()
     df = pd.DataFrame(rows)
     fig = go.Figure()
-    for carrier, color in zip(
-        ("power", "heat", "gas"),
-        (ev.NETWORK_COLOR_MAP["electricity"],
-         ev.NETWORK_COLOR_MAP["heat"],
-         ev.NETWORK_COLOR_MAP["gas"]),
-    ):
+    for carrier, sector in (("power", "electricity"), ("heat", "heat"),
+                            ("gas", "gas")):
         fig.add_trace(go.Bar(
             x=df[carrier], y=df["label"], orientation="h",
-            name=carrier, marker_color=color,
-            hovertemplate=("<b>%{y}</b><br>" + carrier
+            name=pub_style.SECTOR_PRETTY[sector],
+            marker=pub_style.sector_marker(sector),
+            hovertemplate=("<b>%{y}</b><br>" + pub_style.SECTOR_PRETTY[sector]
                            + ": %{x:.4f} MW<extra></extra>"),
         ))
-    fig.update_layout(
-        barmode="stack",
-        title=f"Top-{top_n} components per grid (per-carrier breakdown)",
-        xaxis_title="Load shed (MW)", yaxis_title="Grid · component",
-        height=80 + 22 * max(1, len(df)), width=950,
-        margin=dict(l=240),
+    fig.update_layout(barmode="stack")
+    pub_style.apply_theme(
+        fig, title=f"Top-{top_n} components per grid (per-carrier breakdown)",
+        height=pub_style.hbar_height(len(df), 3), width=pub_style.BAR_FIG_WIDTH,
+        font_bump=1, legend_top=True,
     )
-    return _srs_finalize(fig, legend="right")
+    fig.update_xaxes(title="Load shed (MW)")
+    fig.update_yaxes(title="Grid · component")
+    return fig
 
 
 def _emit_pooled_report(

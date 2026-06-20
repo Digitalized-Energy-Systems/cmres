@@ -53,18 +53,17 @@ import pandas as pd
 
 import monee.model as mm
 import monee.problem as mp
-from monee import PyomoSolver, run_energy_flow_optimization
+from monee import run_energy_flow_optimization
+from monee.solver.gurobipy import GurobipySolver
 
-# Cap per-solve Gurobi runtime and loosen the MIP gap slightly. With
-# ``demand_weight=1e3`` the LP objective is O(1e2-1e3), so the default
-# ``MIPGap=1e-3`` demands sub-mW precision — far below the analysis's
-# noise floor and prone to multi-hour B&B on degenerate single-removal
-# cases. ``MIPGap=5e-3`` gives ~0.5 % precision (~few mW absolute) and
-# the ``TimeLimit`` is a safety net so a single stuck solve cannot
-# block the whole sweep.
-from monee.solver.pyo import PER_SOLVER_OPTIONS as _MONEE_GUROBI_OPTS
-_MONEE_GUROBI_OPTS["gurobi"]["MIPGap"] = 1e-4
-_MONEE_GUROBI_OPTS["gurobi"]["TimeLimit"] = 300
+# ``solver="gurobi"`` resolves to monee's native gurobipy backend (the
+# single-period default), so per-solve params go on the solver instance — the
+# Pyomo ``PER_SOLVER_OPTIONS`` path no longer applies. ``MIPGap=1e-4`` keeps
+# the reported shed sub-mW (the gurobipy default is 1e-3); ``TimeLimit`` is a
+# safety net so one stuck solve cannot block the whole sweep. The lexicographic
+# aux tier is loosened inside the backend, so this tight gap only governs the
+# shed tier we actually measure.
+_GUROBI_PARAMS = {"MIPGap": 1e-4, "TimeLimit": 300}
 
 log = logging.getLogger(__name__)
 
@@ -145,6 +144,12 @@ def _solve_load_shed(
     otherwise the analytical shed and the MC actuals will use different
     external slack capacities and the comparison is biased.
     """
+    # ``auto_priority_floor=True`` (monee default) auto-tunes
+    # ``demand_weight`` so demand shed dominates the formulation-level
+    # tightening terms (MISOCP Joule loss, McCormick epigraph, etc.)
+    # that get added to ``pm.obj`` by the solver-side formulations.
+    # That keeps the single-removal metric monotone (baseline ≤ removed
+    # shed) without us having to hand-pick a weight magnitude.
     opt = mp.create_min_load_shedding_problem(
         bounds_vm=(0.9, 1.1),
         bounds_pressure=(0.85, 1.25),
@@ -160,12 +165,12 @@ def _solve_load_shed(
         check_t=True,
         check_lp=True,
         auto_priority_floor=False,
-        lex_objectives=False
+        lex_objectives=True
     )
     try:
         return run_energy_flow_optimization(
             monee_net,
-            solver="gurobi",
+            solver=GurobipySolver(params=_GUROBI_PARAMS),
             optimization_problem=opt,
             exclude_unconnected_nodes=True,
         )

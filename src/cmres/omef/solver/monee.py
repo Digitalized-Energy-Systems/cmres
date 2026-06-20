@@ -1,9 +1,16 @@
 import monee.problem as mp
-from monee import PyomoSolver, run_energy_flow_optimization
+from monee import run_energy_flow_optimization
+from monee.solver.gurobipy import GurobipySolver
 
 DEFAULT_EXT_GRID_EL_BOUNDS = (-0.05, 0.05)
 DEFAULT_EXT_GRID_GAS_BOUNDS = (-0.006, 0.006)
 DEFAULT_EXT_GRID_HEAT_BOUNDS = (-6.0, 6.0)
+
+# ``solver="gurobi"`` resolves to monee's native gurobipy backend; per-solve
+# params go on the instance (the Pyomo PER_SOLVER_OPTIONS path no longer
+# applies). MIPGap=1e-4 keeps the reported shed sub-mW; TimeLimit caps runaway
+# solves.
+_GUROBI_PARAMS = {"MIPGap": 1e-4, "TimeLimit": 300}
 
 
 def solve(
@@ -29,12 +36,12 @@ def solve(
         check_t=True,
         check_lp=True,
         auto_priority_floor=False,
-        lex_objectives=False
+        lex_objectives=True
     )
 
     return run_energy_flow_optimization(
         network,
-        solver="gurobi",
+        solver=GurobipySolver(params=_GUROBI_PARAMS),
         optimization_problem=optimization_problem,
         exclude_unconnected_nodes=True,
     )
