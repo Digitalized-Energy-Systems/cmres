@@ -63,8 +63,19 @@ cd "${SLURM_SUBMIT_DIR:-$PWD}"
 # constants in cp_cn_evaluation.py; edit there to point at a different
 # simulation output / output directory. CMRES_INPUT (env) overrides
 # the module default for one-off runs without editing the .py.
-python -u -c "
-import os, sys
+# Capture a real core dump (lands in CWD = SLURM_SUBMIT_DIR) and print the
+# kernel core pattern so the file can be located after a native crash.
+ulimit -c unlimited
+echo "ulimit -c    : $(ulimit -c)"
+echo "core_pattern : $(cat /proc/sys/kernel/core_pattern 2>/dev/null)"
+
+# PYTHONFAULTHANDLER makes the interpreter dump a Python+C traceback to stderr
+# (the eval_%j.err file) on a segfault instead of dying silently.
+export PYTHONFAULTHANDLER=1
+
+python -u -X faulthandler -c "
+import os, sys, faulthandler
+faulthandler.enable()
 sys.path.insert(0, 'experiments/re')
 from cp_cn_evaluation import evaluate, INPUT
 evaluate(os.environ.get('CMRES_INPUT') or INPUT)
