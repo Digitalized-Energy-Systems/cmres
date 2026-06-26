@@ -340,8 +340,8 @@ def build_branches_power(monee_net):
             continue
         if b.from_node_id not in id_to_local or b.to_node_id not in id_to_local:
             continue
-        br_r = _val(b.model.br_r, 0.0)
-        br_x = _val(b.model.br_x, 0.0)
+        br_r = _val(b.model.br_r_pu, 0.0)
+        br_x = _val(b.model.br_x_pu, 0.0)
         # Avoid zero impedance (bus-bar / short-circuit branches)
         if abs(br_r) < 1e-9 and abs(br_x) < 1e-9:
             br_x = 1e-6
@@ -351,10 +351,10 @@ def build_branches_power(monee_net):
                 id_to_local[b.to_node_id],
                 br_r,
                 br_x,
-                _val(b.model.g_fr, 0.0),
-                _val(b.model.b_fr, 0.0),
-                _val(b.model.g_to, 0.0),
-                _val(b.model.b_to, 0.0),
+                _val(b.model.g_fr_pu, 0.0),
+                _val(b.model.b_fr_pu, 0.0),
+                _val(b.model.g_to_pu, 0.0),
+                _val(b.model.b_to_pu, 0.0),
                 _val(b.model.tap, 1.0),
                 _val(b.model.shift, 0.0),
             )
@@ -1004,7 +1004,7 @@ def _heat_remoteness_per_node(monee_net, junc_ids: List[int], cfg: CPMetricConfi
             continue
         d_raw = _val(getattr(pipe.model, "diameter_m", None), None)
         L_raw = _val(getattr(pipe.model, "length_m", None), None)
-        m_raw = _val(getattr(pipe.model, "mass_flow", 0.0), 0.0)
+        m_raw = _first_attr(pipe.model, ["mass_flow_kgs", "mass_flow"], default=0.0)
         if not (_is_finite(d_raw) and _is_finite(L_raw)):
             continue
         d = float(d_raw)
@@ -1107,7 +1107,7 @@ def _gas_pipe_limit_and_flow(monee_net, pipe_id, gas_grid=None) -> Tuple[float, 
     except Exception:
         return np.inf, 0.0
 
-    flow0 = abs(_first_attr(pm, ["mass_flow", "mass_flow_pos", "m_dot"], default=0.0))
+    flow0 = abs(_first_attr(pm, ["mass_flow_kgs", "mass_flow_pos_kgs", "mass_flow", "mass_flow_pos", "m_dot"], default=0.0))
 
     # Prefer explicit limits if present
     direct = _first_attr(pm, ["mass_flow_max", "m_max", "max_mass_flow"], default=None)
@@ -1131,7 +1131,7 @@ def _heat_pipe_limit_and_flow(monee_net, pipe_or_hx_id) -> Tuple[float, float]:
     except Exception:
         return np.inf, 0.0
 
-    flow0 = abs(_first_attr(pm, ["mass_flow", "mass_flow_pos", "m_dot"], default=0.0))
+    flow0 = abs(_first_attr(pm, ["mass_flow_kgs", "mass_flow_pos_kgs", "mass_flow", "mass_flow_pos", "m_dot"], default=0.0))
 
     # Prefer explicit limits if present
     direct = _first_attr(pm, ["mass_flow_max", "m_max", "max_mass_flow"], default=None)
@@ -1538,7 +1538,7 @@ def _carrier_quality_factor(carrier: str, monee_net, cfg: CPMetricConfig) -> flo
                 for grid in getattr(monee_net, "grids", []) or []:
                     name = (getattr(grid, "name", "") or "").lower()
                     if name in ("heat", "water"):
-                        tref = float(getattr(grid, "t_ref", Ts))
+                        tref = float(_first_attr(grid, ["t_ref_k", "t_ref"], default=Ts))
                         if tref > T0:
                             Ts = tref
                             break
@@ -1737,7 +1737,7 @@ def compute_stress_topology_metrics(monee_net, ctx: "CarrierPTDFContext", cfg: "
             margin = float(ctx.gas["margins"][i]) if i < len(ctx.gas["margins"]) else cfg.MIN_MARGIN
             try:
                 flow0 = abs(_first_attr(monee_net.branch_by_id(pid).model,
-                                        ["mass_flow", "mass_flow_pos", "m_dot"], default=0.0))
+                                        ["mass_flow_kgs", "mass_flow_pos_kgs", "mass_flow", "mass_flow_pos", "m_dot"], default=0.0))
             except Exception:
                 flow0 = 0.0
             stress_by_id[pid] = float(flow0) / (margin + cfg.EPS_MARGIN)
@@ -1747,7 +1747,7 @@ def compute_stress_topology_metrics(monee_net, ctx: "CarrierPTDFContext", cfg: "
             margin = float(ctx.heat["margins"][i]) if i < len(ctx.heat["margins"]) else cfg.MIN_MARGIN
             try:
                 flow0 = abs(_first_attr(monee_net.branch_by_id(pid).model,
-                                        ["mass_flow", "mass_flow_pos", "m_dot"], default=0.0))
+                                        ["mass_flow_kgs", "mass_flow_pos_kgs", "mass_flow", "mass_flow_pos", "m_dot"], default=0.0))
             except Exception:
                 flow0 = 0.0
             stress_by_id[pid] = float(flow0) / (margin + cfg.EPS_MARGIN)
