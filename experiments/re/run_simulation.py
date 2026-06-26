@@ -56,11 +56,11 @@ data/res/<EXPERIMENT_NAME>/
 
 import argparse
 import logging
-import pickle
 import sys
 import time
 from pathlib import Path
 
+import dill  # noqa: E402
 import numpy as np  # noqa: E402
 
 from test_grids import ALL_GRIDS  # noqa: E402
@@ -171,8 +171,11 @@ def run_experiment(grid_name: str, shard: int = 0, n_shards: int = 1):
     net = container.network
     if not is_shard or shard == 1:
         # Network is identical across shards; only one writer needed.
+        # dill, not stdlib pickle: monee node models carry local lambdas
+        # (e.g. Bus.va_degree PostProcess) that pickle can't serialize —
+        # stdlib pickle leaves a 0-byte file. Readers must load with dill.
         with (out_dir / "network.p").open("wb") as fp:
-            pickle.dump(net, fp)
+            dill.dump(net, fp)
 
     # ── RQMC setup ───────────────────────────────────────────────────────────
     registry = ComponentRegistry(net)

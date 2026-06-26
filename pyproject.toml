@@ -32,6 +32,7 @@ dependencies = [
   "plotly==6.3.0",
   "kaleido==0.2.1",
   "gurobipy",
+  "dill",
   "monee @ git+https://github.com/Digitalized-Energy-Systems/monee@development"
 ]
 

@@ -24,12 +24,12 @@ Outputs land in ``<output-dir>`` (default ``data/out/cmres``):
 from __future__ import annotations
 
 import argparse
-import pickle
 import sys
 import traceback
 from pathlib import Path
 from typing import List
 
+import dill
 import pandas
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -73,7 +73,7 @@ def _load_grid_dfs(grid: str, input_dir: Path):
     fail_df["network_type"] = grid
 
     with open(net_path, "rb") as f:
-        monee_net = pickle.load(f)
+        monee_net = dill.load(f)
 
     return perf_df, fail_df, monee_net
 

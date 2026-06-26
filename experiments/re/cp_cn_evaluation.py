@@ -2,11 +2,11 @@ from typing import Dict
 import argparse
 import os
 import sys
-import pickle
 import traceback
 from pathlib import PurePath, Path
 from statistics import mean
 
+import dill
 import cmres.evaluation.evaluation as eval
 from monee import Network, run_energy_flow, run_energy_flow_optimization, PyomoSolver
 from monee.model.core import Node
@@ -417,7 +417,7 @@ def load_dfs(folder_id):
 
         if network_type not in net_type_to_net:
             with open(Path(experiment_desc) / Path("network.p"), "rb") as network_file:
-                monee_net = pickle.load(network_file)
+                monee_net = dill.load(network_file)
                 print(monee_net.statistics())
                 net_type_to_net[network_type] = monee_net
 
