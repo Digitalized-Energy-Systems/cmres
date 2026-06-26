@@ -905,16 +905,16 @@ def impact_aggregated_component_carrier(impact_df: pandas.DataFrame, folder_id):
     )
     """
     average_impact_per_carrier = (
-        new_impact_df.groupby(["type_carrier", "carrier"]).mean().reset_index()
+        new_impact_df.groupby(["type_carrier", "carrier"]).mean(numeric_only=True).reset_index()
     )
     average_impact_per_component = (
-        new_impact_df.groupby(["type", "carrier"]).mean().reset_index()
+        new_impact_df.groupby(["type", "carrier"]).mean(numeric_only=True).reset_index()
     )
     impact_per_carrier = (
-        new_impact_df.groupby(["type_carrier", "carrier"]).sum().reset_index()
+        new_impact_df.groupby(["type_carrier", "carrier"]).sum(numeric_only=True).reset_index()
     )
     impact_per_component = (
-        new_impact_df.groupby(["type", "carrier"]).sum().reset_index()
+        new_impact_df.groupby(["type", "carrier"]).sum(numeric_only=True).reset_index()
     )
     figures = []
     titles = []
@@ -939,7 +939,7 @@ def impact_aggregated_component_carrier(impact_df: pandas.DataFrame, folder_id):
 
     average_impact_per_carrier_net_type = (
         new_impact_df.groupby(["type_carrier", "carrier", "network_type"])
-        .mean()
+        .mean(numeric_only=True)
         .reset_index()
     )
     average_impact_per_carrier_net_type["carrier_net_type"] = (
@@ -949,7 +949,7 @@ def impact_aggregated_component_carrier(impact_df: pandas.DataFrame, folder_id):
     )
     impact_per_carrier_net_type = (
         new_impact_df.groupby(["type_carrier", "carrier", "network_type"])
-        .sum()
+        .sum(numeric_only=True)
         .reset_index()
     )
     impact_per_carrier_net_type["carrier_net_type"] = (
@@ -969,13 +969,13 @@ def impact_aggregated_component_carrier(impact_df: pandas.DataFrame, folder_id):
     titles.append("Total impacts by carrier type and density")
 
     average_impact_per_net_type = (
-        new_impact_df.groupby(["carrier", "network_type"]).mean().reset_index()
+        new_impact_df.groupby(["carrier", "network_type"]).mean(numeric_only=True).reset_index()
     )
     average_impact_per_net_type["network_type"] = (
         average_impact_per_net_type["network_type"].map(pretty_scenario)
     )
     total_impact_per_net_type = (
-        new_impact_df.groupby(["carrier", "network_type"]).sum().reset_index()
+        new_impact_df.groupby(["carrier", "network_type"]).sum(numeric_only=True).reset_index()
     )
     total_impact_per_net_type["network_type"] = (
         total_impact_per_net_type["network_type"].map(pretty_scenario)
