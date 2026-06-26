@@ -530,7 +530,7 @@ def resilience_per_scenario(perf_df: pandas.DataFrame, folder_id):
         .mean()
         .reset_index()
         .groupby(["network_type", "experiment"])
-        .mean()
+        .mean(numeric_only=True)
         .reset_index()
         .melt(
             id_vars=["network_type", "experiment"],
@@ -739,7 +739,7 @@ def impact_over_metrics(
     # aggregated all carrier impacts
     metric_impact_df_all_carrier = (
         metric_impact_df.groupby(["type_y", "network_type", "id"] + metric_ids)
-        .sum()
+        .sum(numeric_only=True)
         .reset_index()
     )
     for metric in metric_ids:
@@ -1974,7 +1974,7 @@ def pooled_resilience_per_scenario(perf_df: pandas.DataFrame, output_dir: str):
         .mean()
         .reset_index()
         .groupby(["network_type", "experiment"])
-        .mean()
+        .mean(numeric_only=True)
         .reset_index()
         .melt(
             id_vars=["network_type", "experiment"],
