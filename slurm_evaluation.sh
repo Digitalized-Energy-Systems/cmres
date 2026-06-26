@@ -73,14 +73,33 @@ echo "core_pattern : $(cat /proc/sys/kernel/core_pattern 2>/dev/null)"
 # (the eval_%j.err file) on a segfault instead of dying silently.
 export PYTHONFAULTHANDLER=1
 
-python -u -X faulthandler -c "
+# The previous run segfaulted in native code with NO faulthandler output, which
+# means the crash is below the Python layer (gurobi / BLAS / XLA). Run under gdb
+# in batch mode so a native C backtrace is dumped straight into the .err file —
+# that names the offending shared library, which faulthandler cannot. Falls back
+# to plain python if gdb is unavailable on the node.
+PY_SCRIPT='
 import os, sys, faulthandler
 faulthandler.enable()
-sys.path.insert(0, 'experiments/re')
+sys.path.insert(0, "experiments/re")
 from cp_cn_evaluation import evaluate, INPUT
-evaluate(os.environ.get('CMRES_INPUT') or INPUT)
-"
-EXIT_CODE=$?
+evaluate(os.environ.get("CMRES_INPUT") or INPUT)
+'
+if command -v gdb >/dev/null 2>&1; then
+    gdb -q -batch \
+        -ex "set pagination off" \
+        -ex "run" \
+        -ex "echo \n==== NATIVE BACKTRACE (faulting thread) ====\n" \
+        -ex "bt" \
+        -ex "echo \n==== ALL THREADS ====\n" \
+        -ex "thread apply all bt" \
+        --args python -u -X faulthandler -c "$PY_SCRIPT"
+    EXIT_CODE=$?
+else
+    echo "gdb not found — running plain python"
+    python -u -X faulthandler -c "$PY_SCRIPT"
+    EXIT_CODE=$?
+fi
 
 echo "============================================================"
 echo "Finished at : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
