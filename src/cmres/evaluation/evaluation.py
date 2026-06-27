@@ -945,12 +945,13 @@ def create_multilevel_grouped_bar_chart(
             name=name_list[i],
             marker_color=color,
         )
+    x_span = max(common_x) or 1.0
     for i, group_label in enumerate(group_labels):
         fig.add_annotation(
             text=group_label,
             xref="paper",
             yref="paper",
-            x=(common_x[i * group_size] + 2.5) / (max(common_x)),
+            x=(common_x[i * group_size] + 2.5) / x_span,
             y=multi_level_distance,
             showarrow=False,
             font_size=20,
