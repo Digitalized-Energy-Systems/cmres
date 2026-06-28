@@ -11,6 +11,7 @@ writes one HTML/PDF report per grid:
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -19,6 +20,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
+from plotly.subplots import make_subplots
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
@@ -41,6 +43,20 @@ except Exception:  # pragma: no cover
         return "" if name is None else str(name)
 
 DEFAULT_DIR = Path("data/out/single_removal_shed")
+
+# Short per-grid labels (LV-no … LV-xxl) for the compact, side-by-side pooled
+# figures; the strategy is carried by the panel/subplot title instead of the bar
+# label so the three strategies can sit in one row.
+_SIZE_LABEL = {"no": "LV-no", "low": "LV-s", "mid": "LV-m",
+               "high": "LV-l", "xl": "LV-xl", "xxl": "LV-xxl"}
+_FAMILY_ORDER = {"backup": 0, "loadbearing": 1, "control": 2}
+
+
+def _short_grid(grid: str) -> str:
+    m = re.search(r"lv_([a-z]+)_(?:backup|loadbearing|control)$", str(grid))
+    if m and m.group(1) in _SIZE_LABEL:
+        return _SIZE_LABEL[m.group(1)]
+    return pretty_scenario(grid)
 
 
 # Single-column dissertation typography. Same sizing convention as the
@@ -746,25 +762,62 @@ def _pooled_mean_shed_by_carrier(records: Dict[str, Tuple[pd.DataFrame, pd.Serie
             continue
         fig.add_trace(go.Bar(
             name=pub_style.SECTOR_PRETTY[c],
-            x=[pretty_scenario(g) for g in sub["grid"]],
-            y=sub["mean_shed"],
+            y=[_short_grid(g) for g in sub["grid"]],
+            x=sub["mean_shed"],
+            orientation="h",
             marker=pub_style.sector_marker(c),
-            hovertemplate=("<b>%{x}</b><br>" + pub_style.SECTOR_PRETTY[c]
-                           + ": mean = %{y:.4f} MW"
+            hovertemplate=("<b>%{y}</b><br>" + pub_style.SECTOR_PRETTY[c]
+                           + ": mean = %{x:.4f} MW"
                            "<br>n = %{customdata[0]}<extra></extra>"),
             customdata=np.c_[sub["n"].values],
         ))
-    # Stacked: bar height = mean *total* shed per component, so grids stay
-    # directly comparable on the full shedding while the segments show the
-    # per-sector composition.
+    # Stacked horizontal: bar length = mean *total* shed per component, so grids
+    # stay directly comparable while the segments show the per-sector
+    # composition. Horizontal to align with the other pooled bar figures.
     fig.update_layout(barmode="stack")
     pub_style.apply_theme(
-        fig, title="Average per-component shed per grid, stacked by sector",
-        height=460, width=pub_style.vbar_width(len(grids), base=560),
-        font_bump=1, legend_top=True,
+        fig, title="Mean per-component load shed by carrier",
+        height=pub_style.hbar_height(len(grids), 3),
+        width=pub_style.BAR_FIG_WIDTH, font_bump=1, legend_top=True,
     )
-    fig.update_xaxes(title="Grid", tickangle=-30)
-    fig.update_yaxes(title="Mean shed per component (MW)")
+    fig.update_yaxes(autorange="reversed")
+    fig.update_xaxes(title="Mean shed per component (MW)")
+    return fig
+
+
+def _pooled_mean_shed_by_carrier_row(
+        records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
+        classes: List[Tuple[str, List[str]]]) -> go.Figure:
+    """Combined cross-family view: one horizontal stacked-bar panel per scenario
+    family (backup | loadbearing | control) sharing a single legend, so the three
+    strategies sit in one row in the dissertation. Mirrors
+    :func:`_pooled_mean_shed_by_carrier` but across families."""
+    carriers = (("electricity", "power_shed"), ("heat", "heat_shed"), ("gas", "gas_shed"))
+    fams = sorted(classes, key=lambda c: _FAMILY_ORDER.get(c[0], 99))
+    fig = make_subplots(rows=1, cols=len(fams), shared_xaxes=False,
+                        horizontal_spacing=0.06,
+                        subplot_titles=[f for f, _ in fams])
+    for ci, (_fam, subset) in enumerate(fams, start=1):
+        grids = _grid_order(subset)
+        y = [_short_grid(g) for g in grids]
+        for sec, col in carriers:
+            x = []
+            for g in grids:
+                sweep, _ = records[g]
+                x.append(float(sweep[col].mean())
+                         if (not sweep.empty and col in sweep.columns) else 0.0)
+            fig.add_trace(go.Bar(
+                y=y, x=x, orientation="h",
+                name=pub_style.SECTOR_PRETTY[sec], legendgroup=sec,
+                showlegend=(ci == 1), marker=pub_style.sector_marker(sec),
+            ), row=1, col=ci)
+    fig.update_layout(barmode="stack", bargap=0.25)
+    fig.update_yaxes(autorange="reversed")
+    fig.update_xaxes(title_text="Mean shed per component (MW)",
+                     row=1, col=(len(fams) + 1) // 2)
+    pub_style.apply_theme(
+        fig, title="Mean per-component load shed by carrier, per density and strategy",
+        width=1180, height=430, legend_top=True)
     return fig
 
 
@@ -931,6 +984,15 @@ def plot_pooled(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
         sub_records = {g: records[g] for g in subset}
         last_path = _emit_pooled_report(sub_records, subset, out_dir,
                                         class_label=class_label)
+    # Combined cross-family row used in the dissertation: the three strategies
+    # side by side, horizontal stacked bars, one shared legend.
+    try:
+        row_fig = _pooled_mean_shed_by_carrier_row(records, classes)
+        single_dir = out_dir / "single"
+        single_dir.mkdir(parents=True, exist_ok=True)
+        row_fig.write_image(str(single_dir / "00_pooled_mean_shed_by_carrier_row.pdf"))
+    except Exception as e:  # pragma: no cover
+        print(f"  mean_shed_by_carrier_row skipped: {e}")
     return last_path  # type: ignore[return-value]
 
 

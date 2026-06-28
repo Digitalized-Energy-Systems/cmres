@@ -1957,6 +1957,57 @@ def cp_only_pooled_metric_comparison(
     _cp_only_metric_comparison_core(pooled_df, label, out)
 
 
+_RES_SIZE_LABEL = {"no": "LV-no", "low": "LV-s", "mid": "LV-m",
+                   "high": "LV-l", "xl": "LV-xl", "xxl": "LV-xxl"}
+_RES_FAMILY_ORDER = {"backup": 0, "loadbearing": 1, "control": 2}
+_RES_CARRIER_TO_SECTOR = {"electricity": "power", "heat": "heat", "gas": "gas"}
+
+
+def _resilience_short_label(network_type) -> str:
+    """Short per-grid label (LV-no … LV-xxl) for the compact, side-by-side pooled
+    performance-drop figures; the strategy is carried by the panel title."""
+    import re as _re
+    m = _re.search(r"lv_([a-z]+)_(?:backup|loadbearing|control)$", str(network_type))
+    if m and m.group(1) in _RES_SIZE_LABEL:
+        return _RES_SIZE_LABEL[m.group(1)]
+    return pretty_scenario(network_type)
+
+
+def _pooled_resilience_row(pooled, classes):
+    """Combined cross-family performance-drop view: one horizontal stacked-bar
+    panel per scenario family (backup | loadbearing | control), shared legend, so
+    the three strategies sit in one row in the dissertation E1 figure."""
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+    carriers_present = [c for c in ("electricity", "heat", "gas")
+                        if c in pooled["carrier"].unique()]
+    fams = sorted(list(classes), key=lambda c: _RES_FAMILY_ORDER.get(c[0], 99))
+    fig = make_subplots(rows=1, cols=len(fams), shared_xaxes=False,
+                        horizontal_spacing=0.06, subplot_titles=[f for f, _ in fams])
+    for ci, (_fam, types) in enumerate(fams, start=1):
+        sub_all = pooled[pooled["network_type"].isin(list(types))]
+        order = sorted(sub_all["network_type"].unique(), key=scenario_sort_key)
+        ylabels = [_resilience_short_label(nt) for nt in order]
+        for carrier in carriers_present:
+            sub = sub_all[sub_all["carrier"] == carrier]
+            by_nt = dict(zip(sub["network_type"], sub["resilience_mean"]))
+            fig.add_trace(go.Bar(
+                y=ylabels, x=[float(by_nt.get(nt, 0.0)) for nt in order],
+                orientation="h",
+                name=SECTOR_PRETTY[_RES_CARRIER_TO_SECTOR[carrier]],
+                legendgroup=carrier, showlegend=(ci == 1),
+                marker=pub_style.sector_marker(_RES_CARRIER_TO_SECTOR[carrier]),
+            ), row=1, col=ci)
+    fig.update_layout(barmode="stack", bargap=0.25)
+    fig.update_yaxes(autorange="reversed")
+    fig.update_xaxes(title_text="Mean performance loss (MW)",
+                     row=1, col=(len(fams) + 1) // 2)
+    pub_style.apply_theme(
+        fig, title="Mean per-carrier performance loss, per density and strategy",
+        width=1180, height=430, legend_top=True)
+    return fig
+
+
 def pooled_resilience_per_scenario(perf_df: pandas.DataFrame, output_dir: str):
     """Pooled performance loss per carrier across all scenarios / network types.
 
@@ -2025,24 +2076,26 @@ def pooled_resilience_per_scenario(perf_df: pandas.DataFrame, output_dir: str):
                         if c in pooled["carrier"].unique()]
 
     def _build_fig(sub_pooled):
-        scens = list(sub_pooled["scenario"].unique())
+        order = sorted(sub_pooled["network_type"].unique(), key=scenario_sort_key)
+        ylabels = [_resilience_short_label(nt) for nt in order]
         fig = go.Figure()
         for carrier in carriers_present:
             sub = sub_pooled[sub_pooled["carrier"] == carrier]
-            y_by_scenario = dict(zip(sub["scenario"], sub["resilience_mean"]))
+            by_nt = dict(zip(sub["network_type"], sub["resilience_mean"]))
             carrier_label = _sector_label(carrier)
             fig.add_trace(go.Bar(
-                x=scens,
-                y=[float(y_by_scenario.get(s, 0.0)) for s in scens],
+                y=ylabels,
+                x=[float(by_nt.get(nt, 0.0)) for nt in order],
+                orientation="h",
                 name=carrier_label,
                 marker=pub_style.sector_marker(_CARRIER_TO_SECTOR[carrier]),
                 hovertemplate=(
-                    "scenario=%{x}<br>"
+                    "scenario=%{y}<br>"
                     f"carrier={carrier_label}<br>"
-                    "mean performance loss=%{y:.4f} MW<extra></extra>"
+                    "mean performance loss=%{x:.4f} MW<extra></extra>"
                 ),
             ))
-        return fig, scens
+        return fig, order
 
     # Split by scenario family so a full-roster run doesn't render a
     # 2.5k-px-wide bar chart. Filter on the raw network_type (the dataframe
@@ -2056,17 +2109,17 @@ def pooled_resilience_per_scenario(perf_df: pandas.DataFrame, output_dir: str):
         fig, scens = _build_fig(sub_pooled)
         suffix = f" ({class_label})" if class_label else ""
         slug_suffix = f"_{class_label}" if class_label else ""
-        # Stacked + vertical: bar height = total performance drop (scenarios
-        # are an ordered density series read left-to-right); the segments show
-        # the per-sector composition.
+        # Stacked horizontal: bar length = total performance drop; the segments
+        # show the per-sector composition. Horizontal to align with the other
+        # pooled bar figures (ceiling, per-sector, ranking).
         fig.update_layout(barmode="stack")
         pub_style.apply_theme(
             fig, title=f"Pooled performance drop by scenario, by carrier{suffix}",
-            height=460, width=pub_style.vbar_width(len(scens), base=520),
-            font_bump=1, legend_top=True,
+            height=pub_style.hbar_height(len(scens), 3),
+            width=pub_style.BAR_FIG_WIDTH, font_bump=1, legend_top=True,
         )
-        fig.update_xaxes(title="Scenario", tickangle=-30)
-        fig.update_yaxes(title="Mean performance loss (MW)")
+        fig.update_yaxes(autorange="reversed")
+        fig.update_xaxes(title="Mean performance loss (MW)")
         eval.write_all_in_one(
             [fig], "Figure", Path("."),
             f"{output_dir}/resilience_per_carrier_per_scenario_pooled{slug_suffix}.html",
@@ -2082,6 +2135,14 @@ def pooled_resilience_per_scenario(perf_df: pandas.DataFrame, output_dir: str):
     else:
         for cl, types in classes:
             _emit(pooled[pooled["network_type"].isin(types)], class_label=cl)
+        # Combined cross-family row used in the dissertation: the three
+        # strategies side by side, horizontal stacked bars, one shared legend.
+        try:
+            row_fig = _pooled_resilience_row(pooled, classes)
+            row_fig.write_image(
+                f"{output_dir}/resilience_per_carrier_per_scenario_pooled_row.pdf")
+        except Exception as e:  # pragma: no cover
+            print(f"  resilience row skipped: {e}")
 
     print(
         f"Pooled resilience plot: "

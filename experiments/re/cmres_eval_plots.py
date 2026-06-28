@@ -1755,6 +1755,133 @@ def _e16_rho_per_sector_bar_aggregated(
     )
 
 
+_E16_RANK_METRICS = [
+    "predicted_score", "predicted_score_cp_aware", "predicted_score_balanced",
+    "predicted_stress", "topo_bc", "stress_bc", "katz_score", "vitality_score",
+    "local_score", "self_score",
+]
+
+
+def _e16_ranking_per_sector_aggregated(
+    merged_files: Sequence[Path], k: int = 10,
+) -> go.Figure:
+    """Pooled per-sector *top-of-ranking* accuracy: Kendall τ, NDCG@k and
+    precision@k recomputed on rows concatenated across every scenario's
+    ``E16_<scenario>_merged.csv``, using the same sector partitioning as
+    ``_e16_rho_per_sector_bar_aggregated`` (total / multi / power / heat / gas).
+
+    Three horizontal grouped panels (one per measure), bars grouped by sector.
+    Complements the per-sector ρ bar: ρ measures full-list monotonicity, these
+    measure how well the few most critical components surface — which is what a
+    planner screening a handful of coupling points actually cares about. Pooling
+    these across sectors collapses the signal, so they are resolved per sector.
+    """
+    from plotly.subplots import make_subplots
+    from scipy.stats import kendalltau as _kendalltau
+    try:
+        from eval_common import ndcg as _ndcg
+    except Exception:  # pragma: no cover
+        _ndcg = None
+
+    if not merged_files:
+        return go.Figure()
+    frames: List[pd.DataFrame] = []
+    for mf in merged_files:
+        try:
+            d = pd.read_csv(mf)
+        except Exception:
+            continue
+        if not d.empty:
+            frames.append(d)
+    if not frames:
+        return go.Figure()
+    pooled = pd.concat(frames, ignore_index=True)
+
+    sector_specs = [
+        ("total", "total_shed", None),
+        ("power", "power_shed", "branch"),
+        ("heat",  "heat_shed",  "branch"),
+        ("gas",   "gas_shed",   "branch"),
+        ("multi", "total_shed", "cp"),
+    ]
+    metrics = [m for m in _E16_RANK_METRICS
+               if m in pooled.columns and pooled[m].notna().sum() >= 3
+               and pooled[m].nunique() >= 2]
+    if not metrics:
+        return go.Figure()
+
+    def _prec_at_k(scores, gains, kk):
+        s = np.asarray(scores, float)
+        g = np.asarray(gains, float)
+        kk = min(kk, len(s))
+        if kk < 1:
+            return float("nan")
+        return len(set(np.argsort(-s)[:kk]) & set(np.argsort(-g)[:kk])) / kk
+
+    def _ndcg_at_k(scores, gains, kk):
+        if _ndcg is not None:
+            return float(_ndcg(np.clip(np.asarray(gains, float), 0, None),
+                               np.asarray(scores, float), k=kk))
+        g = np.clip(np.asarray(gains, float), 0, None)
+        order = np.argsort(-np.asarray(scores, float))[:kk]
+        disc = 1.0 / np.log2(np.arange(2, len(order) + 2))
+        dcg = (g[order] * disc).sum()
+        ig = np.sort(g)[::-1][:kk]
+        idcg = (ig * disc[:len(ig)]).sum()
+        return dcg / idcg if idcg > 0 else float("nan")
+
+    # res[(metric, tag)] = (kendall, ndcg, precision)
+    res: dict = {}
+    n_total = 0
+    for m in metrics:
+        for tag, col, kind_filter in sector_specs:
+            sub = pooled[pooled[m].notna()]
+            if col not in sub.columns:
+                res[(m, tag)] = (float("nan"),) * 3
+                continue
+            if kind_filter == "branch" and "kind" in sub.columns:
+                sub = sub[sub["kind"] == "branch"]
+            elif kind_filter == "cp" and "kind" in sub.columns:
+                sub = sub[sub["kind"] != "branch"]
+            if tag != "total":
+                sub = sub[sub[col].notna() & (sub[col] > 0)]
+            else:
+                sub = sub[sub[col].notna()]
+                n_total = max(n_total, len(sub))
+            if len(sub) < 3 or sub[m].nunique() < 2 or sub[col].nunique() < 2:
+                res[(m, tag)] = (float("nan"),) * 3
+                continue
+            x, ref = sub[m].values, sub[col].values
+            res[(m, tag)] = (float(_kendalltau(x, ref).correlation),
+                             _ndcg_at_k(x, ref, k), _prec_at_k(x, ref, k))
+
+    metric_labels = metric_label(metrics)
+    panels = [(0, "Kendall τ", [-0.5, 1.0]),
+              (1, f"NDCG@{k}", [0.0, 1.0]),
+              (2, f"Precision@{k}", [0.0, 1.0])]
+    fig = make_subplots(rows=1, cols=3, shared_yaxes=True, horizontal_spacing=0.04,
+                        subplot_titles=[t for _, t, _ in panels])
+    for ci, (idx, _t, _rng) in enumerate(panels, start=1):
+        for tag, _col, _kf in sector_specs:
+            vals = [res.get((m, tag), (float("nan"),) * 3)[idx] for m in metrics]
+            fig.add_trace(go.Bar(
+                y=metric_labels, x=vals, orientation="h",
+                name=pub_style.SECTOR_PRETTY.get(tag, tag), legendgroup=tag,
+                showlegend=(ci == 1),
+                marker=pub_style.bar_marker(pub_style.SECTOR_COLOR.get(tag, "#888888")),
+            ), row=1, col=ci)
+    fig.update_layout(barmode="group", bargap=0.25, bargroupgap=0.04)
+    for ci, (_idx, _t, rng) in enumerate(panels, start=1):
+        fig.update_xaxes(range=rng, row=1, col=ci)
+    pub_style.apply_theme(
+        fig,
+        title=(f"Pooled across scenarios (n={n_total}): per-sector ranking "
+               f"accuracy vs analytical shed"),
+        width=1180, height=620, legend_top=True)
+    fig.update_yaxes(autorange="reversed")
+    return fig
+
+
 def _e16_per_sector_heatmap(df: pd.DataFrame) -> go.Figure:
     """Extended E16 heatmap with per-sector y-axis resolution.
 
@@ -2043,6 +2170,18 @@ def plot_e16_single_removal(input_dir: Path, output_dir: Path) -> Optional[Path]
                 slugs.append(
                     _slug("e16_rho_vs_shed_per_sector_pooled", class_label)
                 )
+            # Per-sector top-of-ranking accuracy (Kendall τ / NDCG@k /
+            # precision@k), the deployment-relevant complement to the ρ bar.
+            rank_bar = _e16_ranking_per_sector_aggregated(sub_pooled_files)
+            if rank_bar.data:
+                figs.append(rank_bar)
+                titles.append(
+                    f"ranking accuracy per sector — pooled across scenarios"
+                    f"{_title_suffix(class_label)}"
+                )
+                slugs.append(
+                    _slug("e16_ranking_per_sector_pooled", class_label)
+                )
 
         # ρ vs shed vs ρ vs MC scatter — does shed-quality predict MC-quality?
         fig = go.Figure()
@@ -2104,7 +2243,7 @@ def plot_e16_single_removal(input_dir: Path, output_dir: Path) -> Optional[Path]
             pub_style.apply_theme(
                 fig2,
                 title=(
-                    "Ceiling: ρ between analytical shed and MC actual_total"
+                    "ρ between N-1 shed and MC"
                     + _title_suffix(class_label)
                 ),
                 height=pub_style.hbar_height(len(c)),
