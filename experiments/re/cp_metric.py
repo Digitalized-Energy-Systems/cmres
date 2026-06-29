@@ -478,14 +478,38 @@ _V_MAX_WATER_MPS = 2.5  # typical DH velocity cap
 _HX_RESISTANCE_FALLBACK = 1e-3  # only used if there are no WaterPipes to scale from
 
 
-def _calc_C_squared(diameter_m, length_m, t_k, compressibility):
-    # Weymouth constant, C² = π²D⁵ / (128 L R T Z).  Matches the form
-    # C² = π²D⁵ / (16 f L R T Z) of Osiadacz (1987, §5) with f = 1/8
-    # baked in; the friction factor is absorbed into the monee simulator's
-    # operating-point calibration rather than carried as a free parameter.
+def _calc_C_squared(diameter_m, length_m, t_k, compressibility,
+                    r_specific=_R_SPECIFIC_GAS):
+    # Friction-free Weymouth constant C² = π²D⁵ / (16 L R T Z), matching the
+    # monee simulator (monee.model.phys.nonlinear.gf.calc_C_squared). The
+    # per-pipe friction factor λ is applied separately at the susceptance and
+    # capacity call sites, so screening stays consistent with the simulator.
     return (math.pi**2 * diameter_m**5) / (
-        128.0 * length_m * _R_SPECIFIC_GAS * t_k * compressibility
+        16.0 * length_m * r_specific * t_k * compressibility
     )
+
+
+def _gas_friction(pipe_model, default: float = 0.02) -> float:
+    """Per-pipe Darcy friction factor at the operating point, matching the
+    monee GasPipe ``friction`` Var. Falls back to the monee default (0.02)
+    when the value is missing or non-finite (e.g. an unsolved network)."""
+    f = _val(getattr(pipe_model, "friction", None), default)
+    return float(f) if (_is_finite(f) and float(f) > 0) else float(default)
+
+
+def _gas_r_specific(gas_grid, default: float = _R_SPECIFIC_GAS) -> float:
+    """Specific gas constant R = R_universal / M, derived from the grid to
+    match the monee gas formulations (which pass
+    ``grid.universal_gas_constant / grid.molar_mass``). Falls back to the
+    module default when the grid or its fields are unavailable."""
+    try:
+        R = float(getattr(gas_grid, "universal_gas_constant"))
+        M = float(getattr(gas_grid, "molar_mass"))
+        if _is_finite(R) and _is_finite(M) and M > 0:
+            return R / M
+    except Exception:
+        pass
+    return float(default)
 
 
 def _darcy_resistance(pipe_model):
@@ -616,13 +640,13 @@ def _gas_pipe_max_flow(pipe_model, gas_grid) -> float:
     if not d or not L or d <= 0 or L <= 0:
         return np.inf
 
-    t_k = float(getattr(gas_grid, "gas_temperature", 300.0))
+    t_k = float(getattr(gas_grid, "t_k", 300.0))
     z = float(getattr(gas_grid, "compressibility", 1.0))
-    C2 = _calc_C_squared(d, L, t_k, z)
+    C2 = _calc_C_squared(d, L, t_k, z, _gas_r_specific(gas_grid)) / _gas_friction(pipe_model)
 
-    p_sq_max = float(getattr(gas_grid, "p_squared_pu_max", 1.3))
-    p_sq_min = float(getattr(gas_grid, "p_squared_pu_min", 0.7))
-    p_ref = float(getattr(gas_grid, "pressure_ref", 1e6))
+    p_sq_max = float(getattr(gas_grid, "pressure_squared_pu_max", 1.3))
+    p_sq_min = float(getattr(gas_grid, "pressure_squared_pu_min", 0.7))
+    p_ref = float(getattr(gas_grid, "pressure_ref_pa", 1e6))
 
     if not (p_sq_max > p_sq_min) or p_ref <= 0:
         return np.inf
@@ -651,7 +675,7 @@ def build_gas_susceptance(monee_net, cfg: CPMetricConfig):
 
     gas_grid = _gas_grid(monee_net)
     t_k = (
-        float(getattr(gas_grid, "gas_temperature", 300.0))
+        float(getattr(gas_grid, "t_k", 300.0))
         if gas_grid is not None
         else 300.0
     )
@@ -681,8 +705,9 @@ def build_gas_susceptance(monee_net, cfg: CPMetricConfig):
         if not (_is_finite(d_raw) and _is_finite(L_raw)):
             continue
 
-        C2 = _calc_C_squared(float(d_raw), float(L_raw), t_k, z)
-        b_raw = C2 / (2.0 * m0_eff)
+        lam = _gas_friction(pipe.model)
+        C2 = _calc_C_squared(float(d_raw), float(L_raw), t_k, z, _gas_r_specific(gas_grid))
+        b_raw = C2 / (2.0 * lam * m0_eff)
         if not _is_finite(b_raw) or b_raw <= 0:
             continue
         raw_pipes.append((fi, ti, b_raw, pipe.id))
@@ -835,7 +860,7 @@ def _heat_injector_node_ids(monee_net) -> set:
     except Exception:
         pass
 
-    for cp_type in (mm.CHP, mm.PowerToHeat):
+    for cp_type in (mm.CHP, mm.CHPHG, mm.PowerToHeat):
         try:
             for cp in monee_net.compounds_by_type(cp_type):
                 connected = _compound_connected_nodes(cp)
@@ -844,7 +869,7 @@ def _heat_injector_node_ids(monee_net) -> set:
         except Exception:
             pass
 
-    for cp_type in (mm.CHPHG, mm.PowerToHeatHG, mm.GasToHeatHG):
+    for cp_type in (mm.PowerToHeatHG, mm.GasToHeatHG):
         try:
             for br in monee_net.branches_by_type(cp_type):
                 for nid in (br.from_node_id, br.to_node_id):
@@ -871,19 +896,22 @@ def _heat_node_demand(monee_net) -> Dict[int, float]:
             return
         demand[nid] = demand.get(nid, 0.0) + abs(float(q))
 
+    passive_load = getattr(mm, "PassiveHeatExchangerLoad", mm.HeatExchangerLoad)
     for c in monee_net.childs:
         m = c.model
         if isinstance(m, mm.HeatLoad):
             _add(c.node_id, _val(getattr(m, "q_mw_heat", 0.0), 0.0))
-        elif isinstance(m, (mm.HeatExchangerLoad, getattr(mm, "PassiveHeatExchangerLoad", mm.HeatExchangerLoad))):
-            _add(c.node_id, _val(getattr(m, "q_mw", 0.0), 0.0))
 
     for b in monee_net.branches:
         m = b.model
-        if isinstance(m, mm.HeatExchangerLoad):
-            _add(b.from_node_id, _val(getattr(m, "q_mw", 0.0), 0.0))
-        elif isinstance(m, mm.HeatExchanger):
-            _add(b.from_node_id, _val(getattr(m, "q_mw", 0.0), 0.0))
+        # Heat-consuming exchangers only. Bare HeatExchanger / SubHE are
+        # CP-internal couplings or heat sources and must not be counted as
+        # demand. Use the rated duty q_mw_set, not the solved q_mw Var (which
+        # is ~0 on an unsolved network).
+        if isinstance(m, (mm.HeatExchangerLoad, passive_load)):
+            q_set = _val(getattr(m, "q_mw_set", None), None)
+            q = q_set if _is_finite(q_set) else _val(getattr(m, "q_mw", 0.0), 0.0)
+            _add(b.from_node_id, q)
 
     return demand
 
@@ -1219,7 +1247,7 @@ def compute_physical_topology_metrics(monee_net):
             bm = br.model
             if isinstance(bm, mm.GenericPowerBranch):
                 carrier = "power"
-                x = abs(_val(getattr(bm, "br_x", 0.0), 0.0))
+                x = abs(_val(getattr(bm, "br_x_pu", 0.0), 0.0))
                 raw = x if x > 0 else None
             elif isinstance(bm, mm.GasPipe):
                 carrier = "gas"
@@ -1440,7 +1468,7 @@ def compute_physical_topology_metrics_cp_aware(monee_net):
             bm = br.model
             if isinstance(bm, mm.GenericPowerBranch):
                 carrier = "power"
-                x = abs(_val(getattr(bm, "br_x", 0.0), 0.0))
+                x = abs(_val(getattr(bm, "br_x_pu", 0.0), 0.0))
                 raw = x if x > 0 else None
             elif isinstance(bm, mm.GasPipe):
                 carrier = "gas"
@@ -1511,7 +1539,7 @@ _CP_IO_SPEC: Dict[str, Tuple[str, List[Tuple[str, str]]]] = {
                               ("heat",  "efficiency_heat")]),
     "PowerToHeat":   ("power", [("heat", "efficiency")]),
     "PowerToHeatHG": ("power", [("heat", "efficiency")]),
-    "GasToHeatHG":   ("gas",   [("heat", "efficiency_heat")]),
+    "GasToHeatHG":   ("gas",   [("heat", "efficiency")]),
     "PowerToGas":    ("power", [("gas",  "efficiency")]),
     "GasToPower":    ("gas",   [("power", "efficiency")]),
 }
@@ -1671,7 +1699,7 @@ def compute_physical_topology_metrics_exergy_aware(
             bm = br.model
             if isinstance(bm, mm.GenericPowerBranch):
                 carrier = "power"
-                x = abs(_val(getattr(bm, "br_x", 0.0), 0.0))
+                x = abs(_val(getattr(bm, "br_x_pu", 0.0), 0.0))
                 raw = x if x > 0 else None
             elif isinstance(bm, mm.GasPipe):
                 carrier = "gas"
@@ -1726,8 +1754,10 @@ def compute_stress_topology_metrics(monee_net, ctx: "CarrierPTDFContext", cfg: "
         for i, bid in enumerate(ctx.power["branch_ids"]):
             margin = float(ctx.power["margins"][i]) if i < len(ctx.power["margins"]) else cfg.MIN_MARGIN
             try:
-                flow0 = abs(_first_attr(monee_net.branch_by_id(bid).model,
-                                        ["p_from_mw", "p_mw", "p_from", "p"], default=0.0))
+                bm = monee_net.branch_by_id(bid).model
+                p0 = abs(_first_attr(bm, ["p_from_mw", "p_mw", "p_from", "p"], default=0.0))
+                q0 = abs(_first_attr(bm, ["q_from_mvar", "q_mvar", "q_from", "q"], default=0.0))
+                flow0 = math.hypot(p0, q0)
             except Exception:
                 flow0 = 0.0
             stress_by_id[bid] = float(flow0) / (margin + cfg.EPS_MARGIN)
@@ -1904,23 +1934,30 @@ def _cp_throughput_proxy(cp_or_branch, label: str, monee_net=None) -> float:
 
     try:
         if label == "CHP":
-            ctrl = cp_or_branch.model._control_node
-            el_mw = abs(_safe(getattr(ctrl, "el_mw", 0.0)))
-            heat_mw = abs(_safe(getattr(ctrl, "heat_w", 0.0))) / 1e6
+            # Rated capacity, not the solved Pyomo Vars (el_mw/heat_mw on the
+            # control node), which the optimizer drives to ~0 when idle and
+            # would collapse the score. Rated outputs follow from the gas
+            # setpoint exactly as in the CHP conversion equations.
+            m = cp_or_branch.model
+            hhv = _get_gas_hhv(monee_net) if monee_net is not None else 15.3
+            mdot = abs(_safe(getattr(m, "mass_flow_setpoint_kgs", 0.0)))
+            el_mw = abs(_safe(getattr(m, "efficiency_power", 0.0))) * mdot * hhv * 3.6
+            heat_mw = abs(_safe(getattr(m, "efficiency_heat", 0.0))) * mdot * hhv * 3.6
             return max((el_mw + heat_mw) / sn_mva, 1e-6)
 
         if label == "CHPHG":
-            # CHPHG control node stores el_mw and heat_mw directly in MW.
-            ctrl = cp_or_branch.model._control_node
-            el_mw = abs(_safe(getattr(ctrl, "el_mw", 0.0)))
-            heat_mw = abs(_safe(getattr(ctrl, "heat_mw", 0.0)))
+            # Rated capacity from the gas setpoint (the control-node el_mw/heat_mw
+            # are solved Vars that collapse to ~0 when idle), mirroring CHP.
+            m = cp_or_branch.model
+            hhv = _get_gas_hhv(monee_net) if monee_net is not None else 15.3
+            mdot = abs(_safe(getattr(m, "mass_flow_setpoint_kgs", 0.0)))
+            el_mw = abs(_safe(getattr(m, "efficiency_power", 0.0))) * mdot * hhv * 3.6
+            heat_mw = abs(_safe(getattr(m, "efficiency_heat", 0.0))) * mdot * hhv * 3.6
             return max((el_mw + heat_mw) / sn_mva, 1e-6)
 
         if label == "PowerToHeat":
-            ctrl = cp_or_branch.model._control_node
-            heat_w_raw = _val(getattr(ctrl, "heat_w", None), None)
-            if _is_finite(heat_w_raw):
-                return max(abs(float(heat_w_raw)) / (1e6 * sn_mva), 1e-6)
+            # Rated heat capacity (fixed constructor arg), consistent with the
+            # other CPs; the dispatched heat Var would zero out when idle.
             heat_mw = abs(_safe(getattr(cp_or_branch.model, "heat_energy_mw", 0.0)))
             return max(heat_mw / sn_mva, 1e-6)
 
@@ -3396,6 +3433,13 @@ def mes_all_components_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig())
         return throughput
 
     df_all["loading"] = df_all.apply(_loading_local, axis=1)
+    # CP loading is a rated-capacity proxy (pu), not a [0,1] utilisation like the
+    # branch |flow|/limit ratio. Rescale CP rows by the max CP proxy so the
+    # local/self scores compare CPs and branches on a common loading axis.
+    _is_cp_row = df_all["cp_type"].isin(ALL_CP_LABELS)
+    _cp_load_max = df_all.loc[_is_cp_row, "loading"].max() if _is_cp_row.any() else 0.0
+    if np.isfinite(_cp_load_max) and _cp_load_max > 0:
+        df_all.loc[_is_cp_row, "loading"] = df_all.loc[_is_cp_row, "loading"] / _cp_load_max
     df_all["n_critical_nbrs"] = df_all.apply(_n_critical_nbrs, axis=1)
     df_all["carrier_coupling"] = df_all.apply(_carrier_coupling, axis=1)
     df_all["local_score"] = (
@@ -3445,7 +3489,18 @@ def mes_all_components_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig())
     # vitality(v) = W(G) - W(G \ v): how much total pairwise distance increases
     # when v is removed. Captures structural indispensability, not just centrality.
     try:
-        vitality_individual = nx.closeness_vitality(G_phys, weight="weight")
+        # On a disconnected graph the Wiener index is already infinite, so a
+        # single closeness_vitality call would return NaN for every node and
+        # collapse the whole metric to zero. Compute per connected component so
+        # vitality stays meaningful on the (typically disconnected) MES graph.
+        if G_phys.number_of_nodes() and not nx.is_connected(G_phys):
+            vitality_individual = {}
+            for comp in nx.connected_components(G_phys):
+                vitality_individual.update(
+                    nx.closeness_vitality(G_phys.subgraph(comp).copy(), weight="weight")
+                )
+        else:
+            vitality_individual = nx.closeness_vitality(G_phys, weight="weight")
         # Replace inf (node removal disconnects graph → infinite path distances)
         # with the maximum finite vitality, treating disconnectors as maximally critical.
         finite_vals = [v for v in vitality_individual.values()
@@ -3727,7 +3782,7 @@ def _total_demand_per_carrier_mw(monee_net) -> Dict[str, float]:
             elif isinstance(m, mm.HeatLoad):
                 heat += float(mm.upper(m.q_mw_heat) or 0.0)
             elif isinstance(m, (mm.HeatExchangerLoad, passive_hx)):
-                heat += float(mm.upper(m.q_mw) or 0.0)
+                heat += abs(float(mm.upper(getattr(m, "q_mw_set", m.q_mw)) or 0.0))
             elif isinstance(m, mm.Sink):
                 grid = getattr(c, "grid", None)
                 if grid is not None and hasattr(grid, "higher_heating_value_kwh_per_kg"):
@@ -3742,7 +3797,7 @@ def _total_demand_per_carrier_mw(monee_net) -> Dict[str, float]:
             continue
         if isinstance(m, (mm.HeatExchangerLoad, passive_hx)):
             try:
-                heat += float(mm.upper(m.q_mw) or 0.0)
+                heat += abs(float(mm.upper(getattr(m, "q_mw_set", m.q_mw)) or 0.0))
             except Exception:
                 continue
     return {"power": power, "heat": heat, "gas": gas}
