@@ -1761,125 +1761,340 @@ _E16_RANK_METRICS = [
     "local_score", "self_score",
 ]
 
+# ── Shared per-sector criticality-figure code path (analytical E16 + MC) ───────
+# Sector partitioning. (tag, reference column, kind_filter): kind_filter selects
+# the component subset — None = every row, "branch" = single-carrier components,
+# "cp" = coupling points. The two simulations differ ONLY in the reference
+# columns, so the same builders serve both.
+ANALYTICAL_SECTOR_SPECS = [
+    ("total", "total_shed", None),
+    ("power", "power_shed", "branch"),
+    ("heat",  "heat_shed",  "branch"),
+    ("gas",   "gas_shed",   "branch"),
+    ("multi", "total_shed", "cp"),
+]
+MC_SECTOR_SPECS = [
+    ("total", "actual_total",       None),
+    ("power", "actual_electricity", "branch"),
+    ("heat",  "actual_heat",        "branch"),
+    ("gas",   "actual_gas",         "branch"),
+    ("multi", "actual_total",       "cp"),
+]
+_RANK_CP_TYPES = {"CHPHG", "PowerToGas", "PowerToHeatHG"}
 
-def _e16_ranking_per_sector_aggregated(
-    merged_files: Sequence[Path], k: int = 10,
-) -> go.Figure:
-    """Pooled per-sector *top-of-ranking* accuracy: Kendall τ, NDCG@k and
-    precision@k recomputed on rows concatenated across every scenario's
-    ``E16_<scenario>_merged.csv``, using the same sector partitioning as
-    ``_e16_rho_per_sector_bar_aggregated`` (total / multi / power / heat / gas).
 
-    Three horizontal grouped panels (one per measure), bars grouped by sector.
-    Complements the per-sector ρ bar: ρ measures full-list monotonicity, these
-    measure how well the few most critical components surface — which is what a
-    planner screening a handful of coupling points actually cares about. Pooling
-    these across sectors collapses the signal, so they are resolved per sector.
-    """
-    from plotly.subplots import make_subplots
-    from scipy.stats import kendalltau as _kendalltau
+def _cp_mask(df: pd.DataFrame) -> pd.Series:
+    """Boolean mask, True on coupling-point rows. Prefers the ``kind`` column
+    (branch/compound/branch_cp) and falls back to ``cp_type`` so the MC eval df
+    (which has cp_type but not kind) is handled identically."""
+    if "kind" in df.columns:
+        return df["kind"].astype(str) != "branch"
+    if "cp_type" in df.columns:
+        return df["cp_type"].astype(str).isin(_RANK_CP_TYPES)
+    return pd.Series(False, index=df.index)
+
+
+def _sector_subset(pooled: pd.DataFrame, metric: str, tag: str,
+                   col: str, kind_filter) -> pd.DataFrame:
+    sub = pooled[pooled[metric].notna()]
+    if col not in sub.columns:
+        return sub.iloc[0:0]
+    if kind_filter == "branch":
+        sub = sub[~_cp_mask(sub)]
+    elif kind_filter == "cp":
+        sub = sub[_cp_mask(sub)]
+    if tag != "total":
+        sub = sub[sub[col].notna() & (sub[col] > 0)]
+    else:
+        sub = sub[sub[col].notna()]
+    return sub
+
+
+def _rank_ndcg_at_k(scores, gains, kk):
     try:
         from eval_common import ndcg as _ndcg
     except Exception:  # pragma: no cover
         _ndcg = None
+    g = np.clip(np.asarray(gains, float), 0, None)
+    if _ndcg is not None:
+        return float(_ndcg(g, np.asarray(scores, float), k=kk))
+    order = np.argsort(-np.asarray(scores, float))[:kk]
+    disc = 1.0 / np.log2(np.arange(2, len(order) + 2))
+    dcg = (g[order] * disc).sum()
+    ig = np.sort(g)[::-1][:kk]
+    idcg = (ig * disc[:len(ig)]).sum()
+    return dcg / idcg if idcg > 0 else float("nan")
 
-    if not merged_files:
+
+def _rank_prec_at_k(scores, gains, kk):
+    s = np.asarray(scores, float)
+    g = np.asarray(gains, float)
+    kk = min(kk, len(s))
+    if kk < 1:
+        return float("nan")
+    return len(set(np.argsort(-s)[:kk]) & set(np.argsort(-g)[:kk])) / kk
+
+
+def _rank_metrics_present(pooled: pd.DataFrame) -> List[str]:
+    return [m for m in _E16_RANK_METRICS
+            if m in pooled.columns and pooled[m].notna().sum() >= 3
+            and pooled[m].nunique() >= 2]
+
+
+def per_sector_ranking_table(pooled, sector_specs, metrics, k=10):
+    """{(metric, tag): {"kendall":…, "ndcg":…, "prec":…}}, n_total — Kendall τ,
+    NDCG@k and precision@k of each metric against ``sector_specs``' reference
+    column, per sector slice."""
+    from scipy.stats import kendalltau as _kendalltau
+    table: dict = {}
+    n_total = 0
+    for m in metrics:
+        for tag, col, kf in sector_specs:
+            sub = _sector_subset(pooled, m, tag, col, kf)
+            if tag == "total":
+                n_total = max(n_total, len(sub))
+            if (col not in pooled.columns or len(sub) < 3
+                    or sub[m].nunique() < 2 or sub[col].nunique() < 2):
+                table[(m, tag)] = {"kendall": np.nan, "ndcg": np.nan, "prec": np.nan}
+                continue
+            x, ref = sub[m].values, sub[col].values
+            table[(m, tag)] = {
+                "kendall": float(_kendalltau(x, ref).correlation),
+                "ndcg": _rank_ndcg_at_k(x, ref, k),
+                "prec": _rank_prec_at_k(x, ref, k),
+            }
+    return table, n_total
+
+
+def per_sector_spearman_table(pooled, sector_specs, metrics):
+    """{(metric, tag): {"rho":…}}, n_total — Spearman ρ of each metric against
+    ``sector_specs``' reference column, per sector slice."""
+    try:
+        from eval_common import spearman_with_ci as _sp
+    except Exception:  # pragma: no cover
+        from scipy.stats import spearmanr as _spr
+
+        def _sp(a, b):
+            r = _spr(a, b)
+            return float(r.statistic), float(r.pvalue), np.nan, np.nan
+    table: dict = {}
+    n_total = 0
+    for m in metrics:
+        for tag, col, kf in sector_specs:
+            sub = _sector_subset(pooled, m, tag, col, kf)
+            if tag == "total":
+                n_total = max(n_total, len(sub))
+            if (col not in pooled.columns or len(sub) < 3
+                    or sub[m].nunique() < 2 or sub[col].nunique() < 2):
+                table[(m, tag)] = {"rho": np.nan}
+                continue
+            rho, _p, _lo, _hi = _sp(sub[m], sub[col])
+            table[(m, tag)] = {"rho": float(rho)}
+    return table, n_total
+
+
+def render_per_sector_panels(table, metrics, sector_tags, panels, *, title,
+                             width=1180, height=620, font_bump=4):
+    """Horizontal grouped-bar figure shared by the ranking / spearman / delta
+    per-sector views. ``panels`` = ``[(measure_key, panel_title, x_range)]``;
+    ``table[(metric, tag)][measure_key]`` holds the value. One subplot per panel,
+    bars grouped by sector down the metric (y) axis."""
+    from plotly.subplots import make_subplots
+    metric_labels = metric_label(metrics)
+    fig = make_subplots(rows=1, cols=len(panels), shared_yaxes=True,
+                        horizontal_spacing=0.04,
+                        subplot_titles=[t for _, t, _ in panels])
+    for ci, (key, _t, _rng) in enumerate(panels, start=1):
+        for tag in sector_tags:
+            vals = [table.get((m, tag), {}).get(key, np.nan) for m in metrics]
+            fig.add_trace(go.Bar(
+                y=metric_labels, x=vals, orientation="h",
+                name=pub_style.SECTOR_PRETTY.get(tag, tag), legendgroup=tag,
+                showlegend=(ci == 1),
+                marker=pub_style.bar_marker(
+                    pub_style.SECTOR_COLOR.get(tag, "#888888")),
+            ), row=1, col=ci)
+    fig.update_layout(barmode="group", bargap=0.25, bargroupgap=0.04)
+    for ci, (_k, _t, rng) in enumerate(panels, start=1):
+        if rng is not None:
+            fig.update_xaxes(range=rng, row=1, col=ci)
+        fig.add_vline(x=0, line=dict(color="#444", width=1, dash="dot"),
+                      row=1, col=ci)
+    pub_style.apply_theme(fig, title=title, width=width, height=height,
+                          legend_top=True, font_bump=font_bump)
+    fig.update_yaxes(autorange="reversed")
+    return fig
+
+
+def ranking_per_sector_figure(pooled, sector_specs, *, title, k=10):
+    """Per-sector Kendall τ / NDCG@k / precision@k (3 panels). ``title`` may
+    contain ``{n}`` for the total-sector sample size."""
+    metrics = _rank_metrics_present(pooled)
+    if not metrics:
         return go.Figure()
+    table, n_total = per_sector_ranking_table(pooled, sector_specs, metrics, k)
+    panels = [("kendall", "Kendall τ", [-0.5, 1.0]),
+              ("ndcg", f"NDCG@{k}", [0.0, 1.0]),
+              ("prec", f"Precision@{k}", [0.0, 1.0])]
+    tags = [t for t, _, _ in sector_specs]
+    return render_per_sector_panels(table, metrics, tags, panels,
+                                    title=title.format(n=n_total))
+
+
+def ranking_per_sector_delta_figure(pooled, specs_a, specs_b, *, title, k=10,
+                                    drange=0.6):
+    """Δ (B − A) of the per-sector ranking measures, same 3-panel form (used for
+    MC − analytical). ``specs_a``/``specs_b`` are sector-spec lists sharing the
+    same tags but different reference columns."""
+    metrics = _rank_metrics_present(pooled)
+    if not metrics:
+        return go.Figure()
+    ta, _ = per_sector_ranking_table(pooled, specs_a, metrics, k)
+    tb, n = per_sector_ranking_table(pooled, specs_b, metrics, k)
+    delta = {}
+    for key in set(ta) | set(tb):
+        a, b = ta.get(key, {}), tb.get(key, {})
+        delta[key] = {mk: (b.get(mk, np.nan) - a.get(mk, np.nan))
+                      for mk in ("kendall", "ndcg", "prec")}
+    panels = [("kendall", "Δ Kendall τ", [-drange, drange]),
+              ("ndcg", f"Δ NDCG@{k}", [-drange, drange]),
+              ("prec", f"Δ Precision@{k}", [-drange, drange])]
+    tags = [t for t, _, _ in specs_a]
+    return render_per_sector_panels(delta, metrics, tags, panels,
+                                    title=title.format(n=n))
+
+
+def spearman_per_sector_delta_figure(pooled, specs_a, specs_b, *, title,
+                                     drange=0.6):
+    """Δ (B − A) of the per-sector Spearman ρ, single grouped-bar panel."""
+    metrics = _rank_metrics_present(pooled)
+    if not metrics:
+        return go.Figure()
+    ta, _ = per_sector_spearman_table(pooled, specs_a, metrics)
+    tb, n = per_sector_spearman_table(pooled, specs_b, metrics)
+    delta = {key: {"rho": tb.get(key, {}).get("rho", np.nan)
+                   - ta.get(key, {}).get("rho", np.nan)}
+             for key in set(ta) | set(tb)}
+    panels = [("rho", "Δ Spearman ρ", [-drange, drange])]
+    tags = [t for t, _, _ in specs_a]
+    return render_per_sector_panels(delta, metrics, tags, panels,
+                                    title=title.format(n=n), width=760)
+
+
+def style_corr_heatmap(fig, *, z, x, y, cbar_title="Spearman ρ",
+                       hi_text_threshold=0.55, ann_size=10, cbar_size=None,
+                       extra_annotations=None):
+    """Apply the shared metric-correlation heatmap *styling* (the look of the MC
+    pairwise-ρ heatmap): ``RdBu_r`` diverging colourscale centred at 0 over
+    [−1, 1], a ``Spearman ρ`` colourbar with ±1 ticks, per-cell numeric
+    annotations (white text on saturated cells), and the CMRES template / reversed
+    y-axis / angled x-ticks. Only styling — the caller owns z/x/y, sizing, and any
+    extra shapes/annotations (passed via ``extra_annotations``). Applied last so
+    the shared look wins over any caller template; nested axis updates merge, so
+    caller-set axis titles/gridlines are preserved."""
+    import cmres.evaluation.evaluation as _ev
+    z = np.asarray(z, dtype=float)
+    cbar = dict(title=dict(text=cbar_title, side="right"),
+                tickvals=[-1, -0.5, 0, 0.5, 1])
+    if cbar_size is not None:
+        cbar["title"]["font"] = dict(size=cbar_size)
+        cbar["tickfont"] = dict(size=cbar_size)
+    fig.update_traces(selector=dict(type="heatmap"),
+                      colorscale="RdBu_r", reversescale=False,
+                      zmid=0, zmin=-1, zmax=1, colorbar=cbar)
+    annotations = list(extra_annotations or [])
+    for i in range(len(y)):
+        for j in range(len(x)):
+            v = z[i, j]
+            if v != v:
+                continue
+            col = "white" if abs(v) > hi_text_threshold else "black"
+            annotations.append(dict(x=x[j], y=y[i], text=f"{v:.2f}",
+                                    xref="x", yref="y", showarrow=False,
+                                    font=dict(size=ann_size, color=col)))
+    fig.update_layout(
+        template=_ev.CMRES_TEMPLATE,
+        annotations=annotations,
+        xaxis=dict(tickangle=-35, automargin=True),
+        yaxis=dict(autorange="reversed", automargin=True),
+    )
+    return fig
+
+
+def rho_per_network_type_figure(pooled, ref_col, *, title, metrics=None,
+                                net_col="network_type"):
+    """Grouped vertical bars of Spearman ρ (metric vs ``ref_col``) per network
+    type — the heterogeneity check, shared by the MC and analytical pipelines."""
+    try:
+        from eval_common import spearman_with_ci as _sp
+    except Exception:  # pragma: no cover
+        from scipy.stats import spearmanr as _spr
+
+        def _sp(a, b):
+            r = _spr(a, b)
+            return float(r.statistic), float(r.pvalue), np.nan, np.nan
+    if net_col not in pooled.columns or ref_col not in pooled.columns:
+        return go.Figure()
+    metrics = metrics or _rank_metrics_present(pooled)
+    net_types = _scenario_order(pooled[net_col].dropna().unique()) \
+        if "_scenario_order" in globals() else list(pooled[net_col].dropna().unique())
+    if len(net_types) < 2 or not metrics:
+        return go.Figure()
+    fig = go.Figure()
+    for m_idx, m in enumerate(metrics):
+        rhos, elo, ehi = [], [], []
+        for nt in net_types:
+            sub = pooled[(pooled[net_col] == nt) & pooled[m].notna()
+                         & pooled[ref_col].notna()]
+            if len(sub) < 4 or sub[m].nunique() < 2 or sub[ref_col].nunique() < 2:
+                rhos.append(np.nan); elo.append(0); ehi.append(0); continue
+            rho, _p, lo, hi = _sp(sub[m], sub[ref_col])
+            rhos.append(rho)
+            elo.append(rho - lo if lo == lo else 0)
+            ehi.append(hi - rho if hi == hi else 0)
+        fig.add_trace(go.Bar(
+            name=metric_label(m),
+            x=[pretty_scenario(nt) for nt in net_types], y=rhos,
+            # Solid qual colours (no hatch): the 10-series hatch overlay
+            # rasterises to a multi-MB PDF; the qualitative palette separates
+            # the series on its own.
+            marker=pub_style.bar_marker(pub_style.qual_color(m_idx)),
+            error_y=dict(type="data", symmetric=False, array=ehi, arrayminus=elo,
+                         thickness=1.2, width=4, color=pub_style.MUTED_COLOR),
+        ))
+    fig.add_hline(y=0, line=dict(color="#444", width=1, dash="dot"))
+    fig.update_layout(barmode="group")
+    pub_style.apply_theme(fig, title=title, height=480,
+                          width=pub_style.vbar_width(len(net_types), 10, base=620),
+                          font_bump=1, legend_top=True)
+    fig.update_xaxes(title="Network type", tickangle=-30)
+    fig.update_yaxes(title="Spearman ρ", range=[-1.05, 1.05])
+    return fig
+
+
+def _e16_load_merged(merged_files: Sequence[Path]) -> pd.DataFrame:
     frames: List[pd.DataFrame] = []
-    for mf in merged_files:
+    for mf in merged_files or []:
         try:
             d = pd.read_csv(mf)
         except Exception:
             continue
         if not d.empty:
             frames.append(d)
-    if not frames:
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def _e16_ranking_per_sector_aggregated(merged_files: Sequence[Path],
+                                       k: int = 10) -> go.Figure:
+    """Analytical per-sector ranking accuracy pooled across scenarios (thin
+    wrapper around the shared :func:`ranking_per_sector_figure`)."""
+    pooled = _e16_load_merged(merged_files)
+    if pooled.empty:
         return go.Figure()
-    pooled = pd.concat(frames, ignore_index=True)
-
-    sector_specs = [
-        ("total", "total_shed", None),
-        ("power", "power_shed", "branch"),
-        ("heat",  "heat_shed",  "branch"),
-        ("gas",   "gas_shed",   "branch"),
-        ("multi", "total_shed", "cp"),
-    ]
-    metrics = [m for m in _E16_RANK_METRICS
-               if m in pooled.columns and pooled[m].notna().sum() >= 3
-               and pooled[m].nunique() >= 2]
-    if not metrics:
-        return go.Figure()
-
-    def _prec_at_k(scores, gains, kk):
-        s = np.asarray(scores, float)
-        g = np.asarray(gains, float)
-        kk = min(kk, len(s))
-        if kk < 1:
-            return float("nan")
-        return len(set(np.argsort(-s)[:kk]) & set(np.argsort(-g)[:kk])) / kk
-
-    def _ndcg_at_k(scores, gains, kk):
-        if _ndcg is not None:
-            return float(_ndcg(np.clip(np.asarray(gains, float), 0, None),
-                               np.asarray(scores, float), k=kk))
-        g = np.clip(np.asarray(gains, float), 0, None)
-        order = np.argsort(-np.asarray(scores, float))[:kk]
-        disc = 1.0 / np.log2(np.arange(2, len(order) + 2))
-        dcg = (g[order] * disc).sum()
-        ig = np.sort(g)[::-1][:kk]
-        idcg = (ig * disc[:len(ig)]).sum()
-        return dcg / idcg if idcg > 0 else float("nan")
-
-    # res[(metric, tag)] = (kendall, ndcg, precision)
-    res: dict = {}
-    n_total = 0
-    for m in metrics:
-        for tag, col, kind_filter in sector_specs:
-            sub = pooled[pooled[m].notna()]
-            if col not in sub.columns:
-                res[(m, tag)] = (float("nan"),) * 3
-                continue
-            if kind_filter == "branch" and "kind" in sub.columns:
-                sub = sub[sub["kind"] == "branch"]
-            elif kind_filter == "cp" and "kind" in sub.columns:
-                sub = sub[sub["kind"] != "branch"]
-            if tag != "total":
-                sub = sub[sub[col].notna() & (sub[col] > 0)]
-            else:
-                sub = sub[sub[col].notna()]
-                n_total = max(n_total, len(sub))
-            if len(sub) < 3 or sub[m].nunique() < 2 or sub[col].nunique() < 2:
-                res[(m, tag)] = (float("nan"),) * 3
-                continue
-            x, ref = sub[m].values, sub[col].values
-            res[(m, tag)] = (float(_kendalltau(x, ref).correlation),
-                             _ndcg_at_k(x, ref, k), _prec_at_k(x, ref, k))
-
-    metric_labels = metric_label(metrics)
-    panels = [(0, "Kendall τ", [-0.5, 1.0]),
-              (1, f"NDCG@{k}", [0.0, 1.0]),
-              (2, f"Precision@{k}", [0.0, 1.0])]
-    fig = make_subplots(rows=1, cols=3, shared_yaxes=True, horizontal_spacing=0.04,
-                        subplot_titles=[t for _, t, _ in panels])
-    for ci, (idx, _t, _rng) in enumerate(panels, start=1):
-        for tag, _col, _kf in sector_specs:
-            vals = [res.get((m, tag), (float("nan"),) * 3)[idx] for m in metrics]
-            fig.add_trace(go.Bar(
-                y=metric_labels, x=vals, orientation="h",
-                name=pub_style.SECTOR_PRETTY.get(tag, tag), legendgroup=tag,
-                showlegend=(ci == 1),
-                marker=pub_style.bar_marker(pub_style.SECTOR_COLOR.get(tag, "#888888")),
-            ), row=1, col=ci)
-    fig.update_layout(barmode="group", bargap=0.25, bargroupgap=0.04)
-    for ci, (_idx, _t, rng) in enumerate(panels, start=1):
-        fig.update_xaxes(range=rng, row=1, col=ci)
-    pub_style.apply_theme(
-        fig,
-        title=(f"Pooled across scenarios (n={n_total}): per-sector ranking "
-               f"accuracy vs analytical shed"),
-        width=1180, height=620, legend_top=True, font_bump=4)
-    fig.update_yaxes(autorange="reversed")
-    return fig
+    return ranking_per_sector_figure(
+        pooled, ANALYTICAL_SECTOR_SPECS, k=k,
+        title="Pooled across scenarios (n={n}): per-sector ranking accuracy "
+              "vs analytical shed")
 
 
 def _e16_per_sector_heatmap(df: pd.DataFrame) -> go.Figure:
@@ -1971,43 +2186,9 @@ def _e16_per_sector_heatmap(df: pd.DataFrame) -> go.Figure:
 
     heat = go.Figure(go.Heatmap(
         z=z, x=metric_labels, y=row_labels,
-        # Match the cp_cn pairwise-ρ heatmap convention: ``RdBu_r`` with
-        # ``reversescale=False`` puts red on positive ρ and blue on
-        # negative ρ (the corr_fig in pooled_metric_comparison uses the
-        # same setting — the two heatmaps now read the same).
-        colorscale="RdBu_r", reversescale=False,
-        zmid=0, zmin=-1, zmax=1,
-        colorbar=dict(
-            title=dict(
-                text="Spearman ρ", side="right",
-                font=dict(size=cbar_size),
-            ),
-            tickfont=dict(size=cbar_size),
-            tickvals=[-1, -0.5, 0, 0.5, 1],
-            thickness=14, len=0.9,
-        ),
         xgap=1, ygap=1,
         hovertemplate="<b>%{y}</b><br>%{x}: ρ = %{z:.3f}<extra></extra>",
     ))
-
-    # Cell annotations with adaptive text colour — same logic as the
-    # cp_cn pairwise heatmap: white text on saturated cells (|ρ| > 0.55)
-    # for legibility, black on light cells. Using a layout-level
-    # annotation list (instead of texttemplate) gives us per-cell colour
-    # control plus the +2 pt size.
-    annotations = []
-    for i in range(z.shape[0]):
-        for j in range(z.shape[1]):
-            v = z[i, j]
-            if not np.isfinite(v):
-                continue
-            text_color = "white" if abs(v) > 0.55 else "black"
-            annotations.append(dict(
-                x=metric_labels[j], y=row_labels[i],
-                text=f"{v:.2f}",
-                xref="x", yref="y", showarrow=False,
-                font=dict(size=ann_size, color=text_color),
-            ))
 
     # Scenario block separators as layout shapes so the per-sector rows
     # that belong together read as a group.
@@ -2029,13 +2210,9 @@ def _e16_per_sector_heatmap(df: pd.DataFrame) -> go.Figure:
             "Spearman ρ between metric and analytical shed, "
             "per scenario × sector"
         ),
-        # tickangle matches the cp_cn pairwise heatmap (-35 vs the
-        # previous +30) so the two figures share an axis orientation.
-        xaxis=dict(title="Metric", tickangle=-35, automargin=True),
+        xaxis=dict(title="Metric", automargin=True),
         yaxis=dict(
-            title="Scenario — Sector",
-            autorange="reversed",
-            automargin=True,
+            title="Scenario — Sector", automargin=True,
             # Gridlines between every category for per-sector resolution
             # (in addition to the heavier scenario-boundary separators).
             showgrid=True, gridcolor="#eeeeee", gridwidth=1,
@@ -2046,12 +2223,17 @@ def _e16_per_sector_heatmap(df: pd.DataFrame) -> go.Figure:
         width=240 + 110 * max(len(metrics), 1),
         font=dict(size=_E16_FONT_SIZES["base"] + 2),
         title_font=dict(size=_E16_FONT_SIZES["title"] + 2),
-        annotations=annotations,
         shapes=shapes,
     ))
-    # Bump axis title / tick fonts +2 too (``_e16_layout`` set them at
-    # the base sizes; plotly's layout-level ``font`` doesn't propagate
-    # to ``xaxis.title.font`` or ``tickfont`` automatically).
+    # Shared metric-correlation heatmap styling — identical to the cp_cn
+    # pairwise-ρ heatmap (colourscale, ±1 colourbar, white-on-saturated cell
+    # annotations, CMRES template, reversed y / angled x). Applied last so the
+    # shared look wins; nested axis updates merge, preserving the titles and
+    # gridlines set above.
+    style_corr_heatmap(heat, z=z, x=metric_labels, y=row_labels,
+                       ann_size=ann_size, cbar_size=cbar_size)
+    # Bump axis title / tick fonts +2 (layout-level ``font`` doesn't propagate
+    # to ``xaxis.title.font`` / ``tickfont``).
     heat.update_xaxes(
         title_font=dict(size=_E16_FONT_SIZES["axis_title"] + 2),
         tickfont=dict(size=_E16_FONT_SIZES["axis_tick"] + 2),
@@ -2182,6 +2364,44 @@ def plot_e16_single_removal(input_dir: Path, output_dir: Path) -> Optional[Path]
                 slugs.append(
                     _slug("e16_ranking_per_sector_pooled", class_label)
                 )
+            # MC-reference (RQMC actual impact) per-sector ranking, the
+            # analytical↔MC deltas, and the per-network-type heterogeneity
+            # check — all recomputed from the same pooled merged rows via the
+            # shared builders so the analytical and MC figures stay identical
+            # in style and method.
+            _pool_m = _e16_load_merged(sub_pooled_files)
+            if not _pool_m.empty:
+                _extra = [
+                    (ranking_per_sector_figure(
+                        _pool_m, MC_SECTOR_SPECS,
+                        title="Pooled across scenarios (n={n}): per-sector "
+                              "ranking accuracy vs MC actual impact"),
+                     "ranking accuracy per sector vs MC",
+                     "e16_ranking_per_sector_mc_pooled"),
+                    (ranking_per_sector_delta_figure(
+                        _pool_m, ANALYTICAL_SECTOR_SPECS, MC_SECTOR_SPECS,
+                        title="Pooled across scenarios (n={n}): per-sector "
+                              "ranking accuracy Δ (MC − analytical)"),
+                     "ranking accuracy per sector Δ (MC − analytical)",
+                     "e16_ranking_per_sector_delta_pooled"),
+                    (spearman_per_sector_delta_figure(
+                        _pool_m, ANALYTICAL_SECTOR_SPECS, MC_SECTOR_SPECS,
+                        title="Pooled across scenarios (n={n}): per-sector "
+                              "Spearman ρ Δ (MC − analytical)"),
+                     "per-sector Spearman ρ Δ (MC − analytical)",
+                     "e16_rho_per_sector_delta_pooled"),
+                    (rho_per_network_type_figure(
+                        _pool_m, "total_shed",
+                        title="Spearman ρ per network type (analytical shed) "
+                              "— check for heterogeneity"),
+                     "ρ per network type (analytical)",
+                     "e16_rho_per_network_type"),
+                ]
+                for _f, _ttl, _slug_name in _extra:
+                    if _f.data:
+                        figs.append(_f)
+                        titles.append(f"{_ttl}{_title_suffix(class_label)}")
+                        slugs.append(_slug(_slug_name, class_label))
 
         # ρ vs shed vs ρ vs MC scatter — does shed-quality predict MC-quality?
         fig = go.Figure()

@@ -24,6 +24,12 @@ import eval_common as _ec
 from cmres_eval_plots import (
     SECTOR_COLORS, SECTOR_PRETTY,
     bar_error_kwargs, outlined_marker,
+    # Shared per-sector / heatmap / per-network-type builders so the MC and
+    # analytical (E16) criticality figures use one styled code path.
+    MC_SECTOR_SPECS,
+    ranking_per_sector_figure,
+    style_corr_heatmap,
+    rho_per_network_type_figure,
 )
 import pub_style  # shared scare-style publication theme (bar outline, CVD
                   # hatch, top legend, compact horizontal sizing)
@@ -2665,35 +2671,16 @@ def pooled_metric_comparison(pooled_df, output_dir, class_label: str = ""):
         dtype=float, na_value=_np.nan
     )
     corr_fig = go.Figure(go.Heatmap(
-        z=rho_matrix,
-        x=heat_labels,
-        y=heat_labels,
-        zmin=-1.0, zmax=1.0,
-        colorscale="RdBu_r",
-        reversescale=False,
-        colorbar=dict(title="Spearman ρ", tickvals=[-1, -0.5, 0, 0.5, 1]),
+        z=rho_matrix, x=heat_labels, y=heat_labels,
         hovertemplate="x=%{x}<br>y=%{y}<br>ρ=%{z:.2f}<extra></extra>",
     ))
-    # Cell annotations (small numeric labels) for quick visual scanning.
-    annotations = []
-    for i in range(n_h):
-        for j in range(n_h):
-            v = rho_matrix[i, j]
-            text_color = "white" if abs(v) > 0.55 else "black"
-            annotations.append(dict(
-                x=heat_labels[j], y=heat_labels[i],
-                text=("—" if v != v else f"{v:.2f}"),
-                xref="x", yref="y", showarrow=False,
-                font=dict(size=10, color=text_color),
-            ))
     corr_fig.update_layout(
         height=80 + 38 * n_h, width=140 + 38 * n_h + 260,
-        template=eval.CMRES_TEMPLATE,
         margin={"l": 200, "b": 180, "r": 60, "t": 50},
-        annotations=annotations,
-        xaxis=dict(tickangle=-35, automargin=True),
-        yaxis=dict(autorange="reversed", automargin=True),
     )
+    # Shared metric-correlation heatmap styling (single source of truth shared
+    # with the E16 per-sector heatmap).
+    style_corr_heatmap(corr_fig, z=rho_matrix, x=heat_labels, y=heat_labels)
     figures.append(corr_fig)
     titles.append(
         f"Pairwise Spearman ρ across metrics and the MC actual (n={n_total})"
@@ -2720,122 +2707,34 @@ def pooled_metric_comparison(pooled_df, output_dir, class_label: str = ""):
     figures.append(rho_bar)
     titles.append(f"Pooled Spearman ρ with Fisher z 95% CI (n={n_total})")
 
-    # ── 3. Spearman ρ per network type (small multiples) ──────────────────
+    # ── 3. Spearman ρ per network type (heterogeneity check) ──────────────
+    # Shared builder (same one the analytical E16 path uses), here against the
+    # MC actual_total reference.
     if len(net_types) > 1:
-        nt_rho_fig = go.Figure()
-        for m_idx, (col, label) in enumerate(pred_metrics):
-            nt_rhos, nt_errs_lo, nt_errs_hi = [], [], []
-            for nt in net_types:
-                sub = valid[valid["network_type"] == nt]
-                if len(sub) < 4:
-                    nt_rhos.append(float("nan"))
-                    nt_errs_lo.append(0)
-                    nt_errs_hi.append(0)
-                    continue
-                rho, _, ci_lo, ci_hi = _spearman_with_ci(sub[col], sub["actual_total"])
-                nt_rhos.append(rho)
-                nt_errs_lo.append(rho - ci_lo)
-                nt_errs_hi.append(ci_hi - rho)
-            nt_rho_fig.add_trace(go.Bar(
-                name=label,
-                x=[pretty_scenario(nt) for nt in net_types],
-                y=nt_rhos,
-                marker=pub_style.bar_marker(
-                    pub_style.qual_color(m_idx),
-                    pattern_shape=pub_style.qual_pattern(m_idx)),
-                error_y=bar_error_kwargs(err_hi=nt_errs_hi, err_lo=nt_errs_lo),
-            ))
-        # Kept vertical: network types are the comparison axis and the many
-        # metric series read as grouped columns per network; a horizontal
-        # layout with this many series would be excessively tall.
-        nt_rho_fig.add_hline(y=0, line=dict(color="#444", width=1, dash="dot"))
-        nt_rho_fig.update_layout(barmode="group")
-        pub_style.apply_theme(
-            nt_rho_fig,
-            title="Spearman ρ per network type — check for heterogeneity",
-            height=480, width=pub_style.vbar_width(len(net_types), 10, base=620),
-            font_bump=1, legend_top=True,
-        )
-        nt_rho_fig.update_xaxes(title="Network type", tickangle=-30)
-        nt_rho_fig.update_yaxes(title="Spearman ρ", range=[-1.05, 1.05])
-        figures.append(nt_rho_fig)
-        titles.append("Spearman ρ per network type — check for heterogeneity")
+        nt_rho_fig = rho_per_network_type_figure(
+            valid, "actual_total",
+            metrics=[c for c, _ in pred_metrics],
+            title="Spearman ρ per network type — check for heterogeneity")
+        if nt_rho_fig.data:
+            figures.append(nt_rho_fig)
+            titles.append("Spearman ρ per network type — check for heterogeneity")
 
-    # ── 4. Kendall τ + NDCG@k + rNDCG@k (+ legacy NDCG) with bootstrap CI ─
-    # NDCG / rNDCG CIs use the vectorised ``bootstrap_ndcg_ci``.
-    _rndcg = _ec.random_normalized_ndcg
-    _bootstrap_ndcg_ci = _ec.bootstrap_ndcg_ci
-    _k_cut = _ec.default_ndcg_k(len(actual_vals))
-    _rng = _np.random.default_rng(42)
-    acc_rows = []
-    for col, label in pred_metrics:
-        scores = valid[col].values
-        tau  = float(scipy.stats.kendalltau(scores, actual_vals).statistic)
-        ndcg = _ndcg(actual_vals, scores)
-        ndcgk = _ndcg(actual_vals, scores, k=_k_cut)
-        rndcg = _rndcg(actual_vals, scores, k=_k_cut)
-        tau_lo, tau_hi = _bootstrap_ci(
-            lambda a, p: float(scipy.stats.kendalltau(p, a).statistic),
-            actual_vals, scores, rng=_rng)
-        ndcg_lo, ndcg_hi = _bootstrap_ndcg_ci(actual_vals, scores, rng=_rng)
-        ndcgk_lo, ndcgk_hi = _bootstrap_ndcg_ci(
-            actual_vals, scores, k=_k_cut, rng=_rng,
-        )
-        rndcg_lo, rndcg_hi = _bootstrap_ndcg_ci(
-            actual_vals, scores, k=_k_cut, normalize_random=True, rng=_rng,
-        )
-        acc_rows.append({
-            "Metric": label,
-            "Kendall τ": tau, "τ_lo": tau_lo, "τ_hi": tau_hi,
-            "NDCG": ndcg, "ndcg_lo": ndcg_lo, "ndcg_hi": ndcg_hi,
-            "NDCG@k": ndcgk, "ndcgk_lo": ndcgk_lo, "ndcgk_hi": ndcgk_hi,
-            "rNDCG@k": rndcg, "rndcg_lo": rndcg_lo, "rndcg_hi": rndcg_hi,
-        })
-    acc_df = pandas.DataFrame(acc_rows).sort_values("rNDCG@k", ascending=True)
-
-    panels = [
-        ("Kendall τ",       "Kendall τ", "τ_lo",     "τ_hi",     [-1.05, 1.05]),
-        (f"NDCG@{_k_cut}",  "NDCG@k",    "ndcgk_lo", "ndcgk_hi", [-0.05, 1.05]),
-        (f"rNDCG@{_k_cut}", "rNDCG@k",   "rndcg_lo", "rndcg_hi", [-1.05, 1.05]),
-        ("NDCG",            "NDCG",      "ndcg_lo",  "ndcg_hi",  [-0.05, 1.05]),
-    ]
-    acc_fig = _ranking_accuracy_panels(
-        acc_df, panels,
-        title=(f"Pooled ranking accuracy: Kendall τ, NDCG@{_k_cut}, "
-               f"rNDCG@{_k_cut}, NDCG (bootstrap 95% CI, n={n_total})"),
-    )
-    figures.append(acc_fig)
-    best = acc_df.iloc[-1]["Metric"]
-    titles.append(
-        f"Pooled Ranking Accuracy: Kendall τ + NDCG@{_k_cut} + rNDCG@{_k_cut} "
-        f"+ NDCG with Bootstrap 95% CI (n={n_total}, best rNDCG@{_k_cut}: {best})"
-    )
-
-    # ── 5. Precision@k ─────────────────────────────────────────────────────
-    n_comp = len(valid)
-    k_values = list(range(1, n_comp + 1))
-    prec_fig = go.Figure()
-    for col, label in pred_metrics:
-        scores = valid[col].values
-        prec_fig.add_trace(go.Scatter(
-            x=k_values,
-            y=[_precision_at_k(actual_vals, scores, k) for k in k_values],
-            mode="lines+markers", name=label, marker=dict(size=5),
-        ))
-    prec_fig.add_trace(go.Scatter(
-        x=k_values, y=[k / n_comp for k in k_values],
-        mode="lines", name="Random baseline",
-        line=dict(dash="dash", color="grey", width=1),
-    ))
-    prec_fig.update_layout(
-        height=450, width=750, template=eval.CMRES_TEMPLATE,
-        xaxis=dict(title="k (number of top components considered)", dtick=max(1, n_comp // 20)),
-        yaxis=dict(title="Precision@k", range=[-0.05, 1.05]),
-        legend=dict(title="Metric", x=1.01, xanchor="left"),
-        margin={"l": 60, "b": 60, "r": 20, "t": 40},
-    )
-    figures.append(prec_fig)
-    titles.append(f"Pooled Precision@k (n={n_total} MC-sampled of {n_all} matched)")
+    # ── 4. Per-sector ranking accuracy vs the MC actual impact ────────────
+    # Kendall τ / NDCG@10 / precision@10 resolved per sector through the shared
+    # builder — the same code path (and styling) as the analytical E16 figure,
+    # only the reference columns differ (MC ``actual_*`` here). Replaces the old
+    # all-component ranking-accuracy + precision@k panels: ranking quality is
+    # strongly sector-dependent, so a single pooled-across-sectors number
+    # understates it.
+    rank_fig = ranking_per_sector_figure(
+        valid, MC_SECTOR_SPECS,
+        title="Pooled across scenarios (n={n}): per-sector ranking accuracy "
+              "vs MC actual impact")
+    if rank_fig.data:
+        figures.append(rank_fig)
+        titles.append(
+            f"Pooled per-sector ranking accuracy vs MC actual "
+            f"(Kendall τ / NDCG@10 / precision@10, n={n_total})")
 
     # ── Filtered-vs-unfiltered ρ comparison (pooled) ───────────────────────
     if n_mc >= 3 and n_all > n_mc:
