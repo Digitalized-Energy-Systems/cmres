@@ -2490,8 +2490,8 @@ def cross_carrier_impact_aggregated(
             ))
         fig.update_layout(barmode="group")
         pub_style.apply_theme(
-            fig, title="Cross-carrier impact (mean ± std across scenarios)",
-            height=440, width=pub_style.vbar_width(len(source_order), 3, base=560),
+            fig, title="Mean cross-carrier impact",
+            height=340, width=pub_style.vbar_width(len(source_order), 3, base=560),
             font_bump=1, legend_top=True,
         )
         fig.update_xaxes(title="Source carrier")
@@ -2500,7 +2500,7 @@ def cross_carrier_impact_aggregated(
 
     fig_total = _build_fig(
         total_mean, total_std,
-        y_title="Mean Σ |impact| across scenarios (MW)",
+        y_title="Mean Σ |impact| (MW)",
         unit="MW",
         show_n_components=False,
     )

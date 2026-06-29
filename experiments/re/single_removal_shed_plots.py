@@ -495,7 +495,7 @@ def _pooled_baseline(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
     fig = go.Figure()
     for carrier in ("electricity", "heat", "gas"):
         fig.add_trace(go.Bar(
-            y=[pretty_scenario(g) for g in df["grid"]],
+            y=[_short_grid(g) for g in df["grid"]],
             x=df[carrier], name=pub_style.SECTOR_PRETTY[carrier], orientation="h",
             marker=pub_style.sector_marker(carrier),
             hovertemplate=("<b>%{y}</b><br>" + pub_style.SECTOR_PRETTY[carrier]
@@ -519,34 +519,48 @@ def _pooled_total_shed_box(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
     "no fault" anchor is visible relative to the spread."""
     fig = go.Figure()
     color = _grid_color_map(grids)
+    # Floor/window for the log value-axis: near-zero shed (≈1e-18 on components
+    # that cause no curtailment) and a near-zero baseline would otherwise stretch
+    # the log axis across ~18 decades and squash the boxes. Clamp to the
+    # meaningful (>1e-6 MW) shed window so the distributions stay legible.
+    _allv = (pd.concat([records[g][0]["total_shed"]
+                        for g in grids if not records[g][0].empty])
+             if grids else pd.Series(dtype=float))
+    _real = _allv[_allv > 1e-6]
+    _floor = float(_real.min()) if len(_real) else 1e-4
+    _hi = float(_real.max()) * 1.6 if len(_real) else 1.0
     for g in grids:
         sweep, baseline = records[g]
         if sweep.empty:
             continue
         fig.add_trace(go.Box(
-            y=sweep["total_shed"], x=[pretty_scenario(g)] * len(sweep),
-            name=pretty_scenario(g), marker_color=color[g],
+            x=sweep["total_shed"], y=[_short_grid(g)] * len(sweep),
+            name=_short_grid(g), marker_color=color[g], orientation="h",
             opacity=_grid_opacity(g),
             boxpoints="outliers", showlegend=False,
-            hovertemplate=("<b>" + pretty_scenario(g)
-                           + "</b><br>total_shed = %{y:.4f} MW<extra></extra>"),
+            hovertemplate=("<b>" + _short_grid(g)
+                           + "</b><br>total_shed = %{x:.4f} MW<extra></extra>"),
         ))
         if baseline is not None:
             fig.add_trace(go.Scatter(
-                x=[pretty_scenario(g)], y=[float(baseline["total_shed"])],
+                x=[max(float(baseline["total_shed"]), _floor)], y=[_short_grid(g)],
                 mode="markers", marker=dict(color="#e45756", symbol="diamond",
                                             size=10, line=dict(color="#222", width=0.6)),
                 name="baseline", legendgroup="baseline",
                 showlegend=(g == grids[0]),
-                hovertemplate=("<b>" + pretty_scenario(g)
-                               + "</b><br>baseline = %{y:.4f} MW<extra></extra>"),
+                hovertemplate=("<b>" + _short_grid(g)
+                               + "</b><br>baseline = %{x:.4f} MW<extra></extra>"),
             ))
+    # Horizontal to align with the other pooled bar figures; grid on the
+    # category (y) axis, shed on the log value (x) axis.
     fig.update_layout(
         title="Total shed across single-component removals — distribution per grid",
-        xaxis_title="Grid", yaxis_title="Total load shed (MW)",
-        yaxis_type="log",
-        height=520, width=max(720, 90 * len(grids) + 180),
+        xaxis_title="Total load shed (MW)", yaxis_title="Grid",
+        xaxis_type="log",
+        height=max(360, 70 * len(grids) + 180), width=pub_style.BAR_FIG_WIDTH,
     )
+    fig.update_xaxes(range=[float(np.log10(_floor * 0.7)), float(np.log10(_hi))])
+    fig.update_yaxes(autorange="reversed")
     return _srs_finalize(fig, legend="right")
 
 
@@ -576,22 +590,23 @@ def _pooled_excess_shed_box(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
         if positive.empty:
             continue
         fig.add_trace(go.Box(
-            y=positive, x=[pretty_scenario(g)] * len(positive),
-            name=pretty_scenario(g), marker_color=color[g],
+            x=positive, y=[_short_grid(g)] * len(positive),
+            name=_short_grid(g), marker_color=color[g], orientation="h",
             opacity=_grid_opacity(g),
             boxpoints="outliers", showlegend=False,
-            hovertemplate=("<b>" + pretty_scenario(g)
-                           + "</b><br>Δ shed = %{y:.4f} MW<extra></extra>"),
+            hovertemplate=("<b>" + _short_grid(g)
+                           + "</b><br>Δ shed = %{x:.4f} MW<extra></extra>"),
         ))
     label = "connected-load shed" if conn else "total_shed"
     fig.update_layout(
         title=(f"Excess shed under fault: {label} − baseline per component"),
-        xaxis_title="Grid",
-        yaxis_title=("Excess connected shed Δ (MW, log)" if conn
+        yaxis_title="Grid",
+        xaxis_title=("Excess connected shed Δ (MW, log)" if conn
                      else "Excess shed Δ (MW, log)"),
-        yaxis_type="log",
-        height=520, width=max(720, 90 * len(grids) + 180),
+        xaxis_type="log",
+        height=max(360, 70 * len(grids) + 180), width=pub_style.BAR_FIG_WIDTH,
     )
+    fig.update_yaxes(autorange="reversed")
     # Annotate per-grid n_positive/n_total so the reader doesn't compare
     # boxes of wildly different sample size as if they were equivalent.
     # annotations = [
@@ -620,9 +635,9 @@ def _pooled_pareto(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
         cum_share = s["total_shed"].cumsum() / max(s["total_shed"].sum(), 1e-12)
         fig.add_trace(go.Scatter(
             x=ranks, y=cum_share, mode="lines",
-            name=pretty_scenario(g),
+            name=_short_grid(g),
             line=dict(color=color[g], width=2, dash=_grid_dash(g)),
-            hovertemplate=("<b>" + pretty_scenario(g)
+            hovertemplate=("<b>" + _short_grid(g)
                            + "</b><br>rank %{x}<br>cum. share %{y:.1%}"
                            "<extra></extra>"),
         ))
@@ -652,26 +667,26 @@ def _pooled_carrier_box(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
         long["carrier"] = long["carrier"].str.replace("_shed", "", regex=False).map(
             {"power": "electricity", "heat": "heat", "gas": "gas"}
         )
-        long["grid"] = pretty_scenario(g)
+        long["grid"] = _short_grid(g)
         rows.append(long)
     if not rows:
         return go.Figure()
     df = pd.concat(rows, ignore_index=True)
-    df = df[df["shed_mw"] > 0]  # log y demands strictly positive
+    df = df[df["shed_mw"] > 0]  # log axis demands strictly positive
     fig = px.box(
-        df, x="carrier", y="shed_mw", color="grid", points=False,
-        color_discrete_map={pretty_scenario(g): _grid_color_map(grids)[g]
+        df, x="shed_mw", y="carrier", color="grid", points=False, orientation="h",
+        color_discrete_map={_short_grid(g): _grid_color_map(grids)[g]
                             for g in grids},
         category_orders={
             "carrier": ["electricity", "heat", "gas"],
-            "grid": [pretty_scenario(g) for g in grids],
+            "grid": [_short_grid(g) for g in grids],
         },
         title="Per-carrier shed distribution per grid (zero-shed rows excluded)",
     )
     fig.update_layout(
-        yaxis_type="log",
-        xaxis_title="Carrier", yaxis_title="Shed (MW, log)",
-        height=520, width=max(820, 100 * len(grids) + 240),
+        xaxis_type="log",
+        yaxis_title="Carrier", xaxis_title="Shed (MW, log)",
+        height=max(380, 90 * len(grids) + 200), width=pub_style.BAR_FIG_WIDTH,
     )
     fig = _srs_finalize(fig, legend="right")
     # Per-figure-only +2 pt bump on every text element (dissertation-print
@@ -817,7 +832,7 @@ def _pooled_mean_shed_by_carrier_row(
                      row=1, col=(len(fams) + 1) // 2)
     pub_style.apply_theme(
         fig, title="Mean per-component load shed by carrier, per density and strategy",
-        width=1180, height=430, legend_top=True)
+        width=1180, height=430, legend_top=True, font_bump=2)
     return fig
 
 
@@ -833,18 +848,19 @@ def _pooled_solve_time(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
         if sweep.empty or "elapsed_s" not in sweep.columns:
             continue
         fig.add_trace(go.Box(
-            y=sweep["elapsed_s"], x=[pretty_scenario(g)] * len(sweep),
-            name=pretty_scenario(g), marker_color=color[g],
+            x=sweep["elapsed_s"], y=[_short_grid(g)] * len(sweep),
+            name=_short_grid(g), marker_color=color[g], orientation="h",
             opacity=_grid_opacity(g),
             boxpoints="outliers", showlegend=False,
-            hovertemplate=("<b>" + pretty_scenario(g)
-                           + "</b><br>elapsed = %{y:.2f} s<extra></extra>"),
+            hovertemplate=("<b>" + _short_grid(g)
+                           + "</b><br>elapsed = %{x:.2f} s<extra></extra>"),
         ))
     fig.update_layout(
         title="Per-component LP solve time, per grid",
-        xaxis_title="Grid", yaxis_title="Elapsed (s)",
-        height=440, width=max(720, 90 * len(grids) + 180),
+        yaxis_title="Grid", xaxis_title="Elapsed (s)",
+        height=max(360, 70 * len(grids) + 180), width=pub_style.BAR_FIG_WIDTH,
     )
+    fig.update_yaxes(autorange="reversed")
     return _srs_finalize(fig, legend="right")
 
 

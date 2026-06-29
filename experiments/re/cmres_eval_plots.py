@@ -1531,7 +1531,7 @@ def _e16_sector_hbar(metric_labels: List[str], traces: list, *,
     pub_style.apply_theme(
         bar, title=title,
         height=pub_style.hbar_height(len(metric_labels), n_series),
-        width=pub_style.BAR_FIG_WIDTH, font_bump=1, legend_top=True,
+        width=pub_style.BAR_FIG_WIDTH, font_bump=4, legend_top=True,
     )
     bar.update_xaxes(title="Spearman ρ", range=[-1.10, 1.10])
     bar.update_yaxes(title="")
@@ -1877,7 +1877,7 @@ def _e16_ranking_per_sector_aggregated(
         fig,
         title=(f"Pooled across scenarios (n={n_total}): per-sector ranking "
                f"accuracy vs analytical shed"),
-        width=1180, height=620, legend_top=True)
+        width=1180, height=620, legend_top=True, font_bump=4)
     fig.update_yaxes(autorange="reversed")
     return fig
 
@@ -2247,9 +2247,9 @@ def plot_e16_single_removal(input_dir: Path, output_dir: Path) -> Optional[Path]
                     + _title_suffix(class_label)
                 ),
                 height=pub_style.hbar_height(len(c)),
-                width=pub_style.BAR_FIG_WIDTH, font_bump=1, no_legend=True,
+                width=pub_style.BAR_FIG_WIDTH, font_bump=6, no_legend=True,
             )
-            fig2.update_xaxes(title="Spearman ρ", range=[-1.05, 1.10])
+            fig2.update_xaxes(title="Spearman ρ", range=[-.55, 1.10])
             fig2.update_yaxes(title="")
             figs.append(fig2)
             titles.append(f"Ceiling ρ{_title_suffix(class_label)}")
