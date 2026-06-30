@@ -1942,7 +1942,7 @@ def ranking_per_sector_figure(pooled, sector_specs, *, title, k=10):
 
 
 def ranking_per_sector_delta_figure(pooled, specs_a, specs_b, *, title, k=10,
-                                    drange=0.6):
+                                    drange=1.0):
     """Δ (B − A) of the per-sector ranking measures, same 3-panel form (used for
     MC − analytical). ``specs_a``/``specs_b`` are sector-spec lists sharing the
     same tags but different reference columns."""
@@ -1965,7 +1965,7 @@ def ranking_per_sector_delta_figure(pooled, specs_a, specs_b, *, title, k=10,
 
 
 def spearman_per_sector_delta_figure(pooled, specs_a, specs_b, *, title,
-                                     drange=0.6):
+                                     drange=1.0):
     """Δ (B − A) of the per-sector Spearman ρ, single grouped-bar panel."""
     metrics = _rank_metrics_present(pooled)
     if not metrics:
@@ -2402,6 +2402,42 @@ def plot_e16_single_removal(input_dir: Path, output_dir: Path) -> Optional[Path]
                         figs.append(_f)
                         titles.append(f"{_ttl}{_title_suffix(class_label)}")
                         slugs.append(_slug(_slug_name, class_label))
+
+            # Per-scenario (per-grid) ranking + delta figures, so the strong-
+            # vs low-coupling contrast is visible grid by grid (not only pooled).
+            for _mf in sub_pooled_files:
+                _one = _e16_load_merged([_mf])
+                if _one.empty:
+                    continue
+                _scen = Path(_mf).stem.removeprefix("E16_").removesuffix("_merged")
+                _lbl = pretty_scenario(_scen)
+                _ps = [
+                    (ranking_per_sector_figure(
+                        _one, ANALYTICAL_SECTOR_SPECS,
+                        title=f"{_lbl} (n={{n}}): per-sector ranking accuracy "
+                              "vs analytical shed"),
+                     "e16_ranking_per_sector"),
+                    (ranking_per_sector_figure(
+                        _one, MC_SECTOR_SPECS,
+                        title=f"{_lbl} (n={{n}}): per-sector ranking accuracy "
+                              "vs MC actual impact"),
+                     "e16_ranking_per_sector_mc"),
+                    (ranking_per_sector_delta_figure(
+                        _one, ANALYTICAL_SECTOR_SPECS, MC_SECTOR_SPECS,
+                        title=f"{_lbl} (n={{n}}): per-sector ranking accuracy "
+                              "Δ (MC − analytical)"),
+                     "e16_ranking_per_sector_delta"),
+                    (spearman_per_sector_delta_figure(
+                        _one, ANALYTICAL_SECTOR_SPECS, MC_SECTOR_SPECS,
+                        title=f"{_lbl} (n={{n}}): per-sector Spearman ρ "
+                              "Δ (MC − analytical)"),
+                     "e16_rho_per_sector_delta"),
+                ]
+                for _f, _slug_name in _ps:
+                    if _f.data:
+                        figs.append(_f)
+                        titles.append(f"{_slug_name} :: {_scen}")
+                        slugs.append(f"{_slug_name}_{_scen}")
 
         # ρ vs shed vs ρ vs MC scatter — does shed-quality predict MC-quality?
         fig = go.Figure()
