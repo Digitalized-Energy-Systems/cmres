@@ -73,18 +73,22 @@ class CPMetricConfig:
     HX_KAPPA: float = 10.0
 
     # ── Heat / thermal-aware metric ──────────────────────────────────────
-    # (A) Replace pure-hydraulic margins with thermal margins:
-    #     m_min = q_downstream_demand / (cp · ΔT)  (mass flow needed to deliver
-    #     the downstream heat demand at a fixed supply-return spread).
-    #     thermal_margin = max(MIN_MARGIN, m_solved - m_min).
-    HEAT_THERMAL_MARGIN_ENABLE: bool = True
+    # Heat pipes use the same hydraulic capacity − flow margins as gas
+    # (velocity-cap limit via _robust_margins). The earlier "thermal
+    # margin" override (m_solved − q_downstream/(cp·ΔT)) was removed: it
+    # *increased* with loading — inverted vs. every other carrier — and
+    # because monee's HeatExchanger sizes flows at the same 30 K design
+    # spread, the two terms nearly cancelled and demand-carrying supply
+    # pipes collapsed onto the MIN_MARGIN plateau (heat ranking = noise).
     HEAT_DELTA_T_K: float = 30.0           # supply-return spread (K)
     HEAT_CP_J_PER_KG_K: float = 4186.0     # specific heat of water
 
     # (B) Slack-distance prefactor for heat: scales heat-stress contribution by
     #     (1 + α · d_thermal) where d_thermal = Σ L·κ on the shortest path
     #     (per-pipe thermal-loss factor) from the component to the nearest
-    #     heat injector (ExtHydrGrid + heat-supplying CPs).
+    #     heat injector (ExtHydrGrid + heat-supplying CPs), normalised to
+    #     [0, 1] by the farthest node so the multiplier is bounded to
+    #     [1, 1+α].
     HEAT_REMOTENESS_ENABLE: bool = True
     HEAT_REMOTENESS_ALPHA: float = 1.0
     HEAT_PIPE_U_W_M2_K: float = 1.5        # external heat-transfer coeff for DH pipe
@@ -229,11 +233,17 @@ def _robust_margins(limits: np.ndarray, flows0: np.ndarray, cfg: CPMetricConfig)
         if not cfg.USE_PSEUDO_LIMITS:
             raw_margins[missing] = np.inf
         else:
-            # robust scale so pseudo-limit isn't zero
+            # One pseudo capacity for the whole group: (1+headroom) × P90 of
+            # observed flows (robust scale so it isn't zero). The former
+            # per-branch base max(flow, scale) made margins GROW with flow
+            # above the 90th percentile — margin 0.3·flow — so the most
+            # heavily loaded limit-less branches (all HeatExchangers) scored
+            # the LOWEST stress. With a constant limit, margin = limit − flow
+            # is monotone decreasing; flows beyond the pseudo capacity clamp
+            # to MIN_MARGIN and are flagged binding.
             scale = np.percentile(flows0[flows0 > 0], 90) if np.any(flows0 > 0) else 1.0
-            base = np.maximum(flows0, max(scale, cfg.MIN_MARGIN))
-            pseudo_limit = (1.0 + cfg.PSEUDO_HEADROOM) * base
-            raw_margins[missing] = pseudo_limit[missing] - flows0[missing]
+            pseudo_limit = (1.0 + cfg.PSEUDO_HEADROOM) * max(scale, cfg.MIN_MARGIN)
+            raw_margins[missing] = pseudo_limit - flows0[missing]
 
     binding_mask = raw_margins <= cfg.BINDING_MARGIN_EPS
     margins = np.maximum(raw_margins, cfg.MIN_MARGIN)
@@ -886,129 +896,6 @@ def _heat_injector_node_ids(monee_net) -> set:
     return ids
 
 
-def _heat_node_demand(monee_net) -> Dict[int, float]:
-    """Per-junction heat demand q_mw (rated). Used to attribute downstream load
-    to each pipe in the supply tree."""
-    demand: Dict[int, float] = {}
-
-    def _add(nid, q):
-        if nid is None or not _is_finite(q):
-            return
-        demand[nid] = demand.get(nid, 0.0) + abs(float(q))
-
-    passive_load = getattr(mm, "PassiveHeatExchangerLoad", mm.HeatExchangerLoad)
-    for c in monee_net.childs:
-        m = c.model
-        if isinstance(m, mm.HeatLoad):
-            _add(c.node_id, _val(getattr(m, "q_mw_heat", 0.0), 0.0))
-
-    for b in monee_net.branches:
-        m = b.model
-        # Heat-consuming exchangers only. Bare HeatExchanger / SubHE are
-        # CP-internal couplings or heat sources and must not be counted as
-        # demand. Use the rated duty q_mw_set, not the solved q_mw Var (which
-        # is ~0 on an unsolved network).
-        if isinstance(m, (mm.HeatExchangerLoad, passive_load)):
-            q_set = _val(getattr(m, "q_mw_set", None), None)
-            q = q_set if _is_finite(q_set) else _val(getattr(m, "q_mw", 0.0), 0.0)
-            _add(b.from_node_id, q)
-
-    return demand
-
-
-def _heat_supply_tree(
-    monee_net, junc_ids: List[int]
-) -> Tuple[Dict[int, Optional[int]], Dict[Tuple[int, int], int]]:
-    """BFS spanning tree on water graph rooted at heat injectors.
-
-    Returns (parent[nid] = parent_nid_or_None, edge_to_pipe[(parent, child)] = pipe_id).
-    For radial supply/return DHS this recovers the exact supply-side topology.
-    For meshed grids the BFS tree is an approximation but downstream-demand
-    attribution still gives a sensible per-edge mass-flow lower bound.
-    """
-    junc_set = set(junc_ids)
-    G = nx.Graph()
-    G.add_nodes_from(junc_ids)
-    edge_to_pipe: Dict[Tuple[int, int], int] = {}
-
-    for pipe in monee_net.branches_by_type(mm.WaterPipe):
-        if not pipe.active:
-            continue
-        if pipe.from_node_id in junc_set and pipe.to_node_id in junc_set:
-            G.add_edge(pipe.from_node_id, pipe.to_node_id)
-            edge_to_pipe[(pipe.from_node_id, pipe.to_node_id)] = pipe.id
-            edge_to_pipe[(pipe.to_node_id, pipe.from_node_id)] = pipe.id
-
-    for hx in monee_net.branches_by_type(mm.HeatExchanger):
-        if not hx.active:
-            continue
-        if hx.from_node_id in junc_set and hx.to_node_id in junc_set:
-            G.add_edge(hx.from_node_id, hx.to_node_id)
-            edge_to_pipe[(hx.from_node_id, hx.to_node_id)] = hx.id
-            edge_to_pipe[(hx.to_node_id, hx.from_node_id)] = hx.id
-
-    injectors = [nid for nid in junc_ids if nid in _heat_injector_node_ids(monee_net)]
-    parent: Dict[int, Optional[int]] = {nid: None for nid in injectors}
-    if not injectors or not G.edges:
-        return parent, edge_to_pipe
-
-    visited = set(injectors)
-    queue = list(injectors)
-    while queue:
-        n = queue.pop(0)
-        for nbr in G.neighbors(n):
-            if nbr in visited:
-                continue
-            visited.add(nbr)
-            parent[nbr] = n
-            queue.append(nbr)
-
-    return parent, edge_to_pipe
-
-
-def _heat_pipe_downstream_demand(
-    monee_net, pipe_ids: List[int], junc_ids: List[int]
-) -> Dict[int, float]:
-    """For each WaterPipe / HeatExchanger id in pipe_ids, the cumulative q_mw of
-    heat loads on its downstream side (in the supply tree rooted at injectors).
-
-    A pipe with no downstream demand returns 0.0; that means the thermal-margin
-    fallback is just the hydraulic margin.
-    """
-    parent, edge_to_pipe = _heat_supply_tree(monee_net, junc_ids)
-    node_demand = _heat_node_demand(monee_net)
-
-    children: Dict[int, List[int]] = {}
-    for child, par in parent.items():
-        if par is None:
-            continue
-        children.setdefault(par, []).append(child)
-
-    subtree: Dict[int, float] = {}
-
-    def _post(v: int) -> float:
-        if v in subtree:
-            return subtree[v]
-        s = float(node_demand.get(v, 0.0))
-        for c in children.get(v, []):
-            s += _post(c)
-        subtree[v] = s
-        return s
-
-    for nid in junc_ids:
-        _post(nid)
-
-    pipe_demand: Dict[int, float] = {pid: 0.0 for pid in pipe_ids}
-    for child, par in parent.items():
-        if par is None:
-            continue
-        pid = edge_to_pipe.get((par, child))
-        if pid is None:
-            continue
-        pipe_demand[pid] = subtree.get(child, 0.0)
-    return pipe_demand
-
-
 def _heat_remoteness_per_node(monee_net, junc_ids: List[int], cfg: CPMetricConfig) -> Dict[int, float]:
     """Per-junction thermal-loss distance to the nearest heat injector.
 
@@ -1066,7 +953,18 @@ def _heat_remoteness_per_node(monee_net, junc_ids: List[int], cfg: CPMetricConfi
 
     finite_vals = [v for v in dists.values() if math.isfinite(v)]
     cap = max(finite_vals) if finite_vals else 0.0
-    return {nid: float(dists.get(nid, cap)) for nid in junc_ids}
+    # Normalise to [0, 1] (fraction of the farthest node's distance). The
+    # raw Σ L·κ distance is unbounded and dominated by the FLOW_MIN floor:
+    # one idle 100 m pipe contributes weight ≈ 100 · (U·π·d)/(FLOW_MIN·cp)
+    # ≈ 113, so unnormalised distances inflated remote nodes' heat scores
+    # by 2–4 orders of magnitude and drowned the PTDF/margin signal. After
+    # normalisation the remoteness multiplier (1 + α·d) is bounded to
+    # [1, 1+α] while preserving the remoteness ordering.
+    if cap > 0:
+        return {
+            nid: float(min(dists.get(nid, cap), cap)) / cap for nid in junc_ids
+        }
+    return {nid: 0.0 for nid in junc_ids}
 
 
 # =============================================================================
@@ -1789,6 +1687,7 @@ def compute_stress_topology_metrics(monee_net, ctx: "CarrierPTDFContext", cfg: "
     mapped = 0
     total = 0
 
+    edge_stress: dict = {}
     for u, v, data in G.edges(data=True):
         total += 1
         stress_val = None
@@ -1818,17 +1717,25 @@ def compute_stress_topology_metrics(monee_net, ctx: "CarrierPTDFContext", cfg: "
                         break
                 except Exception:
                     pass
+        edge_stress[(u, v)] = stress_val
 
-        # weight = 1/(stress+eps): highly loaded edges become "short" (preferred)
+    # weight = 1/(stress+eps): highly loaded edges become "short" (preferred
+    # by weighted shortest paths — nx treats weight as distance). Unmapped
+    # edges (no stress data at all — notably every branch-CP / transfer
+    # edge, whose ids are never in stress_by_id) get the NEUTRAL median of
+    # the mapped weights: the earlier 1/EPS assignment made them the
+    # *longest* edges in the graph, i.e. shortest paths never crossed a
+    # coupling point and stress_bc degenerated to per-carrier-island BC —
+    # the exact opposite of the "conservative, inflates BC" intent.
+    mapped_weights = [
+        1.0 / (s + EPS) for s in edge_stress.values() if s is not None and s > 0
+    ]
+    neutral_w = float(np.median(mapped_weights)) if mapped_weights else 1.0
+    for (u, v), stress_val in edge_stress.items():
         if stress_val is not None and stress_val > 0:
             w = 1.0 / (stress_val + EPS)
         else:
-            # Unmapped or zero-flow edges: absence of stress data is interpreted
-            # as "maximally unconstrained" -> weight = 1/EPS makes them the
-            # shortest possible paths.  This is CONSERVATIVE, not neutral: it
-            # inflates BC of nodes adjacent to unmapped edges.  For a neutral
-            # alternative, use w = median(stress_weight over mapped edges).
-            w = 1.0 / EPS
+            w = neutral_w
         G.edges[u, v]["stress_weight"] = float(np.clip(w, 0.0, 1e12))
 
     bc = nx.betweenness_centrality(G, weight="stress_weight")
@@ -1880,9 +1787,11 @@ def _apply_ablations(
 def _heat_remoteness_factor(ctx, node_id, cfg: "CPMetricConfig") -> float:
     """(1 + α · d_thermal(node)) — slack-distance prefactor for heat stress.
 
-    Returns 1.0 when remoteness is disabled, the node is unknown, or it sits
-    at a heat injector. Larger values penalise components farther from any
-    heat source along thermally lossy supply paths.
+    ``d_thermal`` is normalised to [0, 1] (see ``_heat_remoteness_per_node``)
+    so the factor is bounded to [1, 1+α]. Returns 1.0 when remoteness is
+    disabled, the node is unknown, or it sits at a heat injector. Larger
+    values penalise components farther from any heat source along thermally
+    lossy supply paths.
     """
     if not cfg.HEAT_REMOTENESS_ENABLE:
         return 1.0
@@ -1989,12 +1898,28 @@ def _cp_throughput_proxy(cp_or_branch, label: str, monee_net=None) -> float:
 # =============================================================================
 
 
-def _stress_from_ptdf(ptdf: np.ndarray, margins: np.ndarray, cfg: CPMetricConfig):
+def _stress_from_ptdf(
+    ptdf: np.ndarray,
+    margins: np.ndarray,
+    cfg: CPMetricConfig,
+    unit_factor: float = 1.0,
+):
+    """Aggregate |PTDF|/margin stress.
+
+    ``unit_factor`` converts the carrier's native "fraction of margin per
+    unit injection" into the common **per-MW** basis: the PTDF injects one
+    native flow unit (1 pu ≈ 1 MW for power, 1 kg/s ≈ 55 MW gas / ≈ 0.13 MW
+    heat), so without the factor the three carriers' stresses differ by up
+    to ~440× for identical physical loading — the mechanism behind the
+    composite's cross-carrier scale bias (PowerLine median score 0.78 vs
+    GasPipe 0.00). Within-carrier rankings are unaffected (constant
+    factor); the factor also puts CLIP_STRESS on one common scale.
+    """
     ptdf = np.asarray(ptdf, dtype=float)
     margins = np.asarray(margins, dtype=float)
     denom = margins + cfg.EPS_MARGIN
     with np.errstate(invalid="ignore", divide="ignore"):
-        s = np.abs(ptdf) / denom
+        s = float(unit_factor) * np.abs(ptdf) / denom
     # Drop NaN / ±inf samples instead of letting them poison the aggregate.
     # NaN typically signals an ill-conditioned PTDF (singular Laplacian, NaN
     # in the susceptance matrix, etc.) — better to score the well-defined
@@ -2045,6 +1970,9 @@ class CarrierPTDFContext:
 
         self.power.update(
             {
+                # Per-MW stress conversion: power PTDF injects 1 pu against
+                # MVA margins — already the per-MW basis (MVA ≈ MW).
+                "stress_unit": 1.0,
                 "branches": branches,
                 "branch_ids": branch_ids,
                 "Ybus": Ybus,
@@ -2135,6 +2063,9 @@ class CarrierPTDFContext:
 
         self.gas.update(
             {
+                # Per-MW stress conversion: gas PTDF injects 1 kg/s against
+                # kg/s margins; 1 MW of gas = 1/(3.6·HHV) kg/s.
+                "stress_unit": 1.0 / (3.6 * _get_gas_hhv(monee_net)),
                 "B": B,
                 "pipe_data": pipe_data,
                 "pipe_ids": pipe_ids,
@@ -2240,38 +2171,10 @@ class CarrierPTDFContext:
             limits, flows0, self.cfg
         )
 
-        # (A) Thermal-aware margin override: each pipe must carry at least
-        # m_min = q_downstream_demand / (cp · ΔT) to deliver the heat its
-        # downstream subtree needs at a fixed supply-return spread. Margin
-        # becomes the headroom *above* that thermal floor (m0 − m_min), which
-        # is the budget for flow-decreasing perturbations under fault. Where
-        # the BFS-tree gives zero downstream demand (return-side pipes,
-        # disconnected components) we fall back to the hydraulic margin.
-        thermal_min: Optional[np.ndarray] = None
-        if self.cfg.HEAT_THERMAL_MARGIN_ENABLE and pipe_ids:
-            try:
-                pipe_demand = _heat_pipe_downstream_demand(
-                    monee_net, pipe_ids, junc_ids
-                )
-                cp_dT = self.cfg.HEAT_CP_J_PER_KG_K * self.cfg.HEAT_DELTA_T_K  # J/kg
-                # q [MW] · 1e6 / (cp·ΔT [J/kg]) → kg/s
-                thermal_min = np.array(
-                    [
-                        float(pipe_demand.get(pid, 0.0)) * 1e6 / cp_dT
-                        for pid in pipe_ids
-                    ],
-                    dtype=float,
-                )
-                # Operating headroom over thermal floor (clipped to MIN_MARGIN).
-                thermal_margins = np.maximum(
-                    np.abs(flows0) - thermal_min, self.cfg.MIN_MARGIN
-                )
-                # Use thermal margin where downstream demand is nonzero, else
-                # keep hydraulic margin from _robust_margins.
-                use_thermal = thermal_min > 0.0
-                margins = np.where(use_thermal, thermal_margins, margins)
-            except Exception:
-                thermal_min = None
+        # Heat keeps the hydraulic capacity − flow margins from
+        # _robust_margins, like every other carrier. (The former thermal-
+        # margin override was orientation-inverted — see the config note at
+        # HEAT_DELTA_T_K.)
 
         # (B) Per-junction thermal-loss distance to nearest heat injector.
         # Cached on the context so each heat-bearing component just looks up
@@ -2288,6 +2191,11 @@ class CarrierPTDFContext:
 
         self.heat.update(
             {
+                # Per-MW stress conversion: heat PTDF injects 1 kg/s against
+                # kg/s margins; 1 MW of heat = 1e6/(cp·ΔT) kg/s ≈ 8 kg/s.
+                "stress_unit": 1e6 / (
+                    self.cfg.HEAT_CP_J_PER_KG_K * self.cfg.HEAT_DELTA_T_K
+                ),
                 "B": B,
                 "pipe_data": pipe_data,
                 "pipe_ids": pipe_ids,
@@ -2315,9 +2223,6 @@ class CarrierPTDFContext:
             "pseudo_used_ratio": pseudo_ratio,
             "margin_min": float(np.min(margins)) if margins.size else None,
             "margin_med": float(np.median(margins)) if margins.size else None,
-            "thermal_margin_pipes": (
-                int(np.sum(thermal_min > 0)) if thermal_min is not None else 0
-            ),
             "remoteness_min": float(min(rem_vals)) if rem_vals else None,
             "remoteness_med": float(np.median(rem_vals)) if rem_vals else None,
             "remoteness_max": float(max(rem_vals)) if rem_vals else None,
@@ -2359,11 +2264,21 @@ class CarrierPTDFContext:
 
         bal_idxs = [i for i in slack_idxs if i in src_comp]
         if not bal_idxs:
+            # No ExtHydrGrid in this component — fall back to CP heat-feed
+            # nodes (CHP / P2H / HG variants). On CP-fed heat islands (the
+            # backup-CP grid families) these ARE the physical heat sources,
+            # so treating them as balancing slack is sound; without the
+            # fallback every heat PTDF on such islands was all-zeros and
+            # predicted_heat tied at 0 across the whole island.
+            injector_ids = _heat_injector_node_ids(monee_net)
+            bal_idxs = [i for i in src_comp if node_ids[i] in injector_ids]
+        if not bal_idxs:
             z = (np.zeros(len(self.heat["pipe_data"]), dtype=float), False)
             cache[node_id] = z
             return z
 
-        # If source IS the slack (ExtHydrGrid), any injection is absorbed locally → zero PTDF (reliable).
+        # If source IS the slack (ExtHydrGrid or CP heat feed), any injection
+        # is absorbed locally → zero PTDF (reliable).
         if s_idx in bal_idxs:
             z = (np.zeros(len(self.heat["pipe_data"]), dtype=float), True)
             cache[node_id] = z
@@ -2706,7 +2621,9 @@ def mes_cp_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig()):
                 nid = connected["power"]
                 ptdf, ok = ctx.power_ptdf_node(monee_net, nid)
                 margins = ctx.power["margins"]
-                mean_s, max_s, agg_s = _stress_from_ptdf(ptdf, margins, cfg)
+                mean_s, max_s, agg_s = _stress_from_ptdf(
+                    ptdf, margins, cfg, ctx.power.get("stress_unit", 1.0)
+                )
                 carrier_detail["power"] = dict(
                     node_id=nid,
                     reliable=bool(ok),
@@ -2724,7 +2641,9 @@ def mes_cp_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig()):
                 margins = ctx.gas.get("margins", np.zeros_like(ptdf))
                 if margins.size != ptdf.size:
                     margins = np.zeros_like(ptdf) + cfg.MIN_MARGIN
-                mean_s, max_s, agg_s = _stress_from_ptdf(ptdf, margins, cfg)
+                mean_s, max_s, agg_s = _stress_from_ptdf(
+                    ptdf, margins, cfg, ctx.gas.get("stress_unit", 1.0)
+                )
                 carrier_detail["gas"] = dict(
                     node_id=nid,
                     reliable=bool(ok),
@@ -2742,7 +2661,9 @@ def mes_cp_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig()):
                 margins = ctx.heat.get("margins", np.zeros_like(ptdf))
                 if margins.size != ptdf.size:
                     margins = np.zeros_like(ptdf) + cfg.MIN_MARGIN
-                mean_s, max_s, agg_s = _stress_from_ptdf(ptdf, margins, cfg)
+                mean_s, max_s, agg_s = _stress_from_ptdf(
+                    ptdf, margins, cfg, ctx.heat.get("stress_unit", 1.0)
+                )
                 rem = _heat_remoteness_factor(ctx, nid, cfg)
                 carrier_detail["heat"] = dict(
                     node_id=nid,
@@ -2846,7 +2767,9 @@ def mes_cp_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig()):
                 nid = carrier_nodes["power"]
                 ptdf, ok = ctx.power_ptdf_node(monee_net, nid)
                 margins = ctx.power["margins"]
-                mean_s, max_s, agg_s = _stress_from_ptdf(ptdf, margins, cfg)
+                mean_s, max_s, agg_s = _stress_from_ptdf(
+                    ptdf, margins, cfg, ctx.power.get("stress_unit", 1.0)
+                )
                 carrier_detail["power"] = dict(
                     node_id=nid,
                     reliable=bool(ok),
@@ -2863,7 +2786,9 @@ def mes_cp_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig()):
                 margins = ctx.gas.get("margins", np.zeros_like(ptdf))
                 if margins.size != ptdf.size:
                     margins = np.zeros_like(ptdf) + cfg.MIN_MARGIN
-                mean_s, max_s, agg_s = _stress_from_ptdf(ptdf, margins, cfg)
+                mean_s, max_s, agg_s = _stress_from_ptdf(
+                    ptdf, margins, cfg, ctx.gas.get("stress_unit", 1.0)
+                )
                 carrier_detail["gas"] = dict(
                     node_id=nid,
                     reliable=bool(ok),
@@ -2880,7 +2805,9 @@ def mes_cp_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig()):
                 margins = ctx.heat.get("margins", np.zeros_like(ptdf))
                 if margins.size != ptdf.size:
                     margins = np.zeros_like(ptdf) + cfg.MIN_MARGIN
-                mean_s, max_s, agg_s = _stress_from_ptdf(ptdf, margins, cfg)
+                mean_s, max_s, agg_s = _stress_from_ptdf(
+                    ptdf, margins, cfg, ctx.heat.get("stress_unit", 1.0)
+                )
                 rem = _heat_remoteness_factor(ctx, nid, cfg)
                 carrier_detail["heat"] = dict(
                     node_id=nid,
@@ -3020,7 +2947,8 @@ def _branch_lodf_stress(
         margins = np.ones(ptdf_from.size) * cfg.MIN_MARGIN
 
     ptdf_diff = ptdf_from - ptdf_to
-    mean_s, max_s, agg_s = _stress_from_ptdf(ptdf_diff, margins, cfg)
+    unit = getattr(ctx, carrier).get("stress_unit", 1.0)
+    mean_s, max_s, agg_s = _stress_from_ptdf(ptdf_diff, margins, cfg, unit)
     return mean_s, max_s, agg_s, bool(ok_f and ok_t)
 
 
@@ -3486,8 +3414,10 @@ def mes_all_components_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig())
     df_all["katz_score"] = df_all.apply(_katz_for_row, axis=1)
 
     # ---- Closeness vitality (physical graph, same weights as BC and Katz) ----
-    # vitality(v) = W(G) - W(G \ v): how much total pairwise distance increases
-    # when v is removed. Captures structural indispensability, not just centrality.
+    # vitality(v) = W(G \ v) - W(G): how much total pairwise distance increases
+    # when v is removed (higher = more critical). Captures structural
+    # indispensability, not just centrality. nx returns the negated form
+    # W(G) - W(G\v), so we flip the sign below.
     try:
         # On a disconnected graph the Wiener index is already infinite, so a
         # single closeness_vitality call would return NaN for every node and
@@ -3501,6 +3431,11 @@ def mes_all_components_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig())
                 )
         else:
             vitality_individual = nx.closeness_vitality(G_phys, weight="weight")
+        # nx.closeness_vitality returns W(G) − W(G\v): NEGATIVE (down to −inf)
+        # for critical nodes, positive for peripheral ones. Negate so the score
+        # is oriented "higher = more critical" like every other metric — i.e.
+        # W(G\v) − W(G), the increase in total pairwise distance on removal.
+        vitality_individual = {n: -v for n, v in vitality_individual.items()}
         # Replace inf (node removal disconnects graph → infinite path distances)
         # with the maximum finite vitality, treating disconnectors as maximally critical.
         finite_vals = [v for v in vitality_individual.values()

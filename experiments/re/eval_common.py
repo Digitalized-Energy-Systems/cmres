@@ -19,7 +19,7 @@ callers preserve reproducibility.
 from __future__ import annotations
 
 import math
-from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import pandas as pd
@@ -36,6 +36,16 @@ import scipy.stats as _stats
 # metrics. Including them inflates NDCG (saturated by ties at zero) and
 # biases P@k toward random.
 MC_FAILED_EPS = 1e-6
+
+# Noise floor for the analytical single-removal shed (MW). The min-shed
+# solves run at MIPGap 1e-4 on MW-scale demand, so sheds below ~1e-4 MW are
+# solver tolerance, not physics: in the 2026-06 run 64% of "power-affected"
+# rows sat below 0.1 kW. Conditioning per-carrier slices on ``> 0`` admits
+# those rows and inflates any predictor that merely knows the component's
+# carrier (matched power predictor: ρ 0.89 with them, 0.66 without —
+# the noise rows are free concordant pairs at the bottom of the ranking).
+# 1e-4 vs 1e-3 is insensitive; keep well above MIPGap × demand scale.
+SHED_EPS = 1e-4
 
 # Coupling-point cp_type labels emitted by mes_*_metric.
 CP_TYPE_SET = frozenset({
@@ -127,7 +137,23 @@ CORE_METRICS: List[Tuple[str, str]] = [
     ("self_score",               "0-hop self"),
 ]
 CORE_METRIC_COLS: List[str] = [c for c, _ in CORE_METRICS]
-CORE_METRIC_LABELS: Dict[str, str] = {c: lab for c, lab in CORE_METRICS}
+
+# Carrier-matched per-sector predictors. The composite mixes incomparable
+# per-carrier score scales (PowerLine median 0.78 vs GasPipe 0.00), which
+# costs ~0.22 ρ on the power slice (0.67 composite vs 0.89 matched) — so the
+# E16 per-sector evaluation additionally tests each carrier's own predictor
+# against its own shed. Kept out of CORE_METRICS: the cp_cn pooled figures
+# have no per-carrier slicing where a matched predictor would be meaningful.
+MATCHED_METRICS: List[Tuple[str, str]] = [
+    ("predicted_power", "Matched predictor (power)"),
+    ("predicted_heat",  "Matched predictor (heat)"),
+    ("predicted_gas",   "Matched predictor (gas)"),
+]
+MATCHED_METRIC_COLS: List[str] = [c for c, _ in MATCHED_METRICS]
+
+CORE_METRIC_LABELS: Dict[str, str] = {
+    c: lab for c, lab in CORE_METRICS + MATCHED_METRICS
+}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -268,7 +294,11 @@ def ndcg(actual_vals, predicted_scores, k: Optional[int] = None) -> float:
     cutoff = n if k is None else min(int(k), n)
     if cutoff <= 0:
         return 0.0
-    pred_order = np.argsort(predicted_scores)[::-1][:cutoff]
+    # argsort(-x), not argsort(x)[::-1]: both sort descending but break ties
+    # differently, and ndcg_batch (bootstrap CIs) uses the former — keep the
+    # point estimate on the same tie-breaking or tied metrics get CIs that
+    # exclude their own point value.
+    pred_order = np.argsort(-np.asarray(predicted_scores, dtype=float))[:cutoff]
     gains = np.maximum(actual_arr, 0.0)
     discounts = _discounts(cutoff)
     dcg = float(np.sum(gains[pred_order] * discounts))
@@ -446,15 +476,109 @@ def default_ndcg_k(n: int) -> int:
 
 
 def precision_at_k(actual_vals, predicted_scores, k: int) -> float:
-    """Fraction of true top-k components that appear in the predicted top-k."""
-    if k <= 0:
-        return 0.0
+    """Fraction of true top-k components that appear in the predicted top-k.
+
+    ``k`` is clamped to the list length so a perfect predictor on a short
+    list (e.g. the n=14 CP-only slice at k=20) still scores 1.0 instead of
+    being silently capped at ``n/k``.
+    """
     actual_arr = np.asarray(actual_vals)
     if actual_arr.size == 0:
+        return 0.0
+    k = min(int(k), actual_arr.size)
+    if k <= 0:
         return 0.0
     actual_top = set(np.argsort(actual_arr)[-k:])
     pred_top = set(np.argsort(predicted_scores)[-k:])
     return len(actual_top & pred_top) / k
+
+
+def rprecision_at_k(actual_vals, predicted_scores, k: int) -> float:
+    """Random-baseline-normalised precision@k (rP@k), analogous to rNDCG.
+
+    ``rP@k = (P@k − k/n) / (1 − k/n)`` — 0 means no better than picking k
+    items at random, 1 is perfect, negative is worse than random. Plain P@k
+    is incomparable across slice sizes: its random baseline is k/n, i.e.
+    0.03 on a 384-row branch slice but 0.71 on a 14-row CP slice, so the
+    same raw value means "excellent" on one and "below chance" on the other.
+    Returns NaN when k ≥ n (P@k is then 1 by construction).
+    """
+    actual_arr = np.asarray(actual_vals)
+    n = actual_arr.size
+    if n == 0 or k <= 0:
+        return float("nan")
+    k = min(int(k), n)
+    baseline = k / n
+    if baseline >= 1.0:
+        return float("nan")
+    p = precision_at_k(actual_arr, predicted_scores, k)
+    return float((p - baseline) / (1.0 - baseline))
+
+
+def partial_spearman(x, y, control) -> Tuple[float, float]:
+    """Spearman ρ between ``x`` and ``y`` after removing the (rank-linear)
+    contribution of ``control`` from both — the incremental ranking signal
+    of ``x`` beyond the control variable.
+
+    Used to quantify what a structural metric knows beyond the 0-hop local
+    demand baseline (``self_score``): a metric can post a high raw ρ purely
+    by proxying demand mass. Returns ``(rho, p)``; NaN-safe.
+    """
+    arrs = [np.asarray(v, dtype=float) for v in (x, y, control)]
+    mask = np.logical_and.reduce([np.isfinite(a) for a in arrs])
+    x_a, y_a, c_a = (a[mask] for a in arrs)
+    if x_a.size < 4:
+        return float("nan"), float("nan")
+    rx, ry, rc = (_stats.rankdata(a) for a in (x_a, y_a, c_a))
+    if np.ptp(rc) == 0:
+        res = _stats.spearmanr(rx, ry)
+        return float(res.statistic), float(res.pvalue)
+    ex = rx - np.polyval(np.polyfit(rc, rx, 1), rc)
+    ey = ry - np.polyval(np.polyfit(rc, ry, 1), rc)
+    # Degenerate residuals (variable ≈ fully explained by the control) are
+    # float noise at ~1e-14 — ranking that noise produces spurious ±1.
+    tol = 1e-8 * x_a.size
+    if np.max(np.abs(ex)) < tol or np.max(np.abs(ey)) < tol:
+        return float("nan"), float("nan")
+    res = _stats.spearmanr(ex, ey)
+    return float(res.statistic), float(res.pvalue)
+
+
+def carrier_rank_pooled(
+    df,
+    shed_cols: Sequence[str],
+    branch_mask,
+    ref_col: str = "_ranked_ref",
+    min_shed: float = SHED_EPS,
+):
+    """Long frame for the carrier-rank pooled evaluation.
+
+    For each carrier shed column: take branch rows with shed above the
+    noise floor (``min_shed``, default :data:`SHED_EPS`) and replace the
+    shed by its percentile rank *within that carrier*, then concatenate.
+    Correlating a metric against ``ref_col`` on the result gives a pooled
+    "overall" ρ that is immune to the Simpson flip of raw cross-carrier
+    pooling (raw scales differ by orders of magnitude between carriers, so
+    pooled raw ρ came out negative in 15/15 scenarios while every
+    within-carrier ρ was positive). Components affecting several carriers
+    appear once per carrier — intentional: each appearance is one ranking
+    task. Returns a new frame with ``ref_col`` added.
+    """
+    parts = []
+    for col in shed_cols:
+        if col not in df.columns:
+            continue
+        sub = df[branch_mask & df[col].notna() & (df[col] > min_shed)]
+        if len(sub) < 3:
+            continue
+        part = sub.copy()
+        part[ref_col] = sub[col].rank(pct=True)
+        parts.append(part)
+    if not parts:
+        out = df.iloc[0:0].copy()
+        out[ref_col] = []
+        return out
+    return pd.concat(parts, ignore_index=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -550,6 +674,21 @@ def match_impact_id(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def harm_from_impact(impact: pd.Series) -> pd.Series:
+    """Convert the signed MC impact (``out_mean − in_mean``, NEGATIVE for a
+    harmful component) into a non-negative harm value: ``max(0, −impact)``.
+
+    Not ``abs()``: the impact for a harmless component (and for the two
+    carriers a single-carrier component never touches) is a noisy
+    difference centred on 0, and ``abs()`` folds that noise upward into a
+    fake positive "actual impact" ∝ the sampling SD — components at the
+    bottom of the true ranking then get ranked by their noise magnitude.
+    Clamping keeps the harmful (negative) side and zeroes the
+    background-was-higher side instead of counting it as criticality.
+    """
+    return (-impact).clip(lower=0)
+
+
 def build_actual_lookups(impact_df_nt: pd.DataFrame):
     """Build the lookup tables used to attach MC ground-truth values to a
     score row.
@@ -558,14 +697,17 @@ def build_actual_lookups(impact_df_nt: pd.DataFrame):
     per_carrier_lookup)``:
       - ``impact_ids``: set of all id strings in ``impact_df_nt``.
       - ``branch_lookup``: see ``build_branch_lookup``.
-      - ``total_lookup``: ``id → Σ |impact|`` over carriers.
-      - ``per_carrier_lookup``: ``carrier → {id → impact}`` for per-carrier
+      - ``total_lookup``: ``id → Σ harm`` over carriers (see
+        :func:`harm_from_impact` for the sign handling).
+      - ``per_carrier_lookup``: ``carrier → {id → harm}`` for per-carrier
         slicing in the eval (electricity / heat / gas).
     """
     impact_abs = impact_df_nt.copy()
-    impact_abs["impact"] = impact_abs["impact"].abs()
+    impact_abs["impact"] = harm_from_impact(impact_abs["impact"])
+    # min_count=1: a never-MC-sampled component (all-NaN impacts) stays NaN
+    # instead of becoming a fake measured 0 that ties with true zeros.
     actual_total = (
-        impact_abs.groupby("id")["impact"].sum()
+        impact_abs.groupby("id")["impact"].sum(min_count=1)
         .reset_index()
         .rename(columns={"impact": "actual_total"})
     )

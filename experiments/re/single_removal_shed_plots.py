@@ -352,6 +352,9 @@ def _carrier_breakdown(sweep: pd.DataFrame, grid: str) -> go.Figure:
     long["carrier"] = long["carrier"].str.replace("_shed", "", regex=False).map(
         {"power": "electricity", "heat": "heat", "gas": "gas"}
     )
+    # Log axis demands strictly positive values — same filter as the pooled
+    # variant; most branches shed exactly 0 on foreign carriers.
+    long = long[long["shed_mw"] > 0]
     fig = px.box(
         long, x="carrier", y="shed_mw", color="carrier", points="outliers",
         color_discrete_map=ev.NETWORK_COLOR_MAP,

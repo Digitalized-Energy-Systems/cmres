@@ -297,14 +297,46 @@ def create_metrics_df(monee_net: Network, network_type: str):
         edge_to_degree[edge_id] = (
             node_to_degree[edge_id[0]] + node_to_degree[edge_id[1]]
         )
-    node_to_vital = nx.closeness_vitality(monee_net._network_internal, weight="weight")
+    # Negate: nx.closeness_vitality returns W(G) − W(G\v), which is negative
+    # for critical nodes. Flip to W(G\v) − W(G) so higher = more critical,
+    # matching the orientation of every other metric here (and cp_metric).
+    # Same guards as cp_metric: per connected component (a disconnected
+    # graph has an infinite Wiener index → NaN for every node), and ±inf
+    # from articulation points clamped to the max finite value so infs
+    # never propagate into metrics.csv / the vc figures.
+    import numpy as _np
+
+    _G_int = monee_net._network_internal
+    _vital_raw: dict = {}
+    _G_undir = nx.Graph(_G_int)
+    for _comp in nx.connected_components(_G_undir):
+        _vital_raw.update(
+            nx.closeness_vitality(_G_undir.subgraph(_comp).copy(), weight="weight")
+        )
+    node_to_vital = {n: -v for n, v in _vital_raw.items()}
+    _finite = [v for v in node_to_vital.values() if _np.isfinite(v)]
+    _max_fin = max(_finite) if _finite else 0.0
+    node_to_vital = {
+        n: (_max_fin if not _np.isfinite(v) else v)
+        for n, v in node_to_vital.items()
+    }
     edge_to_vital = {}
     for edge_id, _ in edge_to_bc.items():
         edge_to_vital[edge_id] = (
             node_to_vital[edge_id[0]] + node_to_vital[edge_id[1]]
         ) / 2
+    # Katz diverges for alpha ≥ 1/λ_max; derive alpha from the spectral
+    # radius like cp_metric instead of trusting the nx default (0.1).
+    _G_katz = nx.Graph(_G_int)
+    try:
+        _lam = max(
+            abs(_np.linalg.eigvals(nx.to_numpy_array(_G_katz, weight="weight")))
+        )
+        _alpha = 0.9 / _lam if _lam > 0 else 0.1
+    except Exception:
+        _alpha = 0.1
     node_to_katz = nx.katz_centrality(
-        nx.Graph(monee_net._network_internal), weight="weight"
+        _G_katz, alpha=_alpha, weight="weight", max_iter=5000
     )
     edge_to_katz = {}
     for edge_id, _ in edge_to_bc.items():
@@ -660,7 +692,8 @@ def impact_over_metrics(
     metric_impact_df["type_y"] = (
         metric_impact_df["type_y"].astype(str).str.split(".").str[-1].str[:-2]
     )
-    metric_impact_df["impact"] = metric_impact_df["impact"].abs()
+    # Signed harm clamp, not abs — see eval_common.harm_from_impact.
+    metric_impact_df["impact"] = _ec.harm_from_impact(metric_impact_df["impact"])
     figures = []
     titles = []
     metric_impact_df = metric_impact_df[metric_impact_df["impact"].notnull()]
@@ -899,7 +932,8 @@ def _impact_carrier_hbar(agg_df, cat_col, value_col, *, cat_title, title):
 
 def impact_aggregated_component_carrier(impact_df: pandas.DataFrame, folder_id):
     new_impact_df = impact_df.copy()
-    new_impact_df["impact"] = new_impact_df["impact"].abs()
+    # Signed harm clamp, not abs — see eval_common.harm_from_impact.
+    new_impact_df["impact"] = _ec.harm_from_impact(new_impact_df["impact"])
     new_impact_df["type"] = (
         impact_df["type"].astype(str).str.split(".").str[-1].str[:-2]
     )
@@ -2202,7 +2236,7 @@ def cross_carrier_impact_per_scenario(
     # Drop the ambiguous "heat/gas" source bucket (generic Junction); the
     # static map can't say which grid the junction lives on.
     df = df[df["source_carrier"] != "heat/gas"]
-    df["impact_abs"] = df["impact"].abs()
+    df["impact_abs"] = _ec.harm_from_impact(df["impact"])
 
     source_order = ["electricity", "heat", "gas", "multi"]
     target_order = ["electricity", "heat", "gas"]
@@ -2365,7 +2399,7 @@ def cross_carrier_impact_aggregated(
     df["source_carrier"] = df["_type_name"].map(TYPE_TO_CARRIER)
     df = df[df["source_carrier"].notna()]
     df = df[df["source_carrier"] != "heat/gas"]
-    df["impact_abs"] = df["impact"].abs()
+    df["impact_abs"] = _ec.harm_from_impact(df["impact"])
 
     source_order = ["electricity", "heat", "gas", "multi"]
     target_order = ["electricity", "heat", "gas"]

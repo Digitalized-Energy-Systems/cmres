@@ -120,6 +120,7 @@ def main():
     grids: List[str] = args.grids or [
         p.stem.replace("single_removal_shed_", "")
         for p in sorted(args.shed_dir.glob("single_removal_shed_*.csv"))
+        if "_shard_" not in p.stem
     ]
     if not grids:
         print(f"no shed CSVs in {args.shed_dir}", file=sys.stderr)

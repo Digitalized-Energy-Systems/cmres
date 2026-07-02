@@ -144,12 +144,14 @@ def _solve_load_shed(
     otherwise the analytical shed and the MC actuals will use different
     external slack capacities and the comparison is biased.
     """
-    # ``auto_priority_floor=True`` (monee default) auto-tunes
-    # ``demand_weight`` so demand shed dominates the formulation-level
-    # tightening terms (MISOCP Joule loss, McCormick epigraph, etc.)
-    # that get added to ``pm.obj`` by the solver-side formulations.
-    # That keeps the single-removal metric monotone (baseline ≤ removed
-    # shed) without us having to hand-pick a weight magnitude.
+    # ``lex_objectives=True`` puts demand shed in the top lexicographic
+    # tier, strictly prioritised over the formulation-level tightening
+    # terms (MISOCP Joule loss, McCormick epigraph, …) — this is what
+    # keeps the single-removal metric monotone (baseline ≤ removed shed),
+    # replacing the earlier ``auto_priority_floor`` weight-tuning approach
+    # (hence ``auto_priority_floor=False`` below). Note the monotonicity
+    # only holds up to solver tolerance: sheds below ~MIPGap × demand
+    # scale are noise (see eval_common.SHED_EPS on the consumer side).
     opt = mp.create_min_load_shedding_problem(
         bounds_vm=(0.9, 1.1),
         bounds_pressure=(0.85, 1.25),
@@ -470,10 +472,22 @@ def main():
 
     if args.merge:
         parts: List[pd.DataFrame] = []
+        missing: List[int] = []
         for k in range(1, args.n_shards + 1):
             p = args.output_dir / f"single_removal_shed_{args.grid}_shard_{k}_of_{args.n_shards}.csv"
             if p.exists():
                 parts.append(pd.read_csv(p))
+            else:
+                missing.append(k)
+        if missing:
+            # A silently absent shard drops 1/n of the components from the
+            # ground truth with no downstream symptom — refuse to merge.
+            print(
+                f"missing shard CSV(s) {missing} of {args.n_shards} in "
+                f"{args.output_dir}; re-run those shards before merging.",
+                file=sys.stderr,
+            )
+            return 1
         if not parts:
             print(f"no shard CSVs found in {args.output_dir}", file=sys.stderr)
             return 1
@@ -488,11 +502,8 @@ def main():
 
     # Single-shard or unsharded run.
     # Build the network from test_grids (same source-of-truth the MC
-    # resilience simulation consumes) and snapshot it to in-memory bytes
-    # so each per-component iteration deserialises a fresh Pyomo Var
-    # state. ``Network.copy()`` doesn't reliably round-trip Vars (they
-    # come back as floats), and rebuilding from scratch via the factory
-    # would re-pay the simbench load + formulation cost on every solve.
+    # resilience simulation consumes); ``_resolve_grid`` hands out fresh
+    # ``pristine.copy()`` instances per iteration (see its docstring).
     net_factory, ext_bounds, net, include_coupling_points = _resolve_grid(args.grid)
     log.info("built %s from test_grids.ALL_GRIDS (%s)", args.grid, net.statistics())
     log.info("ext-grid bounds for %s: %s", args.grid, ext_bounds)

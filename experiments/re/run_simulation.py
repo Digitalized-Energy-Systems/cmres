@@ -153,6 +153,32 @@ def run_experiment(grid_name: str, shard: int = 0, n_shards: int = 1):
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # performance.csv / failure.csv are append-only (per-run flocked
+    # appends), and run ids restart at the shard offset on every launch. A
+    # re-run into the same directory therefore produces two scenarios
+    # sharing an (experiment, id) key, and create_impact_df silently joins
+    # one run's failures onto the other run's perf rows. Refuse the
+    # unsharded case outright; shards legitimately co-append within one
+    # launch, so for shard 1 only warn (it may start after shard 2).
+    stale = [
+        p for p in (out_dir / "performance.csv", out_dir / "failure.csv")
+        if p.exists()
+    ]
+    if stale:
+        names = ", ".join(p.name for p in stale)
+        if not is_shard:
+            raise FileExistsError(
+                f"{names} already present in {out_dir} — appending a second "
+                "launch corrupts run-id attribution. Move or delete the old "
+                "artefacts first."
+            )
+        if shard == 1:
+            log.warning(
+                "%s already present in %s — if these are from a PREVIOUS "
+                "launch (not this one's sibling shards), run-id collisions "
+                "will corrupt impact attribution.", names, out_dir,
+            )
+
     # Per-(experiment|shard) log file so concurrent shards don't fight over it.
     log_filename = (
         f"shard_{shard}_of_{n_shards}.log" if is_shard else "run.log"

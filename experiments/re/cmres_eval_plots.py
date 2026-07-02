@@ -257,7 +257,7 @@ SECTOR_PRETTY: Dict[str, str] = {
 
 #: Canonical sector display order. Anything that builds a sector legend
 #: should iterate this list (skipping keys it doesn't carry).
-SECTOR_ORDER: List[str] = ["total", "multi", "power", "heat", "gas"]
+SECTOR_ORDER: List[str] = ["total", "ranked", "multi", "power", "heat", "gas"]
 
 
 def outlined_marker(color: str) -> dict:
@@ -1659,14 +1659,26 @@ def _e16_rho_per_sector_bar_aggregated(
         return go.Figure()
     pooled = pd.concat(frames, ignore_index=True)
 
-    # Same partitioning as cmres_eval._E16 sector_specs.
+    # Same partitioning as cmres_eval._E16 sector_specs. "ranked" is the
+    # carrier-rank pooled slice (within-carrier percentile ranks pooled
+    # across carriers) — the de-confounded overall ρ; see the sector-spec
+    # comment above ANALYTICAL_SECTOR_SPECS.
     sector_specs = [
-        ("total", "total_shed", None),
-        ("multi", "total_shed", "cp"),
-        ("power", "power_shed", "branch"),
-        ("heat",  "heat_shed",  "branch"),
-        ("gas",   "gas_shed",   "branch"),
+        ("total",  "total_shed", None),
+        ("ranked", "_ranked_ref", "branch"),
+        ("multi",  "total_shed", "cp"),
+        ("power",  "power_shed", "branch"),
+        ("heat",   "heat_shed",  "branch"),
+        ("gas",    "gas_shed",   "branch"),
     ]
+    from eval_common import carrier_rank_pooled as _crp
+    _branch_mask = (
+        pooled["kind"] == "branch" if "kind" in pooled.columns
+        else pd.Series(True, index=pooled.index)
+    )
+    ranked_pool = _crp(
+        pooled, ["power_shed", "heat_shed", "gas_shed"], _branch_mask
+    )
 
     # Candidate metric columns: any non-meta column with float-like values
     # present on every scenario. Exclude the known-shed / id / metadata
@@ -1697,19 +1709,25 @@ def _e16_rho_per_sector_bar_aggregated(
     for m in candidate_metrics:
         row: dict = {"metric": m}
         for tag, col, kind_filter in sector_specs:
-            sub = pooled[pooled[m].notna()]
-            if col not in sub.columns:
-                row[f"rho_{tag}"] = float("nan")
-                row[f"n_{tag}"] = 0
-                continue
-            if kind_filter == "branch" and "kind" in sub.columns:
-                sub = sub[sub["kind"] == "branch"]
-            elif kind_filter == "cp" and "kind" in sub.columns:
-                sub = sub[sub["kind"] != "branch"]
-            if tag != "total":
-                sub = sub[sub[col].notna() & (sub[col] > 0)]
+            if tag == "ranked":
+                sub = (ranked_pool[ranked_pool[m].notna()]
+                       if m in ranked_pool.columns else ranked_pool.iloc[0:0])
             else:
-                sub = sub[sub[col].notna()]
+                sub = pooled[pooled[m].notna()]
+                if col not in sub.columns:
+                    row[f"rho_{tag}"] = float("nan")
+                    row[f"n_{tag}"] = 0
+                    continue
+                if kind_filter == "branch" and "kind" in sub.columns:
+                    sub = sub[sub["kind"] == "branch"]
+                elif kind_filter == "cp" and "kind" in sub.columns:
+                    sub = sub[sub["kind"] != "branch"]
+                if tag != "total":
+                    # Analytical-shed noise floor; see eval_common.SHED_EPS.
+                    from eval_common import SHED_EPS as _EPS
+                    sub = sub[sub[col].notna() & (sub[col] > _EPS)]
+                else:
+                    sub = sub[sub[col].notna()]
             if len(sub) < 3 or sub[m].nunique() < 2 or sub[col].nunique() < 2:
                 row[f"rho_{tag}"] = float("nan")
                 row[f"ci_lo_{tag}"] = float("nan")
@@ -1759,6 +1777,7 @@ _E16_RANK_METRICS = [
     "predicted_score", "predicted_score_cp_aware", "predicted_score_balanced",
     "predicted_stress", "topo_bc", "stress_bc", "katz_score", "vitality_score",
     "local_score", "self_score",
+    "predicted_power", "predicted_heat", "predicted_gas",
 ]
 
 # ── Shared per-sector criticality-figure code path (analytical E16 + MC) ───────
@@ -1766,19 +1785,28 @@ _E16_RANK_METRICS = [
 # the component subset — None = every row, "branch" = single-carrier components,
 # "cp" = coupling points. The two simulations differ ONLY in the reference
 # columns, so the same builders serve both.
+#
+# The "ranked" tag carries a tuple of per-carrier columns instead of one
+# reference: its slice is built by pooling within-carrier percentile ranks
+# (eval_common.carrier_rank_pooled). That is the de-confounded overall
+# number — pooling raw sheds across carriers ("total") flips ρ negative via
+# Simpson (CP rows + cross-carrier scale mixing) even when every
+# within-carrier ρ is positive.
 ANALYTICAL_SECTOR_SPECS = [
-    ("total", "total_shed", None),
-    ("power", "power_shed", "branch"),
-    ("heat",  "heat_shed",  "branch"),
-    ("gas",   "gas_shed",   "branch"),
-    ("multi", "total_shed", "cp"),
+    ("total",  "total_shed", None),
+    ("ranked", ("power_shed", "heat_shed", "gas_shed"), "branch"),
+    ("power",  "power_shed", "branch"),
+    ("heat",   "heat_shed",  "branch"),
+    ("gas",    "gas_shed",   "branch"),
+    ("multi",  "total_shed", "cp"),
 ]
 MC_SECTOR_SPECS = [
-    ("total", "actual_total",       None),
-    ("power", "actual_electricity", "branch"),
-    ("heat",  "actual_heat",        "branch"),
-    ("gas",   "actual_gas",         "branch"),
-    ("multi", "actual_total",       "cp"),
+    ("total",  "actual_total", None),
+    ("ranked", ("actual_electricity", "actual_heat", "actual_gas"), "branch"),
+    ("power",  "actual_electricity", "branch"),
+    ("heat",   "actual_heat",        "branch"),
+    ("gas",    "actual_gas",         "branch"),
+    ("multi",  "actual_total",       "cp"),
 ]
 _RANK_CP_TYPES = {"CHPHG", "PowerToGas", "PowerToHeatHG"}
 
@@ -1795,44 +1823,37 @@ def _cp_mask(df: pd.DataFrame) -> pd.Series:
 
 
 def _sector_subset(pooled: pd.DataFrame, metric: str, tag: str,
-                   col: str, kind_filter) -> pd.DataFrame:
+                   col, kind_filter):
+    """Slice ``pooled`` for one sector spec. Returns ``(sub, ref_col)`` —
+    the reference column can differ from ``col`` for derived slices (the
+    "ranked" tag builds a within-carrier percentile-rank pool and returns
+    its synthetic reference column)."""
     sub = pooled[pooled[metric].notna()]
+    if isinstance(col, tuple):
+        from eval_common import carrier_rank_pooled
+        present = [c for c in col if c in sub.columns]
+        if not present:
+            return sub.iloc[0:0], "_ranked_ref"
+        mask = ~_cp_mask(sub) if kind_filter == "branch" \
+            else pd.Series(True, index=sub.index)
+        return carrier_rank_pooled(sub, present, mask), "_ranked_ref"
     if col not in sub.columns:
-        return sub.iloc[0:0]
+        return sub.iloc[0:0], col
     if kind_filter == "branch":
         sub = sub[~_cp_mask(sub)]
     elif kind_filter == "cp":
         sub = sub[_cp_mask(sub)]
     if tag != "total":
-        sub = sub[sub[col].notna() & (sub[col] > 0)]
+        # Analytical sheds: > SHED_EPS, not > 0 — MIPGap-level sheds are
+        # solver noise and their inclusion inflates carrier-aware
+        # predictors. MC actuals are probability-weighted (genuinely small
+        # values exist), so they keep the sampled-at-all MC_FAILED_EPS.
+        from eval_common import MC_FAILED_EPS, SHED_EPS
+        eps = MC_FAILED_EPS if str(col).startswith("actual") else SHED_EPS
+        sub = sub[sub[col].notna() & (sub[col] > eps)]
     else:
         sub = sub[sub[col].notna()]
-    return sub
-
-
-def _rank_ndcg_at_k(scores, gains, kk):
-    try:
-        from eval_common import ndcg as _ndcg
-    except Exception:  # pragma: no cover
-        _ndcg = None
-    g = np.clip(np.asarray(gains, float), 0, None)
-    if _ndcg is not None:
-        return float(_ndcg(g, np.asarray(scores, float), k=kk))
-    order = np.argsort(-np.asarray(scores, float))[:kk]
-    disc = 1.0 / np.log2(np.arange(2, len(order) + 2))
-    dcg = (g[order] * disc).sum()
-    ig = np.sort(g)[::-1][:kk]
-    idcg = (ig * disc[:len(ig)]).sum()
-    return dcg / idcg if idcg > 0 else float("nan")
-
-
-def _rank_prec_at_k(scores, gains, kk):
-    s = np.asarray(scores, float)
-    g = np.asarray(gains, float)
-    kk = min(kk, len(s))
-    if kk < 1:
-        return float("nan")
-    return len(set(np.argsort(-s)[:kk]) & set(np.argsort(-g)[:kk])) / kk
+    return sub, col
 
 
 def _rank_metrics_present(pooled: pd.DataFrame) -> List[str]:
@@ -1841,27 +1862,53 @@ def _rank_metrics_present(pooled: pd.DataFrame) -> List[str]:
             and pooled[m].nunique() >= 2]
 
 
+_RANK_MEASURE_KEYS = ("kendall", "wtau", "rndcg", "rprec")
+# Measures whose sign encodes ranking *direction* (a strong negative is an
+# inverted-but-informative ranker) — the delta figures compare magnitudes
+# |B|−|A| for these. rNDCG / rP@k negatives mean "worse than random", which
+# is NOT invertible information, so their deltas stay signed.
+_RANK_SIGNED_CORR_KEYS = frozenset({"kendall", "wtau"})
+
+
+def _slice_k(k: int, n: int) -> int:
+    """Effective cutoff k* for a slice: the top quintile clamped to 5..k.
+    A fixed k across slice sizes makes top-k measures incomparable — @10 on
+    the ~14-row CP slice is nearly the whole list."""
+    from eval_common import default_ndcg_k
+    return max(1, min(int(k), default_ndcg_k(n)))
+
+
 def per_sector_ranking_table(pooled, sector_specs, metrics, k=10):
-    """{(metric, tag): {"kendall":…, "ndcg":…, "prec":…}}, n_total — Kendall τ,
-    NDCG@k and precision@k of each metric against ``sector_specs``' reference
-    column, per sector slice."""
-    from scipy.stats import kendalltau as _kendalltau
+    """{(metric, tag): {"kendall":…, "wtau":…, "rndcg":…, "rprec":…}}, n_total.
+
+    Kendall τ, top-weighted τ (hyperbolic weights — head agreement, the
+    deployment-relevant part of the ranking), random-normalised NDCG@k* and
+    random-normalised precision@k* of each metric against the sector's
+    reference, per slice. k* adapts to the slice size (:func:`_slice_k`);
+    the random normalisation makes values comparable across slice sizes
+    (0 = chance, 1 = perfect, negative = worse than random).
+    """
+    from scipy.stats import kendalltau as _kendalltau, weightedtau as _wtau
+    from eval_common import random_normalized_ndcg, rprecision_at_k
     table: dict = {}
     n_total = 0
+    nan_row = {key: np.nan for key in _RANK_MEASURE_KEYS}
     for m in metrics:
         for tag, col, kf in sector_specs:
-            sub = _sector_subset(pooled, m, tag, col, kf)
+            sub, ref_col = _sector_subset(pooled, m, tag, col, kf)
             if tag == "total":
                 n_total = max(n_total, len(sub))
-            if (col not in pooled.columns or len(sub) < 3
-                    or sub[m].nunique() < 2 or sub[col].nunique() < 2):
-                table[(m, tag)] = {"kendall": np.nan, "ndcg": np.nan, "prec": np.nan}
+            if (len(sub) < 3 or sub[m].nunique() < 2
+                    or sub[ref_col].nunique() < 2):
+                table[(m, tag)] = dict(nan_row)
                 continue
-            x, ref = sub[m].values, sub[col].values
+            x, ref = sub[m].values, sub[ref_col].values
+            kk = _slice_k(k, len(sub))
             table[(m, tag)] = {
                 "kendall": float(_kendalltau(x, ref).correlation),
-                "ndcg": _rank_ndcg_at_k(x, ref, k),
-                "prec": _rank_prec_at_k(x, ref, k),
+                "wtau": float(_wtau(x, ref).correlation),
+                "rndcg": random_normalized_ndcg(ref, x, k=kk),
+                "rprec": rprecision_at_k(ref, x, kk),
             }
     return table, n_total
 
@@ -1881,14 +1928,14 @@ def per_sector_spearman_table(pooled, sector_specs, metrics):
     n_total = 0
     for m in metrics:
         for tag, col, kf in sector_specs:
-            sub = _sector_subset(pooled, m, tag, col, kf)
+            sub, ref_col = _sector_subset(pooled, m, tag, col, kf)
             if tag == "total":
                 n_total = max(n_total, len(sub))
-            if (col not in pooled.columns or len(sub) < 3
-                    or sub[m].nunique() < 2 or sub[col].nunique() < 2):
+            if (len(sub) < 3 or sub[m].nunique() < 2
+                    or sub[ref_col].nunique() < 2):
                 table[(m, tag)] = {"rho": np.nan}
                 continue
-            rho, _p, _lo, _hi = _sp(sub[m], sub[col])
+            rho, _p, _lo, _hi = _sp(sub[m], sub[ref_col])
             table[(m, tag)] = {"rho": float(rho)}
     return table, n_total
 
@@ -1927,23 +1974,30 @@ def render_per_sector_panels(table, metrics, sector_tags, panels, *, title,
 
 
 def ranking_per_sector_figure(pooled, sector_specs, *, title, k=10):
-    """Per-sector Kendall τ / NDCG@k / precision@k (3 panels). ``title`` may
-    contain ``{n}`` for the total-sector sample size."""
+    """Per-sector Kendall τ / weighted τ / rNDCG@k* / rP@k* (4 panels).
+    ``title`` may contain ``{n}`` for the total-sector sample size. k* is
+    the per-slice cutoff (top quintile, 5..k); the r-prefixed measures are
+    random-baseline-normalised so slices of different size are comparable
+    (0 = chance, negative = worse than random)."""
     metrics = _rank_metrics_present(pooled)
     if not metrics:
         return go.Figure()
     table, n_total = per_sector_ranking_table(pooled, sector_specs, metrics, k)
-    panels = [("kendall", "Kendall τ", [-0.5, 1.0]),
-              ("ndcg", f"NDCG@{k}", [0.0, 1.0]),
-              ("prec", f"Precision@{k}", [0.0, 1.0])]
+    panels = [("kendall", "Kendall τ", [-1.0, 1.0]),
+              ("wtau", "Weighted τ (top-heavy)", [-1.0, 1.0]),
+              ("rndcg", "rNDCG@k*", [-1.0, 1.0]),
+              ("rprec", "rP@k*", [-1.0, 1.0])]
     tags = [t for t, _, _ in sector_specs]
-    return render_per_sector_panels(table, metrics, tags, panels,
-                                    title=title.format(n=n_total))
+    return render_per_sector_panels(
+        table, metrics, tags, panels,
+        title=title.format(n=n_total)
+        + f"<br><sup>k* = top quintile of each slice, clamped to 5..{k}; "
+          "r-measures: 0 = random, 1 = ideal</sup>")
 
 
 def ranking_per_sector_delta_figure(pooled, specs_a, specs_b, *, title, k=10,
                                     drange=1.0):
-    """Δ (B − A) of the per-sector ranking measures, same 3-panel form (used for
+    """Δ (B − A) of the per-sector ranking measures, same 4-panel form (used for
     MC − analytical). ``specs_a``/``specs_b`` are sector-spec lists sharing the
     same tags but different reference columns."""
     metrics = _rank_metrics_present(pooled)
@@ -1954,11 +2008,21 @@ def ranking_per_sector_delta_figure(pooled, specs_a, specs_b, *, title, k=10,
     delta = {}
     for key in set(ta) | set(tb):
         a, b = ta.get(key, {}), tb.get(key, {})
-        delta[key] = {mk: (b.get(mk, np.nan) - a.get(mk, np.nan))
-                      for mk in ("kendall", "ndcg", "prec")}
-    panels = [("kendall", "Δ Kendall τ", [-drange, drange]),
-              ("ndcg", f"Δ NDCG@{k}", [-drange, drange]),
-              ("prec", f"Δ Precision@{k}", [-drange, drange])]
+        # Correlation measures (τ, weighted τ): Δ of magnitudes |B| − |A|
+        # compares ranking *strength*, so a sign flip (−0.4 → +0.4) reads as
+        # "no change" rather than a spurious +0.8. rNDCG/rP@k stay signed —
+        # their negatives mean "worse than random", not "inverted ranking",
+        # so |·| would misread a degradation as strength.
+        delta[key] = {
+            mk: ((abs(b.get(mk, np.nan)) - abs(a.get(mk, np.nan)))
+                 if mk in _RANK_SIGNED_CORR_KEYS
+                 else (b.get(mk, np.nan) - a.get(mk, np.nan)))
+            for mk in _RANK_MEASURE_KEYS
+        }
+    panels = [("kendall", "Δ|Kendall τ|", [-drange, drange]),
+              ("wtau", "Δ|Weighted τ|", [-drange, drange]),
+              ("rndcg", "Δ rNDCG@k*", [-drange, drange]),
+              ("rprec", "Δ rP@k*", [-drange, drange])]
     tags = [t for t, _, _ in specs_a]
     return render_per_sector_panels(delta, metrics, tags, panels,
                                     title=title.format(n=n))
@@ -1972,10 +2036,12 @@ def spearman_per_sector_delta_figure(pooled, specs_a, specs_b, *, title,
         return go.Figure()
     ta, _ = per_sector_spearman_table(pooled, specs_a, metrics)
     tb, n = per_sector_spearman_table(pooled, specs_b, metrics)
-    delta = {key: {"rho": tb.get(key, {}).get("rho", np.nan)
-                   - ta.get(key, {}).get("rho", np.nan)}
+    # Δ of magnitudes (|B| − |A|): compares ranking strength, so a sign flip
+    # between the two references doesn't masquerade as a large Δρ.
+    delta = {key: {"rho": abs(tb.get(key, {}).get("rho", np.nan))
+                   - abs(ta.get(key, {}).get("rho", np.nan))}
              for key in set(ta) | set(tb)}
-    panels = [("rho", "Δ Spearman ρ", [-drange, drange])]
+    panels = [("rho", "Δ|Spearman ρ|", [-drange, drange])]
     tags = [t for t, _, _ in specs_a]
     return render_per_sector_panels(delta, metrics, tags, panels,
                                     title=title.format(n=n), width=760)
@@ -2097,6 +2163,101 @@ def _e16_ranking_per_sector_aggregated(merged_files: Sequence[Path],
               "vs analytical shed")
 
 
+def cp_pooled_across_scenarios_figure(merged_files: Sequence[Path]) -> go.Figure:
+    """CP criticality ranking pooled across scenarios.
+
+    The per-scenario CP slice is tiny (n≈14): its rank statistics are
+    dominated by noise (τ CI ≈ ±0.5) and its P@10 random baseline is ≈0.7,
+    so the per-scenario "multi" bars cannot support any stable claim about
+    CP ranking. Pooling fixes the power problem: both the shed references
+    and every metric are percentile-ranked *within* each scenario (neither
+    is on a common scale across scenarios), then concatenated into one
+    n≈200 sample per family and correlated.
+    """
+    try:
+        from eval_common import spearman_with_ci as _sp
+    except Exception:  # pragma: no cover
+        return go.Figure()
+    frames: List[pd.DataFrame] = []
+    for mf in merged_files or []:
+        try:
+            d = pd.read_csv(mf)
+        except Exception:
+            continue
+        if d.empty or "total_shed" not in d.columns:
+            continue
+        cp = d[_cp_mask(d)]
+        if len(cp) < 3:
+            continue
+        keep = [m for m in _E16_RANK_METRICS if m in cp.columns]
+        f = cp[keep].rank(pct=True)
+        f["shed_rank"] = cp["total_shed"].rank(pct=True)
+        if "actual_total" in cp.columns:
+            f["mc_rank"] = cp["actual_total"].rank(pct=True)
+        frames.append(f)
+    if not frames:
+        return go.Figure()
+    pool = pd.concat(frames, ignore_index=True)
+
+    recs: List[dict] = []
+    for m in _E16_RANK_METRICS:
+        if m not in pool.columns:
+            continue
+        rec: dict = {"metric": m}
+        for ref, key in [("shed_rank", "shed"), ("mc_rank", "mc")]:
+            if ref not in pool.columns:
+                continue
+            s = pool[[m, ref]].dropna()
+            if len(s) < 5 or s[m].nunique() < 2 or s[ref].nunique() < 2:
+                continue
+            rho, _p, lo, hi = _sp(s[m], s[ref])
+            rec[f"rho_{key}"] = rho
+            rec[f"lo_{key}"] = lo
+            rec[f"hi_{key}"] = hi
+            rec[f"n_{key}"] = int(len(s))
+        if len(rec) > 1:
+            recs.append(rec)
+    if not recs:
+        return go.Figure()
+    df = pd.DataFrame(recs)
+    if "rho_shed" not in df.columns:
+        return go.Figure()
+    df = df.sort_values("rho_shed", ascending=True, na_position="first")
+
+    fig = go.Figure()
+    for key, label, color in [("shed", "vs analytical shed", "#7e57c2"),
+                              ("mc",   "vs MC actual",       "#00897b")]:
+        rho_col = f"rho_{key}"
+        if rho_col not in df.columns or not df[rho_col].notna().any():
+            continue
+        rho = df[rho_col].astype(float)
+        err_hi = (df[f"hi_{key}"] - rho).clip(lower=0)
+        err_lo = (rho - df[f"lo_{key}"]).clip(lower=0)
+        fig.add_trace(go.Bar(
+            y=metric_label(df["metric"].tolist()), x=rho, orientation="h",
+            name=label,
+            error_x=dict(type="data", symmetric=False,
+                         array=err_hi, arrayminus=err_lo,
+                         thickness=1.2, width=4, color=pub_style.MUTED_COLOR),
+            marker=pub_style.bar_marker(color),
+        ))
+    if not fig.data:
+        return go.Figure()
+    n = int(df["n_shed"].max()) if "n_shed" in df.columns else 0
+    fig.add_vline(x=0, line=dict(color="#444", width=1, dash="dot"))
+    fig.update_layout(barmode="group")
+    pub_style.apply_theme(
+        fig,
+        title=(f"Coupling points pooled across scenarios (n={n}): "
+               "Spearman ρ on within-scenario percentile ranks"),
+        height=pub_style.hbar_height(len(df), 2),
+        width=pub_style.BAR_FIG_WIDTH, legend_top=True, font_bump=4,
+    )
+    fig.update_xaxes(title="Spearman ρ", range=[-1.05, 1.05])
+    fig.update_yaxes(title="")
+    return fig
+
+
 def _e16_per_sector_heatmap(df: pd.DataFrame) -> go.Figure:
     """Extended E16 heatmap with per-sector y-axis resolution.
 
@@ -2111,13 +2272,19 @@ def _e16_per_sector_heatmap(df: pd.DataFrame) -> go.Figure:
     if df is None or df.empty:
         return go.Figure()
 
-    sector_tags = ["total", "multi", "power", "heat", "gas"]
+    # Filtered by column presence so pre-"ranked" CSVs don't render an
+    # all-NaN row block per scenario.
+    sector_tags = [
+        t for t in ("total", "ranked", "multi", "power", "heat", "gas")
+        if f"rho_vs_{t}_shed" in df.columns
+    ]
     sector_short = {
-        "total": "Total",
-        "multi": "Multi",
-        "power": "Electricity",
-        "heat":  "Heat",
-        "gas":   "Gas",
+        "total":  "Total",
+        "ranked": "Pooled-rank",
+        "multi":  "Multi",
+        "power":  "Electricity",
+        "heat":   "Heat",
+        "gas":    "Gas",
     }
 
     scenarios = _scenario_order(df["scenario"].unique())
@@ -2364,6 +2531,16 @@ def plot_e16_single_removal(input_dir: Path, output_dir: Path) -> Optional[Path]
                 slugs.append(
                     _slug("e16_ranking_per_sector_pooled", class_label)
                 )
+            # Cross-scenario pooled CP ranking — the statistically usable
+            # replacement for the per-scenario "multi" bars (n≈14 each).
+            cp_fig = cp_pooled_across_scenarios_figure(sub_pooled_files)
+            if cp_fig.data:
+                figs.append(cp_fig)
+                titles.append(
+                    f"CP ranking — pooled across scenarios"
+                    f"{_title_suffix(class_label)}"
+                )
+                slugs.append(_slug("e16_cp_pooled", class_label))
             # MC-reference (RQMC actual impact) per-sector ranking, the
             # analytical↔MC deltas, and the per-network-type heterogeneity
             # check — all recomputed from the same pooled merged rows via the
@@ -2460,6 +2637,26 @@ def plot_e16_single_removal(input_dir: Path, output_dir: Path) -> Optional[Path]
                       line=dict(color="#888", dash="dash", width=1.2))
         fig.add_hline(y=0, line=dict(color="#bbb", width=1, dash="dot"))
         fig.add_vline(x=0, line=dict(color="#bbb", width=1, dash="dot"))
+        # MC-noise ceiling: ρ(analytical shed, MC actual) bounds what any
+        # metric can reach on the MC axis — values near the band are
+        # attenuation-limited, not metric-limited.
+        if sub_ceil is not None and not sub_ceil.empty:
+            _cv = sub_ceil["rho_shed_vs_mc"].astype(float).dropna()
+            if len(_cv):
+                fig.add_hrect(
+                    y0=float(_cv.min()), y1=float(_cv.max()),
+                    fillcolor="#00897b", opacity=0.10, line_width=0,
+                )
+                fig.add_hline(
+                    y=float(_cv.mean()),
+                    line=dict(color="#00897b", width=1.2, dash="dash"),
+                    annotation_text=(
+                        f"MC ceiling ρ ≈ {_cv.mean():.2f} "
+                        f"({_cv.min():.2f}–{_cv.max():.2f})"
+                    ),
+                    annotation_position="top left",
+                    annotation_font=dict(color="#00897b"),
+                )
         fig.update_layout(**_e16_layout(
             title=(
                 "ρ vs analytical shed (x) vs ρ vs MC actual (y)"

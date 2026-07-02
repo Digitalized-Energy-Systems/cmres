@@ -549,7 +549,10 @@ def experiment_e9_percolation(
         # for compound CPs, prefer the connected_to entry; for branch CPs,
         # use the from-node side.
         df = art.df_eval.copy()
-        df["_orig_id"] = df["cp_id"].astype(str).map(_extract_orig_id)
+        # No leading underscore: itertuples() renames underscore-leading
+        # columns to positional fields (_orig_id → _N), so r._orig_id
+        # raises AttributeError on the first row.
+        df["orig_id_ml"] = df["cp_id"].astype(str).map(_extract_orig_id)
         # Build a per-metric ranking dict {ml_node_id: score}.
         for m in metrics:
             if m not in df.columns:
@@ -557,11 +560,11 @@ def experiment_e9_percolation(
             scoring = df[df[m].notna()].copy()
             ranking: Dict = {}
             for r in scoring.itertuples(index=False):
-                if r._orig_id is None:
+                if r.orig_id_ml is None:
                     continue
                 # Try every carrier — whichever exists in G.
                 for carrier in ("power", "gas", "heat"):
-                    nid = (carrier, int(r._orig_id))
+                    nid = (carrier, int(r.orig_id_ml))
                     if G.has_node(nid):
                         prev = ranking.get(nid)
                         if prev is None or float(getattr(r, m)) > prev:
@@ -717,19 +720,20 @@ def experiment_e12_community(
         partition = cmc.community_partition(G, seed=42)
         bridge = cmc.bridge_score(G, partition)
         df = art.df_eval.copy()
-        df["_orig_id"] = df["cp_id"].astype(str).map(_extract_orig_id)
+        # No leading underscore — see the E9 comment (itertuples renames).
+        df["orig_id_ml"] = df["cp_id"].astype(str).map(_extract_orig_id)
         # Map to multilayer node and look up bridge / community.
         comp_bridge: List[float] = []
         comp_actual: List[float] = []
         comp_bc: List[float] = []
         for r in df.itertuples(index=False):
-            # ``_orig_id`` is the integer node id parsed from cp_id; a falsy
+            # ``orig_id_ml`` is the integer node id parsed from cp_id; a falsy
             # check would drop the legitimate id 0. Skip only when parsing
             # actually failed.
-            if r._orig_id is None:
+            if r.orig_id_ml is None:
                 continue
             for carrier in ("power", "gas", "heat"):
-                nid = (carrier, int(r._orig_id))
+                nid = (carrier, int(r.orig_id_ml))
                 if nid in bridge:
                     comp_bridge.append(float(bridge[nid]))
                     comp_actual.append(float(r.actual_total))
@@ -897,8 +901,26 @@ def _e16_join_id(cp_id, cp_type) -> str:
 
 
 def _e16_merge_one(art: "ScenarioArtefacts", shed_csv: Path) -> pd.DataFrame:
-    """Return the per-scenario merged dataframe (or empty if nothing joins)."""
+    """Return the per-scenario merged dataframe (or empty if nothing joins).
+
+    Per-carrier sheds are baseline-subtracted: every solved shed includes
+    the no-fault baseline (nonzero on several grids — up to 0.055 MW power
+    in the loadbearing family, above SHED_EPS), so without subtraction a
+    component that never touches a carrier still "affects" it at ≈baseline
+    and every branch enters that carrier's slice tied at the offset. Min-
+    shed is monotone (removal can only increase shed), so negatives after
+    subtraction are solver noise — clipped to 0.
+    """
     shed = pd.read_csv(shed_csv)
+    shed_cols = ["total_shed", "power_shed", "heat_shed", "gas_shed"]
+    base_rows = shed[shed["cp_id"] == "_baseline_"]
+    if not base_rows.empty:
+        for col in shed_cols:
+            if col not in shed.columns:
+                continue
+            base_val = float(base_rows.iloc[0][col] or 0.0)
+            if base_val > 0:
+                shed[col] = (shed[col] - base_val).clip(lower=0)
     shed = shed[shed["cp_id"] != "_baseline_"].copy()
     df = art.df_eval.copy()
     df["_join_cp_id"] = df.apply(
@@ -947,13 +969,18 @@ def experiment_e16_single_removal_validation(
     out_dir.mkdir(exist_ok=True, parents=True)
     if shed_dir is None:
         shed_dir = out_dir.parent / "single_removal_shed"
-    # Default to the canonical 10-metric set so E16 stays in sync with the
-    # cp_cn_evaluation scatter / correlation / NDCG figures. Override
-    # with the ``metrics`` argument when probing a one-off subset.
-    metrics = metrics or list(_ec.CORE_METRIC_COLS)
+    # Default to the canonical 10-metric set (kept in sync with the
+    # cp_cn_evaluation figures) plus the carrier-matched per-sector
+    # predictors — the composite mixes incomparable per-carrier scales, so
+    # each carrier's own predictor is evaluated alongside it. Override with
+    # the ``metrics`` argument when probing a one-off subset.
+    metrics = metrics or (
+        list(_ec.CORE_METRIC_COLS) + list(_ec.MATCHED_METRIC_COLS)
+    )
 
     rows: List[dict] = []
     ceiling_rows: List[dict] = []
+    cp_pool_frames: List[pd.DataFrame] = []
     for art in artefacts:
         shed_csv = Path(shed_dir) / f"single_removal_shed_{art.label}.csv"
         if not shed_csv.exists():
@@ -1001,6 +1028,37 @@ def experiment_e16_single_removal_validation(
             ("heat",  "heat_shed",  "branch"),
             ("gas",   "gas_shed",   "branch"),
         ]
+        # Carrier-rank pooled frame: within-carrier percentile ranks pooled
+        # across carriers. The de-confounded "overall" reference — pooling
+        # *raw* sheds across carriers flips ρ negative (Simpson: CP rows +
+        # cross-carrier scale mixing) even when every within-carrier ρ is
+        # positive, so the raw-pooled ``total`` column must not be read as
+        # an overall quality score. This one can.
+        branch_mask = (
+            merged["kind"] == "branch" if "kind" in merged.columns
+            else pd.Series(True, index=merged.index)
+        )
+        ranked_pool = _ec.carrier_rank_pooled(
+            merged, ["power_shed", "heat_shed", "gas_shed"], branch_mask
+        )
+
+        # Cross-scenario CP pool: CP rows with within-scenario percentile
+        # ranks of both references, so the tiny per-scenario CP population
+        # (n≈14) can be aggregated into one usable sample downstream.
+        cp_rows = merged[~branch_mask] if "kind" in merged.columns else merged.iloc[0:0]
+        if len(cp_rows) >= 3:
+            keep_cols = [c for c in metrics if c in cp_rows.columns]
+            # Metric columns are percentile-ranked within the scenario too:
+            # raw scores are not on a common scale across scenarios, and a
+            # between-scenario level shift would contaminate the pooled ρ.
+            pool = cp_rows[keep_cols].rank(pct=True)
+            pool["scenario"] = art.label
+            if "total_shed" in cp_rows.columns:
+                pool["shed_rank"] = cp_rows["total_shed"].rank(pct=True)
+            if "actual_total" in cp_rows.columns:
+                pool["mc_rank"] = cp_rows["actual_total"].rank(pct=True)
+            cp_pool_frames.append(pool)
+
         for m in metrics:
             if m not in merged.columns or merged[m].notna().sum() < 3:
                 continue
@@ -1020,11 +1078,14 @@ def experiment_e16_single_removal_validation(
                     sub = sub[sub["kind"] == "branch"]
                 elif kind_filter == "cp" and "kind" in sub.columns:
                     sub = sub[sub["kind"] != "branch"]
-                # Drop zero / NaN values for per-carrier slices; keep all
+                # Drop NaN and below-noise-floor values for per-carrier
+                # slices (``> SHED_EPS``, not ``> 0`` — MIPGap-level sheds
+                # are solver noise and their inclusion inflates carrier-
+                # aware predictors; see eval_common.SHED_EPS). Keep all
                 # rows for the "total" view so it can be compared 1-to-1
                 # with the rest of the eval pipeline.
                 if tag != "total":
-                    sub = sub[sub[col].notna() & (sub[col] > 0)]
+                    sub = sub[sub[col].notna() & (sub[col] > _ec.SHED_EPS)]
                 else:
                     sub = sub[sub[col].notna()]
                 if len(sub) < 3 or sub[m].nunique() < 2 or sub[col].nunique() < 2:
@@ -1037,6 +1098,32 @@ def experiment_e16_single_removal_validation(
                 row[lo_key] = lo
                 row[hi_key] = hi
                 row[n_key] = int(len(sub))
+                # Incremental ranking value beyond the 0-hop local-demand
+                # baseline: partial ρ | self_score. A metric can post a high
+                # raw per-carrier ρ purely by proxying demand mass — this
+                # column is what structure/physics adds on top.
+                if (kind_filter == "branch" and m != "self_score"
+                        and "self_score" in sub.columns and len(sub) >= 4):
+                    prho, pp = _ec.partial_spearman(
+                        sub[m], sub[col], sub["self_score"]
+                    )
+                    row[f"partial_rho_vs_{tag}_shed"] = prho
+                    row[f"partial_p_vs_{tag}_shed"] = pp
+
+            # Carrier-rank pooled slice (tag "ranked"): the legitimate
+            # overall number, same column naming scheme as the raw sectors.
+            rsub = ranked_pool[ranked_pool[m].notna()] if m in ranked_pool.columns \
+                else ranked_pool.iloc[0:0]
+            if len(rsub) >= 3 and rsub[m].nunique() >= 2:
+                rho, p, lo, hi = _spearman_with_ci(rsub[m], rsub["_ranked_ref"])
+                row["rho_vs_ranked_shed"] = rho
+                row["p_vs_ranked_shed"] = p
+                row["ci_lo_ranked_shed"] = lo
+                row["ci_hi_ranked_shed"] = hi
+            else:
+                row["rho_vs_ranked_shed"] = row["p_vs_ranked_shed"] = float("nan")
+                row["ci_lo_ranked_shed"] = row["ci_hi_ranked_shed"] = float("nan")
+            row["n_ranked"] = int(len(rsub))
             # Back-compat aliases so existing plot code keeps working.
             row["rho_vs_shed"] = row["rho_vs_total_shed"]
             row["p_vs_shed"] = row["p_vs_total_shed"]
@@ -1060,6 +1147,41 @@ def experiment_e16_single_removal_validation(
     if ceiling_rows:
         ceil_df = pd.DataFrame(ceiling_rows)
         ceil_df.to_csv(out_dir / "E16_shed_vs_mc_ceiling.csv", index=False)
+
+    # Cross-scenario pooled CP evaluation. Per scenario the CP slice is
+    # n≈14 — too small for stable rank statistics (P@10 random baseline
+    # 0.71, τ variance huge). Pooling within-scenario percentile ranks
+    # across scenarios gives one usable n≈200 sample per family.
+    if cp_pool_frames:
+        cp_all = pd.concat(cp_pool_frames, ignore_index=True)
+        cp_all["family"] = cp_all["scenario"].map(_ec.scenario_family)
+        cp_rows_out: List[dict] = []
+        for fam, fam_df in cp_all.groupby("family"):
+            for m in metrics:
+                if m not in fam_df.columns:
+                    continue
+                for ref, ref_tag in [("shed_rank", "shed"), ("mc_rank", "mc")]:
+                    if ref not in fam_df.columns:
+                        continue
+                    s = fam_df[[m, ref]].dropna()
+                    if len(s) < 5 or s[m].nunique() < 2:
+                        continue
+                    rho, p, lo, hi = _spearman_with_ci(s[m], s[ref])
+                    k = _ec.default_ndcg_k(len(s))
+                    cp_rows_out.append({
+                        "family": fam, "metric": m, "ref": ref_tag,
+                        "rho": rho, "p": p, "ci_lo": lo, "ci_hi": hi,
+                        "rndcg_at_k": _ec.random_normalized_ndcg(
+                            s[ref].values, s[m].values, k=k),
+                        "rprec_at_k": _ec.rprecision_at_k(
+                            s[ref].values, s[m].values, k),
+                        "k": k, "n": int(len(s)),
+                        "n_scenarios": int(fam_df["scenario"].nunique()),
+                    })
+        if cp_rows_out:
+            pd.DataFrame(cp_rows_out).to_csv(
+                out_dir / "E16_cp_pooled.csv", index=False
+            )
     return out_df
 
 

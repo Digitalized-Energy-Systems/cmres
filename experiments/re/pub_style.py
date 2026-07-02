@@ -42,6 +42,7 @@ SECTOR_COLOR = {
     "gas":         _eval.NETWORK_COLOR_MAP["gas"],          # #388e3c green
     "multi":       "#7e57c2",                               # purple — coupling pts
     "total":       "#444444",                               # dark grey
+    "ranked":      "#1565c0",                               # blue — carrier-rank pooled
 }
 
 # Colour-blind hatch per sector — the redundant channel layered on the kept
@@ -53,6 +54,7 @@ SECTOR_PATTERN = {
     "gas":         "/",
     "multi":       "x",
     "total":       "",
+    "ranked":      ".",
 }
 
 # Pretty sector labels (legend text).
@@ -62,7 +64,8 @@ SECTOR_PRETTY = {
     "heat":        "Heat",
     "gas":         "Gas",
     "multi":       "Multi (CPs)",
-    "total":       "Total",
+    "total":       "Total (raw pooled)",
+    "ranked":      "Overall (carrier-rank)",
 }
 
 # Qualitative palette for non-sector categoricals (metrics, scenarios, null

@@ -210,7 +210,15 @@ class SimpleResilienceModel(ResilienceModel):
 
             for branch in net.branches:
                 key = ("branch", branch.id)
-                if not branch.independent or key in already_failed:
+                # HeatExchanger is failable despite independent=False — the
+                # MC registry (mc.py) allocates Sobol dimensions for it and
+                # FAIL_BASE_PROBABILITY_MAP prices it at 0.1; skipping it
+                # here made those dimensions dead weight and left every HX
+                # with an unmeasured (NaN) impact.
+                if (
+                    not branch.independent
+                    and type(branch.model) is not mm.HeatExchanger
+                ) or key in already_failed:
                     continue
                 fail_prob, triggered = self._eval_failure_scenario(
                     branch, i, time, registry, scenario
