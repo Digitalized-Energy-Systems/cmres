@@ -1906,14 +1906,18 @@ def _stress_from_ptdf(
 ):
     """Aggregate |PTDF|/margin stress.
 
-    ``unit_factor`` converts the carrier's native "fraction of margin per
-    unit injection" into the common **per-MW** basis: the PTDF injects one
-    native flow unit (1 pu ≈ 1 MW for power, 1 kg/s ≈ 55 MW gas / ≈ 0.13 MW
-    heat), so without the factor the three carriers' stresses differ by up
-    to ~440× for identical physical loading — the mechanism behind the
-    composite's cross-carrier scale bias (PowerLine median score 0.78 vs
-    GasPipe 0.00). Within-carrier rankings are unaffected (constant
-    factor); the factor also puts CLIP_STRESS on one common scale.
+    ``unit_factor`` is the carrier's within-carrier normalisation constant
+    (the carrier's **median margin**, native units): samples become
+    ``|ptdf| · median(margin)/margin`` — dimensionless relative tightness,
+    O(1) for a typical branch of *every* carrier. This is what makes the
+    per-carrier stresses commensurate before they are composed into
+    ``total_stress``: without it the raw 1/margin scales differ by orders
+    of magnitude across carriers (injection units ~440×, margin-tightness
+    regimes more), the mechanism behind the composite's cross-carrier
+    scale bias. A per-MW injection conversion cancels inside the
+    median(margin)/margin ratio, so the median alone suffices.
+    Within-carrier rankings are unaffected (constant factor); the factor
+    also puts CLIP_STRESS on one common scale.
     """
     ptdf = np.asarray(ptdf, dtype=float)
     margins = np.asarray(margins, dtype=float)
@@ -1970,9 +1974,11 @@ class CarrierPTDFContext:
 
         self.power.update(
             {
-                # Per-MW stress conversion: power PTDF injects 1 pu against
-                # MVA margins — already the per-MW basis (MVA ≈ MW).
-                "stress_unit": 1.0,
+                # Within-carrier normalisation: median margin, so a branch
+                # at typical tightness scores |ptdf| — see _stress_from_ptdf.
+                "stress_unit": (
+                    float(np.median(margins)) if margins.size else 1.0
+                ),
                 "branches": branches,
                 "branch_ids": branch_ids,
                 "Ybus": Ybus,
@@ -2063,9 +2069,11 @@ class CarrierPTDFContext:
 
         self.gas.update(
             {
-                # Per-MW stress conversion: gas PTDF injects 1 kg/s against
-                # kg/s margins; 1 MW of gas = 1/(3.6·HHV) kg/s.
-                "stress_unit": 1.0 / (3.6 * _get_gas_hhv(monee_net)),
+                # Within-carrier normalisation: median margin (kg/s) — see
+                # _stress_from_ptdf.
+                "stress_unit": (
+                    float(np.median(margins)) if margins.size else 1.0
+                ),
                 "B": B,
                 "pipe_data": pipe_data,
                 "pipe_ids": pipe_ids,
@@ -2191,10 +2199,10 @@ class CarrierPTDFContext:
 
         self.heat.update(
             {
-                # Per-MW stress conversion: heat PTDF injects 1 kg/s against
-                # kg/s margins; 1 MW of heat = 1e6/(cp·ΔT) kg/s ≈ 8 kg/s.
-                "stress_unit": 1e6 / (
-                    self.cfg.HEAT_CP_J_PER_KG_K * self.cfg.HEAT_DELTA_T_K
+                # Within-carrier normalisation: median margin (kg/s) — see
+                # _stress_from_ptdf.
+                "stress_unit": (
+                    float(np.median(margins)) if margins.size else 1.0
                 ),
                 "B": B,
                 "pipe_data": pipe_data,
@@ -3242,6 +3250,7 @@ def mes_all_components_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig())
     )
 
     df_all = pd.concat([df_cp, df_non_cp], ignore_index=True, sort=False)
+    df_all = normalize_within_carrier(df_all, cfg)
     df_all = df_all.sort_values("score", ascending=False).reset_index(drop=True)
 
     # ---- Local metric ----
@@ -3560,6 +3569,75 @@ def mes_all_components_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig())
 # =============================================================================
 # Per-carrier atomic predictors (option 3 — separate predictions per sector)
 # =============================================================================
+
+
+_CARRIER_GROUP_BY_TYPE = {
+    "PowerLine": "power", "GenericPowerBranch": "power", "Trafo": "power",
+    "GasPipe": "gas",
+    "WaterPipe": "heat", "HeatExchanger": "heat",
+}
+
+
+def normalize_within_carrier(
+    df_all: pd.DataFrame, cfg: CPMetricConfig
+) -> pd.DataFrame:
+    """Within-carrier median normalisation of the composite's factors.
+
+    ``throughput`` and the stress columns are divided by their carrier
+    group's positive median (power/gas/heat branches via cp_type; CPs form
+    their own group), and the composed score columns are rescaled by the
+    same divisors, so ``score = throughput · total_stress · topo
+    (· adequacy)`` and ``Σ_c predicted_<c> = score`` keep holding exactly.
+
+    Motivation: even on a common per-unit basis the factors live on
+    incomparable per-carrier regimes (margin tightness, utilisation), so
+    the raw composite ranked essentially by carrier membership (PowerLine
+    median score ~2.4 vs GasPipe ~0.0004 on simbench LV). After this pass
+    a score reads "criticality relative to a typical component of its
+    class" — the cross-carrier comparable quantity. Within-group rankings
+    are unchanged (constant positive factor per group); all per-carrier
+    stress columns share the row's ``total_stress`` divisor so the
+    decomposition identity survives.
+    """
+    if df_all is None or df_all.empty:
+        return df_all
+
+    grp = df_all["cp_type"].map(_CARRIER_GROUP_BY_TYPE) \
+        if "cp_type" in df_all.columns else pd.Series(None, index=df_all.index)
+    if "is_cp" in df_all.columns:
+        grp = grp.where(~df_all["is_cp"].astype(bool), "cp")
+    grp = grp.fillna("other")
+
+    def _pos_median(s: pd.Series) -> float:
+        v = s.astype(float)
+        v = v[np.isfinite(v) & (v > 0)]
+        return float(v.median()) if len(v) else 1.0
+
+    ones = pd.Series(1.0, index=df_all.index)
+    med_thr = (
+        df_all.groupby(grp)["throughput"].transform(_pos_median)
+        if "throughput" in df_all.columns else ones
+    )
+    med_str = (
+        df_all.groupby(grp)["total_stress"].transform(_pos_median)
+        if "total_stress" in df_all.columns else ones
+    )
+
+    if "throughput" in df_all.columns:
+        df_all["throughput"] = df_all["throughput"].astype(float) / med_thr
+    for col in ("total_stress", "power_stress", "gas_stress", "heat_stress"):
+        if col in df_all.columns:
+            df_all[col] = df_all[col].astype(float) / med_str
+
+    divisor = ones.copy()
+    if not cfg.ABLATE_THROUGHPUT:
+        divisor = divisor * med_thr
+    if not cfg.ABLATE_STRESS:
+        divisor = divisor * med_str
+    for col in ("score", "score_cp_aware", "score_exergy"):
+        if col in df_all.columns:
+            df_all[col] = df_all[col].astype(float) / divisor
+    return df_all
 
 
 def attach_per_carrier_scores(
