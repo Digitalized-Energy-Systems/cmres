@@ -2540,13 +2540,13 @@ def cross_carrier_impact_aggregated(
 
     fig_total = _build_fig(
         total_mean, total_std,
-        y_title="Mean Σ |impact| (MW)",
+        y_title="Mean |impact| (MW)",
         unit="MW",
         show_n_components=False,
     )
     fig_per_comp = _build_fig(
         per_comp_mean, per_comp_std,
-        y_title="Mean |impact| per source-side component (MW)",
+        y_title="Mean |impact| per component (MW)",
         unit="MW / component",
         show_n_components=True,
     )
