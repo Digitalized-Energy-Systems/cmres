@@ -1047,6 +1047,33 @@ _build_branch_lookup = _ec.build_branch_lookup
 _match_impact_id = _ec.match_impact_id
 
 
+# Canonical metric row order shared by every ranking / correlation horizontal
+# bar (Spearman ρ, Kendall τ, NDCG@k, rNDCG@k, filtered-vs-unfiltered) so the
+# metrics line up row-for-row across figures instead of each being value-sorted
+# independently — the whole point is that a reader can scan one metric across
+# plots without it jumping rows. Order follows eval_common.CORE_METRICS, and
+# the row direction matches cmres_eval_plots.render_per_sector_panels (which
+# the pooled figure also renders) so the ρ bar and the per-sector Kendall/NDCG
+# panels agree within one report.
+_METRIC_ROW_ORDER = [label for _, label in _ec.CORE_METRICS]
+
+
+def _order_metric_rows(df, *, metric_col="Metric"):
+    """Reorder a per-metric bar dataframe to the canonical CORE_METRICS order.
+
+    Rows are emitted so the first CORE metric lands at the bottom of plotly's
+    horizontal bar (matching the shared per-sector panels). Labels outside the
+    canonical set sink below it, keeping their existing relative order."""
+    pos = {label: i for i, label in enumerate(_METRIC_ROW_ORDER)}
+    fallback = len(pos)
+    order_key = df[metric_col].map(lambda m: pos.get(m, fallback))
+    return (
+        df.assign(_row_order=order_key)
+        .sort_values("_row_order", ascending=True, kind="stable")
+        .drop(columns="_row_order")
+    )
+
+
 def _rho_hbar(metrics, rho, err_hi, err_lo, *, title, color=None,
               text=None, range_x=(-1.15, 1.30)):
     """Single-series horizontal Spearman-ρ bar in the shared publication
@@ -1409,8 +1436,9 @@ def cp_metric_vs_actual_impact(monee_net, impact_df_nt, network_type):
             "ci_lo": ci_lo, "ci_hi": ci_hi,
             "err_lo": rho - ci_lo, "err_hi": ci_hi - rho,
         })
-    # Ascending so the strongest metric lands on top of the horizontal bar.
-    rho_df = pandas.DataFrame(rho_rows).sort_values("Spearman ρ", ascending=True)
+    # Fixed canonical metric order (shared with the Kendall/NDCG, precision and
+    # filtered-vs-unfiltered figures) instead of value-sorting per plot.
+    rho_df = _order_metric_rows(pandas.DataFrame(rho_rows))
 
     # Horizontal + single publication hue: each bar is a *different* metric
     # (its identity is the y label), so a per-bar rainbow encodes nothing —
@@ -1560,10 +1588,10 @@ def cp_metric_vs_actual_impact(monee_net, impact_df_nt, network_type):
             "rNDCG@k": rndcg, "rndcg_lo": rndcg_lo, "rndcg_hi": rndcg_hi,
         })
 
-    # Sort by rNDCG@k (the most discriminating of the three NDCG variants
-    # — strips out the random-baseline inflation that masks differences
-    # between metrics on heavy-tailed actual_total).
-    acc_df = pandas.DataFrame(acc_rows).sort_values("rNDCG@k", ascending=True)
+    # Canonical metric order (shared with the ρ, precision and
+    # filtered-vs-unfiltered figures) so a metric occupies the same row here as
+    # in every other bar.
+    acc_df = _order_metric_rows(pandas.DataFrame(acc_rows))
 
     panels = [
         ("Kendall τ",       "Kendall τ", "τ_lo",     "τ_hi",     [-1.05, 1.05]),
@@ -1577,7 +1605,7 @@ def cp_metric_vs_actual_impact(monee_net, impact_df_nt, network_type):
                + ", rNDCG@" + str(_k_cut) + ", NDCG (bootstrap 95% CI)"),
     )
     figures.append(acc_fig)
-    best = acc_df.iloc[-1]["Metric"]
+    best = acc_df.loc[acc_df["rNDCG@k"].idxmax(), "Metric"]
     titles.append(
         f"Ranking Accuracy: Kendall τ, NDCG@{_k_cut}, rNDCG@{_k_cut}, NDCG "
         f"with Bootstrap 95% CI (best rNDCG@{_k_cut}: {best})"
@@ -1654,7 +1682,7 @@ def cp_metric_vs_actual_impact(monee_net, impact_df_nt, network_type):
                 "rho_all": rho_all, "ci_lo_all": lo_all, "ci_hi_all": hi_all,
                 "rho_mc": rho_mc, "ci_lo_mc": lo_mc, "ci_hi_mc": hi_mc,
             })
-        cmp_df = pandas.DataFrame(cmp_rows).sort_values("rho_mc", ascending=True)
+        cmp_df = _order_metric_rows(pandas.DataFrame(cmp_rows))
 
         cmp_fig = _filtered_vs_unfiltered_hbar(
             cmp_df, n_all, n_mc,
@@ -1862,7 +1890,7 @@ def _cp_only_metric_comparison_core(
         rho_rows.append({
             "Metric": lab, "rho": rho, "p": pval, "lo": lo, "hi": hi,
         })
-    rho_df = pandas.DataFrame(rho_rows).sort_values("rho", ascending=True)
+    rho_df = _order_metric_rows(pandas.DataFrame(rho_rows))
     rho_fig = _rho_hbar(
         rho_df["Metric"], rho_df["rho"],
         (rho_df["hi"] - rho_df["rho"]).clip(lower=0),
@@ -1911,7 +1939,7 @@ def _cp_only_metric_comparison_core(
         })
 
     if acc_rows:
-        acc_df = pandas.DataFrame(acc_rows).sort_values("rndcg", ascending=True)
+        acc_df = _order_metric_rows(pandas.DataFrame(acc_rows))
         panels = [
             ("Kendall τ",       "tau",   "tau_lo",   "tau_hi",   [-1.05, 1.05]),
             (f"NDCG@{_k_cut}",  "ndcgk", "ndcgk_lo", "ndcgk_hi", [-0.05, 1.05]),
@@ -2729,7 +2757,7 @@ def pooled_metric_comparison(pooled_df, output_dir, class_label: str = ""):
             "ci_lo": ci_lo, "ci_hi": ci_hi,
             "err_lo": rho - ci_lo, "err_hi": ci_hi - rho,
         })
-    rho_df = pandas.DataFrame(rho_rows).sort_values("Spearman ρ", ascending=True)
+    rho_df = _order_metric_rows(pandas.DataFrame(rho_rows))
 
     rho_bar = _rho_hbar(
         rho_df["Metric"], rho_df["Spearman ρ"],
@@ -2791,7 +2819,7 @@ def pooled_metric_comparison(pooled_df, output_dir, class_label: str = ""):
                 "rho_all": rho_all, "ci_lo_all": lo_all, "ci_hi_all": hi_all,
                 "rho_mc": rho_mc, "ci_lo_mc": lo_mc, "ci_hi_mc": hi_mc,
             })
-        cmp_df = pandas.DataFrame(cmp_rows).sort_values("rho_mc", ascending=True)
+        cmp_df = _order_metric_rows(pandas.DataFrame(cmp_rows))
 
         cmp_fig = _filtered_vs_unfiltered_hbar(
             cmp_df, n_all, n_mc,
