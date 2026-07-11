@@ -2219,6 +2219,243 @@ def pooled_resilience_per_scenario(perf_df: pandas.DataFrame, output_dir: str):
     )
 
 
+def generation_capacity_per_sector(monee_net) -> Dict[str, float]:
+    """Installed generation capacity per carrier in MW.
+
+    Sums in-grid primary generation (PowerGenerator, gas Source,
+    HeatGenerator) plus the rated CP outputs (CHP/CHPHG power+heat,
+    PowerToGas gas, PowerToHeatHG heat, GasToPower power), so the
+    loadbearing family — where CP capacity replaces primary generation —
+    stays comparable to the additive families. Ext-grid slack is excluded:
+    it is a bounded import budget, not installed capacity.
+    """
+    import monee.model as mm
+
+    hhv = 15.3
+    for n in monee_net.nodes_by_type(mm.Junction):
+        g = n.grid
+        if (g is not None and not isinstance(g, list)
+                and getattr(g, "name", None) == "gas"):
+            hhv = float(getattr(g, "higher_heating_value_kwh_per_kg", 15.3))
+            break
+
+    cap = {"electricity": 0.0, "heat": 0.0, "gas": 0.0}
+    for c in monee_net.childs_by_type(mm.PowerGenerator):
+        cap["electricity"] += abs(float(mm.value(c.model.p_mw) or 0.0))
+    for c in monee_net.childs_by_type(mm.HeatGenerator):
+        cap["heat"] += abs(float(mm.value(c.model.q_mw_heat) or 0.0))
+    for c in monee_net.childs_by_type(mm.Source):
+        if c.grid is not None and getattr(c.grid, "name", None) == "gas":
+            kgps = abs(float(mm.value(c.model.mass_flow_kgs) or 0.0))
+            cap["gas"] += kgps * 3.6 * hhv
+
+    for cp in monee_net.compounds:
+        m = cp.model
+        cn = type(m).__name__
+        if cn in ("CHP", "CHPHG"):
+            kgps = abs(float(getattr(m, "mass_flow_setpoint_kgs", 0.0) or 0.0))
+            gas_mw = kgps * 3.6 * hhv
+            cap["electricity"] += gas_mw * float(
+                getattr(m, "efficiency_power", 0.0) or 0.0)
+            cap["heat"] += gas_mw * float(
+                getattr(m, "efficiency_heat", 0.0) or 0.0)
+        elif cn == "PowerToHeat":
+            cap["heat"] += abs(float(getattr(m, "heat_energy_mw", 0.0) or 0.0))
+    for br in monee_net.branches:
+        m = br.model
+        cn = type(m).__name__
+        if cn == "PowerToHeatHG":
+            cap["heat"] += abs(float(getattr(m, "heat_energy_mw", 0.0) or 0.0))
+        elif cn == "GasToPower":
+            cap["electricity"] += abs(float(getattr(m, "el_mw", 0.0) or 0.0))
+        elif cn == "PowerToGas":
+            kgps = abs(float(getattr(m, "gas_mass_flow_kgs", 0.0) or 0.0))
+            cap["gas"] += kgps * 3.6 * hhv
+    return cap
+
+
+def generation_capacity_df(net_type_to_net) -> pandas.DataFrame:
+    """Long frame ``network_type × carrier → capacity_mw`` from the pickled
+    networks, for the capacity-normalised pooled resilience figure."""
+    rows = []
+    for network_type, net in net_type_to_net.items():
+        for carrier, mw in generation_capacity_per_sector(net).items():
+            rows.append({
+                "network_type": network_type,
+                "carrier": carrier,
+                "capacity_mw": mw,
+            })
+    return pandas.DataFrame(rows)
+
+
+# Family tick labels under each density group in the grouped-stacked pooled
+# figure — same short tags as SCENARIO_LABEL's suffixes.
+_RES_FAMILY_SHORT = {"backup": "bk", "loadbearing": "lb", "control": "ctl"}
+
+
+def pooled_resilience_grouped_capacity(
+    perf_df: pandas.DataFrame,
+    capacity_df: pandas.DataFrame,
+    output_dir: str,
+):
+    """One large grouped stacked-bar figure of the mean per-carrier
+    performance loss: y groups = density (LV-no … LV-xxl), inside each group
+    one stacked bar per strategy paired with a second stacked bar showing
+    the **capacity-weighted** shed
+    ``shed_s × (cap_s / min cap_s over the plotted grids)``.
+
+    The weight is monotone in installed capacity, so the paired bar grows
+    with *both* shed and capacity: shedding the same load despite more
+    installed generation reads as a longer bar — the "capacity in place did
+    not help" signal. Dividing by the per-sector minimum keeps the value in
+    MW (weight ≥ 1; the leanest grid's weighted bar equals its raw shed) and
+    both bars on one shared axis.
+    """
+    if perf_df.empty:
+        print("Grouped capacity resilience plot: empty perf_df — skipping.")
+        return
+
+    pooled = (
+        perf_df.groupby(["network_type", "experiment", "id"])[["0", "1", "2"]]
+        .mean()
+        .reset_index()
+        .groupby(["network_type", "experiment"])
+        .mean(numeric_only=True)
+        .reset_index()
+        .melt(
+            id_vars=["network_type", "experiment"],
+            value_vars=["0", "1", "2"],
+            var_name="carrier",
+            value_name="resilience_mean",
+        )
+    )
+    pooled["carrier"] = pooled["carrier"].map(CARRIER_REPLACE_MAP)
+    pooled = pooled.merge(capacity_df, on=["network_type", "carrier"], how="left")
+
+    # One panel per strategy with the densities as a SHARED row axis: reading
+    # down a panel compares densities within a strategy, reading one row
+    # across panels compares strategies within a density (same x scale, rows
+    # aligned via shared_yaxes — the layout of the E1 pooled-resilience row).
+    classes = dict(
+        _ec.split_scenarios_by_family(
+            sorted(pooled["network_type"].unique(), key=scenario_sort_key)
+        )
+    )
+    fams = [f for f in ("backup", "loadbearing", "control") if classes.get(f)]
+    stems: list = []
+    stem_label: dict = {}
+    for nt in sorted(pooled["network_type"].unique(), key=scenario_sort_key):
+        stem = _ec.scenario_stem(nt)
+        if stem not in stems and _ec.scenario_family(nt) != "other":
+            stems.append(stem)
+            stem_label[stem] = _resilience_short_label(nt)
+    positions = [nt for fam in fams for nt in classes[fam]]
+    if not positions:
+        print("Grouped capacity resilience plot: no known scenarios — skipping.")
+        return
+    y_labels = [stem_label[s] for s in stems]
+
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
+    carriers_present = [c for c in ("electricity", "heat", "gas")
+                        if c in pooled["carrier"].unique()]
+    # Per-sector reference: the leanest plotted grid's installed capacity.
+    cap_ref = {}
+    for carrier in carriers_present:
+        sub = pooled[(pooled["carrier"] == carrier)
+                     & (pooled["network_type"].isin(positions))]
+        pos_caps = sub["capacity_mw"].dropna()
+        pos_caps = pos_caps[pos_caps > 0]
+        cap_ref[carrier] = float(pos_caps.min()) if len(pos_caps) else float("nan")
+
+    fig = make_subplots(
+        rows=1, cols=len(fams), shared_yaxes=True,
+        horizontal_spacing=0.04, subplot_titles=fams,
+    )
+    x_max = 0.0
+    for ci, fam in enumerate(fams, start=1):
+        by_stem = {_ec.scenario_stem(nt): nt for nt in classes[fam]}
+        wt_totals = dict.fromkeys(stems, 0.0)
+        for carrier in carriers_present:
+            sub = pooled[pooled["carrier"] == carrier]
+            shed = dict(zip(sub["network_type"], sub["resilience_mean"]))
+            cap = dict(zip(sub["network_type"], sub["capacity_mw"]))
+            sector = _RES_CARRIER_TO_SECTOR[carrier]
+            label = SECTOR_PRETTY[sector]
+            ref = cap_ref[carrier]
+            shed_vals, cap_vals, weights, wt_vals = [], [], [], []
+            for stem in stems:
+                nt = by_stem.get(stem)
+                s = shed.get(nt) if nt is not None else None
+                c = cap.get(nt) if nt is not None else None
+                shed_vals.append(float(s) if s is not None else None)
+                cap_vals.append(float(c) if c is not None else float("nan"))
+                w = (cap_vals[-1] / ref
+                     if cap_vals[-1] == cap_vals[-1] and ref == ref and ref > 0
+                     else None)
+                weights.append(w)
+                wt_vals.append(shed_vals[-1] * w
+                               if w is not None and shed_vals[-1] is not None
+                               else None)
+            for stem, w in zip(stems, wt_vals):
+                wt_totals[stem] += w or 0.0
+            fig.add_trace(go.Bar(
+                y=y_labels, x=shed_vals, orientation="h",
+                name=label, legendgroup=sector, showlegend=(ci == 1),
+                offsetgroup="abs",
+                marker=pub_style.sector_marker(sector),
+                customdata=[[c] for c in cap_vals],
+                hovertemplate=("<b>%{y} (" + fam + ")</b><br>" + label
+                               + " shed: %{x:.4f} MW"
+                               "<br>capacity: %{customdata[0]:.3f} MW"
+                               "<extra></extra>"),
+            ), row=1, col=ci)
+            color = SECTOR_COLORS[sector]
+            # Lightened solid fill (no hatch) for the capacity-weighted twin:
+            # the lightness step + paired position carries the distinction,
+            # and pattern fills balloon the exported PDF by ~1 MB per trace.
+            fig.add_trace(go.Bar(
+                y=y_labels, x=wt_vals, orientation="h",
+                name=f"{label} × cap. weight", legendgroup=f"{sector}_wt",
+                showlegend=(ci == 1),
+                offsetgroup="wt",
+                marker=pub_style.bar_marker(pub_style.hex_to_rgba(color, 0.45)),
+                customdata=[[c, w if w is not None else float("nan")]
+                            for c, w in zip(cap_vals, weights)],
+                hovertemplate=("<b>%{y} (" + fam + ")</b><br>" + label
+                               + " capacity-weighted shed: %{x:.4f} MW"
+                               "<br>weight: ×%{customdata[1]:.2f} "
+                               "(capacity %{customdata[0]:.3f} MW ÷ leanest grid)"
+                               "<extra></extra>"),
+            ), row=1, col=ci)
+        x_max = max(x_max, max(wt_totals.values()))
+
+    fig.update_layout(barmode="stack", bargap=0.25)
+    fig.update_yaxes(autorange="reversed")
+    pub_style.apply_theme(
+        fig,
+        title=("Mean per-carrier performance loss per density and strategy —<br>"
+               "solid: absolute; lightened: × installed-capacity weight "
+               "(sector capacity ÷ leanest grid)"),
+        width=1180, height=520, legend_top=True,
+    )
+    # One shared value scale so bar lengths compare across the panels.
+    fig.update_xaxes(range=[0, x_max * 1.06])
+    fig.update_xaxes(title_text="Mean performance loss (MW)",
+                     row=1, col=(len(fams) + 1) // 2)
+
+    Path(output_dir).mkdir(exist_ok=True, parents=True)
+    out_path = f"{output_dir}/resilience_grouped_capacity.html"
+    eval.write_all_in_one(
+        [fig], "Figure", Path("."), out_path,
+        titles=["Pooled performance drop, grouped by density × strategy, "
+                "with capacity-weighted twin bars"],
+        slugs=["resilience_grouped_capacity"],
+    )
+    print(f"Grouped capacity resilience plot → {out_path}")
+
+
 def cross_carrier_impact_per_scenario(
     impact_df: pandas.DataFrame, output_dir: str
 ):
@@ -2597,6 +2834,292 @@ def cross_carrier_impact_aggregated(
     )
 
 
+def cross_carrier_density_matrix(impact_df: pandas.DataFrame, output_dir: str):
+    """Source × target matrix of cross-sector harm vs CP density.
+
+    A 4×3 subplot grid that *is* the source→target matrix (rows = source
+    sector of the failed component incl. the ``multi`` CP bucket, columns =
+    impacted carrier). Each panel plots the **excess** of the cell's summed
+    harm over the same family's no-CP grid, against CP density, one line
+    per strategy family.
+
+    Rationale: the absolute cross-sector MW shown by
+    :func:`cross_carrier_impact_per_scenario` /
+    :func:`cross_carrier_impact_aggregated` is dominated by the clamped
+    MC-noise floor (the density-0 grids have physically uncoupled carriers
+    yet show 0.8–3.5 MW per cross cell) and by the huge own-sector gas
+    diagonal. Subtracting the family's density-0 baseline isolates the real
+    coupling signal — e.g. the loadbearing-only gas→el / heat→el hump at
+    low–high densities, and the gas→gas "donor relief" in the CP-aware
+    families — and the control family's spread provides an honest noise
+    envelope to read the lines against.
+    """
+    if impact_df is None or impact_df.empty:
+        print("Cross-carrier density matrix: empty impact_df — skipping.")
+        return
+
+    import numpy as _np
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
+    SOURCES = ["electricity", "heat", "gas", "multi"]
+    TARGETS = ["electricity", "heat", "gas"]
+
+    df = impact_df.copy()
+    df["source_carrier"] = df["type"].map(
+        lambda t: TYPE_TO_CARRIER.get(_type_name(t))
+    )
+    # Drops unmapped types (HeatGenerator) and ambiguous junctions — both
+    # are 100 % never-sampled (NaN impact), so no harm is lost.
+    df = df[df["source_carrier"].notna() & (df["source_carrier"] != "heat/gas")]
+    df["harm"] = _ec.harm_from_impact(df["impact"])
+
+    nets = sorted(df["network_type"].unique(), key=scenario_sort_key)
+    raw = (
+        df.groupby(["network_type", "source_carrier", "carrier"])["harm"]
+        .sum()
+        .reindex(
+            pandas.MultiIndex.from_product(
+                [nets, SOURCES, TARGETS],
+                names=["network_type", "source_carrier", "carrier"],
+            ),
+            fill_value=0.0,
+        )
+    )
+
+    skipped = []
+    scen_info = {}
+    for nt in nets:
+        fam = _ec.scenario_family(nt)
+        density, _ = _scenario_density_distribution(nt)
+        if fam == "other" or density is None:
+            skipped.append(nt)
+            continue
+        scen_info[nt] = (fam, density)
+    if skipped:
+        print(f"Cross-carrier density matrix: skipping unmapped scenarios {skipped}")
+    if not scen_info:
+        print("Cross-carrier density matrix: no mappable scenarios — skipping.")
+        return
+    fams = [f for f in _ec.FAMILY_ORDER
+            if f in {fam for fam, _ in scen_info.values()}]
+
+    # Per-family no-CP baseline per cell; the three density-0 grids are
+    # structurally identical, so a family without one borrows the mean of
+    # the others.
+    base = {}
+    for fam in fams:
+        nt0 = next((nt for nt, (f, d) in scen_info.items()
+                    if f == fam and d == 0.0), None)
+        if nt0 is not None:
+            base[fam] = {(s, t): float(raw[nt0, s, t])
+                         for s in SOURCES for t in TARGETS}
+    if not base:
+        print("Cross-carrier density matrix: no density-0 grid in any "
+              "family — the excess baseline is undefined, skipping.")
+        return
+    for fam in fams:
+        if fam not in base:
+            print(f"Cross-carrier density matrix: no density-0 grid for "
+                  f"{fam} — using the mean of the other families' baselines")
+            base[fam] = {
+                key: float(_np.mean([b[key] for b in base.values()]))
+                for key in next(iter(base.values()))
+            }
+
+    # excess[fam][(s, t)] = [(density, excess, raw)] sorted by density.
+    excess = {fam: {(s, t): [] for s in SOURCES for t in TARGETS}
+              for fam in fams}
+    for nt, (fam, density) in scen_info.items():
+        for s in SOURCES:
+            for t in TARGETS:
+                r = float(raw[nt, s, t])
+                excess[fam][(s, t)].append((density, r - base[fam][(s, t)], r))
+    for fam in fams:
+        for cell in excess[fam].values():
+            cell.sort()
+
+    # MC-noise envelope: control is a coupled-but-inert family, so the p95
+    # of its |excess| over the non-multi cells is the honest "no effect"
+    # band. Fallback without control: backup's off-diagonal cells.
+    if "control" in fams:
+        noise_vals = [abs(e) for (s, _t), pts in excess["control"].items()
+                      if s != "multi" for d, e, _ in pts if d > 0]
+    else:
+        noise_vals = [abs(e) for (s, t), pts in excess.get("backup", {}).items()
+                      if s != "multi" and s != t for d, e, _ in pts if d > 0]
+    q = float(_np.percentile(noise_vals, 95)) if noise_vals else 0.0
+
+    _SECTOR_SQ = {
+        "electricity": "#ffa000", "heat": "#d32f2f", "gas": "#388e3c",
+        "multi": "#7e57c2",
+    }
+    col_titles = [
+        f"<span style='color:{_SECTOR_SQ[t]}'>■</span> → {SECTOR_PRETTY[_RES_CARRIER_TO_SECTOR[t]]}"
+        for t in TARGETS
+    ]
+    fig = make_subplots(
+        rows=4, cols=3, shared_xaxes=True, shared_yaxes=True,
+        horizontal_spacing=0.035, vertical_spacing=0.055,
+        subplot_titles=col_titles + [""] * 9,
+    )
+
+    _FAM_STYLE = {
+        "backup": dict(
+            color="#17BECF", dash="dash", width=2, symbol="square", size=6,
+            label="Backup — additive CPs + donor"),
+        "loadbearing": dict(
+            color=pub_style.QUAL_PALETTE[0], dash="solid", width=2.5,
+            symbol="circle", size=7,
+            label="Loadbearing — CPs replace generation"),
+        "control": dict(
+            color="#7F7F7F", dash="dot", width=2, symbol="diamond", size=6,
+            label="Control — additive, no donor"),
+    }
+    for i, s in enumerate(SOURCES):
+        for j, t in enumerate(TARGETS):
+            for fam in fams:
+                st = _FAM_STYLE[fam]
+                pts = excess[fam][(s, t)]
+                fig.add_trace(go.Scatter(
+                    x=[d for d, _, _ in pts], y=[e for _, e, _ in pts],
+                    mode="lines+markers", legendgroup=fam, name=st["label"],
+                    showlegend=(i == 0 and j == 0),
+                    line=dict(color=st["color"], width=st["width"],
+                              dash=st["dash"]),
+                    marker=dict(symbol=st["symbol"], size=st["size"],
+                                color=st["color"],
+                                line=dict(color=pub_style.BAR_LINE_COLOR,
+                                          width=0.8)),
+                    customdata=[[r, base[fam][(s, t)]] for _, _, r in pts],
+                    hovertemplate=(
+                        f"{fam} | {s} → {t}<br>density=%{{x}}"
+                        "<br>excess=%{y:.3f} MW"
+                        "<br>raw=%{customdata[0]:.3f} MW, "
+                        "no-CP baseline=%{customdata[1]:.3f} MW"
+                        "<extra></extra>"),
+                ), row=i + 1, col=j + 1)
+            # Own-sector (diagonal) cells shaded so the cross cells pop.
+            if s == t:
+                fig.add_shape(
+                    dict(type="rect", xref="x domain", yref="y domain",
+                         x0=0, x1=1, y0=0, y1=1, line_width=0,
+                         fillcolor="rgba(0,0,0,0.035)", layer="below"),
+                    row=i + 1, col=j + 1,
+                )
+            # Anchor: the raw no-CP harm this cell's deltas are measured
+            # against (3-family mean; per-family subtraction differs only
+            # at MC-noise scale). Top-right where the curves stay clear;
+            # the multi row instead rises to the right, so it anchors left.
+            if s == "multi":
+                anno, ax, axanchor = "no CPs at d=0", 0.04, "left"
+            else:
+                b = _np.mean([base[fam][(s, t)] for fam in fams])
+                anno, ax, axanchor = f"no-CP: {b:.2g} MW", 0.97, "right"
+            fig.add_annotation(
+                text=anno, xref="x domain", yref="y domain",
+                x=ax, y=0.96, xanchor=axanchor, yanchor="top",
+                showarrow=False,
+                font=dict(size=12, color=pub_style.MUTED_COLOR),
+                row=i + 1, col=j + 1,
+            )
+    # Legend proxy for the noise band.
+    fig.add_trace(go.Scatter(
+        x=[None], y=[None], mode="markers",
+        marker=dict(symbol="square", size=12, color="rgba(0,0,0,0.10)",
+                    line=dict(color="rgba(0,0,0,0.30)", width=1)),
+        name="MC-noise envelope (control p95)", showlegend=True,
+    ), row=1, col=1)
+    if q > 0:
+        fig.add_hrect(y0=-q, y1=q, fillcolor="rgba(0,0,0,0.05)",
+                      line_width=0, layer="below", row="all", col="all")
+
+    # Print callouts on the two headline cells, anchored to the data.
+    if "loadbearing" in fams:
+        for (cell, pick, text) in [
+            (("gas", "electricity"), max, "loadbearing only"),
+            (("gas", "gas"), min, "donor relief"),
+        ]:
+            pts = [p for p in excess["loadbearing"][cell] if p[0] > 0]
+            if not pts:
+                continue
+            d, e, _ = pick(pts, key=lambda p: p[1])
+            fig.add_annotation(
+                x=d, y=e, text=text, showarrow=True, arrowhead=0,
+                arrowcolor=pub_style.MUTED_COLOR, ax=0, ay=-22,
+                font=dict(size=12, color=pub_style.MUTED_COLOR),
+                row=SOURCES.index(cell[0]) + 1, col=TARGETS.index(cell[1]) + 1,
+            )
+
+    all_e = [e for fam in fams for pts in excess[fam].values()
+             for _, e, _ in pts]
+    y_lo = min(-q, min(all_e)) - 0.15
+    y_hi = max(q, max(all_e)) + 0.15
+
+    pub_style.apply_theme(
+        fig,
+        title=("Cross-sector harm vs coupling-point density<br>"
+               "excess over the family's no-CP grid — below 0: CPs relieve "
+               "harm, above 0: CPs create harm"),
+        width=1180, height=780, font_bump=1, legend_top=True,
+    )
+    # Axis dressing after apply_theme: the theme broadcast resets zerolines
+    # and would otherwise override these.
+    fig.update_yaxes(range=[y_lo, y_hi], zeroline=True,
+                     zerolinecolor="#BBBBBB", zerolinewidth=1)
+    fig.update_xaxes(range=[-0.012, 0.262],
+                     tickvals=[0, .05, .10, .15, .20, .25],
+                     ticktext=["0", ".05", ".10", ".15", ".20", ".25"])
+    fig.update_xaxes(
+        title_text="CP density (realized CPs: 0, 12, 14, 15, 20, 30)",
+        row=4, col=2,
+    )
+    fig.update_layout(margin=dict(l=150, b=90))
+    # Row labels (source sectors) at the vertical centre of each row.
+    for i, s in enumerate(SOURCES):
+        dom = fig.get_subplot(i + 1, 1).yaxis.domain
+        fig.add_annotation(
+            text=(f"<span style='color:{_SECTOR_SQ[s]}'>■</span> "
+                  + SECTOR_PRETTY[
+                      _RES_CARRIER_TO_SECTOR.get(s, s)]),
+            textangle=-90, xref="paper", x=-0.045,
+            yref="paper", y=(dom[0] + dom[1]) / 2,
+            xanchor="center", yanchor="middle", showarrow=False,
+            font=dict(size=15),
+        )
+    fig.add_annotation(
+        text="Source of failed component — excess harm vs no-CP grid (MW)",
+        textangle=-90, xref="paper", x=-0.085, yref="paper", y=0.5,
+        xanchor="center", yanchor="middle", showarrow=False,
+        font=dict(size=17, color=pub_style.MUTED_COLOR),
+    )
+    if "control" in fams:
+        fig.add_annotation(
+            text=("control family: densities 0 / 0.10 / 0.25 only — "
+                  "dotted line interpolates"),
+            xref="paper", x=1.0, xanchor="right",
+            yref="paper", y=-0.075, yanchor="top", showarrow=False,
+            font=dict(size=12, color=pub_style.MUTED_COLOR),
+        )
+
+    Path(output_dir).mkdir(exist_ok=True, parents=True)
+    eval.write_all_in_one(
+        [fig], "Figure", Path("."),
+        f"{output_dir}/cross_carrier_density_matrix.html",
+        titles=[
+            "Cross-sector harm vs CP density (source × target matrix, "
+            f"excess over same-family no-CP baseline; "
+            f"n_scenarios={len(scen_info)})"
+        ],
+        slugs=["cross_carrier_density_matrix"],
+    )
+    print(
+        f"Cross-carrier density matrix: {len(scen_info)} scenarios, "
+        f"noise band ±{q:.3f} MW → "
+        f"{output_dir}/cross_carrier_density_matrix.html"
+    )
+
+
 def pooled_metric_comparison(pooled_df, output_dir, class_label: str = ""):
     """Run metric comparison figures on data pooled across all network types.
 
@@ -2914,8 +3437,12 @@ def evaluate(folder_id):
 
 
     pooled_resilience_per_scenario(perf_df, OUTPUT + "/pooled")
+    pooled_resilience_grouped_capacity(
+        perf_df, generation_capacity_df(net_type_to_net), OUTPUT + "/pooled"
+    )
     cross_carrier_impact_per_scenario(impact_df, OUTPUT + "/pooled")
     cross_carrier_impact_aggregated(impact_df, OUTPUT + "/pooled")
+    cross_carrier_density_matrix(impact_df, OUTPUT + "/pooled")
 
     for network_type, monee_net in net_type_to_net.items():
         print(network_type)

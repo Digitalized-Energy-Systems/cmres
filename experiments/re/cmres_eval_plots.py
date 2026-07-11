@@ -22,10 +22,12 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
-from eval_common import split_scenarios_by_family  # noqa: E402  # canonical
-                                                  # scenario families
-                                                  # partition, used by every
-                                                  # cross-scenario plotter.
+from eval_common import (  # noqa: E402  # canonical scenario-family helpers,
+    FAMILY_ORDER,          # used by every cross-scenario plotter.
+    scenario_family,
+    scenario_stem,
+    split_scenarios_by_family,
+)
 
 import numpy as np
 import pandas as pd
@@ -2412,6 +2414,76 @@ def _e16_per_sector_heatmap(df: pd.DataFrame) -> go.Figure:
     return heat
 
 
+# One colour + hatch per scenario family for figures that put all three
+# strategies on one axis. QUAL_PALETTE hues so a family bar never reads as
+# a sector bar.
+_FAMILY_BAR_COLOR = {
+    fam: pub_style.QUAL_PALETTE[i] for i, fam in enumerate(FAMILY_ORDER)
+}
+_FAMILY_BAR_PATTERN = {"backup": "", "loadbearing": "/", "control": "\\"}
+
+
+def _stem_label(scenario: str) -> str:
+    """Density-stem display label ("LV-m") of a scenario key, derived from
+    the canonical per-scenario label ("LV-m-bk") so the two stay in sync."""
+    label = pretty_scenario(scenario)
+    fam = scenario_family(scenario)
+    if fam != "other" and "-" in label:
+        return label.rsplit("-", 1)[0]
+    return label
+
+
+def _e16_ceiling_rho_combined(ceil: pd.DataFrame) -> go.Figure:
+    """All-strategy ceiling comparison: grouped horizontal bars of
+    ρ(N-1 shed, MC actual) with one bar per family at each density, so
+    backup / loadbearing / control sit on one shared axis instead of one
+    figure each."""
+    df = ceil.copy()
+    df["family"] = df["scenario"].map(scenario_family)
+    df["stem"] = df["scenario"].map(scenario_stem)
+    df = df[df["family"] != "other"]
+    if df.empty:
+        return go.Figure()
+    stems: List[str] = []
+    for s in _scenario_order(df["scenario"]):
+        stem = scenario_stem(s)
+        if stem not in stems:
+            stems.append(stem)
+    stem_labels = {
+        scenario_stem(s): _stem_label(s) for s in df["scenario"]
+    }
+    fams = [f for f in FAMILY_ORDER if f in set(df["family"])]
+
+    fig = go.Figure()
+    for fam in fams:
+        sub = df[df["family"] == fam].set_index("stem")
+        rho = sub["rho_shed_vs_mc"].reindex(stems)
+        err_hi = (sub["ci_hi"].reindex(stems) - rho).clip(lower=0)
+        err_lo = (rho - sub["ci_lo"].reindex(stems)).clip(lower=0)
+        fig.add_trace(go.Bar(
+            y=[stem_labels[st] for st in stems],
+            x=rho.values, orientation="h", name=fam,
+            error_x=dict(type="data", symmetric=False,
+                         array=err_hi.values, arrayminus=err_lo.values,
+                         thickness=1.2, width=3, color=pub_style.MUTED_COLOR),
+            marker=pub_style.bar_marker(
+                _FAMILY_BAR_COLOR[fam],
+                pattern_shape=_FAMILY_BAR_PATTERN.get(fam, ""),
+            ),
+            hovertemplate=("<b>%{y}</b> (" + fam + ")"
+                           "<br>ρ = %{x:+.3f}<extra></extra>"),
+        ))
+    fig.update_layout(barmode="group")
+    fig.update_yaxes(autorange="reversed", title="")
+    fig.update_xaxes(title="Spearman ρ", range=[0, 1.0])
+    pub_style.apply_theme(
+        fig, title="ρ between N-1 shed and MC — all strategies",
+        height=pub_style.hbar_height(len(stems), len(fams)),
+        width=pub_style.BAR_FIG_WIDTH, font_bump=6, legend_top=True,
+    )
+    return fig
+
+
 def plot_e16_single_removal(input_dir: Path, output_dir: Path) -> Optional[Path]:
     """Per-metric ρ vs analytical shed AND vs MC, with the ceiling
     (ρ_shed_vs_mc) drawn as a hatched reference for each scenario.
@@ -2692,7 +2764,6 @@ def plot_e16_single_removal(input_dir: Path, output_dir: Path) -> Optional[Path]
                 customdata=np.c_[c["n"].values],
                 showlegend=False,
             ))
-            fig2.add_vline(x=0, line=dict(color="#444", width=1, dash="dot"))
             pub_style.apply_theme(
                 fig2,
                 title=(
@@ -2702,7 +2773,7 @@ def plot_e16_single_removal(input_dir: Path, output_dir: Path) -> Optional[Path]
                 height=pub_style.hbar_height(len(c)),
                 width=pub_style.BAR_FIG_WIDTH, font_bump=6, no_legend=True,
             )
-            fig2.update_xaxes(title="Spearman ρ", range=[-.55, 1.10])
+            fig2.update_xaxes(title="Spearman ρ", range=[0, 1.0])
             fig2.update_yaxes(title="")
             figs.append(fig2)
             titles.append(f"Ceiling ρ{_title_suffix(class_label)}")
@@ -2736,6 +2807,15 @@ def plot_e16_single_removal(input_dir: Path, output_dir: Path) -> Optional[Path]
                                              class_label=class_label)
             if sub_order is not None:
                 seen_orders.append(sub_order)
+        # Combined ceiling across families: same data as the per-family
+        # "Ceiling ρ" bars, but with all strategies on one shared density
+        # axis so they can be compared directly.
+        if not ceil.empty:
+            comb = _e16_ceiling_rho_combined(ceil)
+            if comb.data:
+                figs.append(comb)
+                titles.append("Ceiling ρ — all strategies")
+                slugs.append("e16_ceiling_rho_combined")
         # Concatenate the per-class orders so the per-scenario bars below
         # still iterate every scenario in a stable, class-grouped order.
         if seen_orders:
