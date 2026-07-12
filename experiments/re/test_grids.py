@@ -5,15 +5,35 @@ All grids share one topology (simbench ``1-LV-rural3--1-no_sw`` + generated
 gas / heat layers) and differ in coupling-point density and supply sizing.
 Three scenario families demonstrate how CPs affect resilience:
 
-  ``_backup``      - additive CPs, asymmetric headroom: electricity tight
-                     (h=0.04), gas rich and CP-aware (h=0.30 floor, raised so
-                     the gas surplus stays 50 % above the CP fleet's rated gas
-                     draw at every density). Electrical failures can be rescued
-                     by CHPs drawing on the gas surplus → "CPs help".
+  ``_backup``      - additive CPs, symmetric base headroom h=0.10; the gas
+                     side is CP-aware (``donor_gas_cp_margin=0.5``): h_gas is
+                     raised above 0.10 wherever needed so the gas surplus
+                     stays 50 % above the CP fleet's rated gas draw at every
+                     density. Electrical failures can be rescued by CHPs
+                     drawing on the gas surplus → "CPs help".
   ``_loadbearing`` - CPs replace primary generation (``cp_capacity_invariant``),
                      symmetric h=0.10 sized CP-aware so the CP fleet is fully
                      fuelable at baseline. Gas-side failures cascade through
                      the load-bearing CHPs → "CPs hurt".
+  ``_decoupled``   - decoupled mirror of ``_loadbearing``: the identical
+                     seeded fleet (sites, types, rated outputs) realised as
+                     independent single-carrier generators with no
+                     input-carrier draw (monee ``decoupled_generation``),
+                     still replacing primary generation; symmetric h=0.10.
+                     ``loadbearing − decoupled`` isolates the cross-carrier
+                     dependency, ``decoupled − no-CP`` the pure re-siting
+                     effect of moving capacity onto the CP buses.
+                     Contract caveats — the subtraction removes the coupling
+                     *and* its side effects: input carriers carry no CP draw
+                     (effective demand and slack size on D alone), a CHP
+                     mirror fails as two independent halves (el + heat, each
+                     at the CP base probability; heat via mm.HeatGenerator
+                     in FAIL_BASE_PROBABILITY_MAP) instead of one compound,
+                     and mirror failures land in single-carrier source rows
+                     of the cross-carrier matrix (loadbearing's land in
+                     "multi"). The N-1 single-removal sweep targets the full
+                     MC-priced surface (incl. generation childs), so the
+                     mirror fleet IS swept — its rows carry kind="child".
   ``_control``     - additive CPs, both carriers tight (h=0.04). Negative
                      control: without donor-carrier surplus CPs cannot help.
 
@@ -50,6 +70,7 @@ from monee.model.formulation import (
     EL_MISOCP_FORMULATION,
     make_heat_convex_milp_formulation,
 )
+from monee.model.grid import DEFAULT_GAS_HHV_KWH_PER_KG
 from monee.network import (
     generate_supply_return_mes_based_on_power_net,
 )
@@ -275,12 +296,21 @@ def _gas_grid_and_hhv(net):
 
     ``net.grids`` chokes on multi-grid CP control nodes whose ``.grid`` is a
     list — same defensive walk as ``_balance_demand_for_cp_replacement``.
+
+    Reads ``higher_heating_value_kwh_per_kg`` (the actual GasGrid field; the
+    study grids are lgas, HHV ≈ 11.79 kWh/kg). A former ``getattr`` on the
+    non-existent ``higher_heating_value`` silently returned a 15.3 fallback
+    everywhere, which cancelled in the pure gas-side ratios but inflated the
+    CP-aware electricity credits (CHP el output, P2G el draw) by ×1.30 in
+    the ``_loadbearing`` sizing.
     """
     for n in net.nodes_by_type(mm.Junction):
         g = n.grid
         if g is not None and not isinstance(g, list) and getattr(g, "name", None) == "gas":
-            return g, float(getattr(g, "higher_heating_value", 15.3))
-    return None, 15.3
+            return g, float(getattr(
+                g, "higher_heating_value_kwh_per_kg", DEFAULT_GAS_HHV_KWH_PER_KG
+            ))
+    return None, DEFAULT_GAS_HHV_KWH_PER_KG
 
 
 def _cp_io_mw(net) -> dict:
@@ -410,6 +440,11 @@ def _scale_to_abs_total(items, get_val, set_val, target_abs_total) -> bool:
     return True
 
 
+def _is_mirror_child(c) -> bool:
+    """Decoupled-mirror generation child (monee ``decoupled_generation``)."""
+    return str(getattr(c, "name", "") or "").startswith("mirror_cp_")
+
+
 def _apply_headroom(net, h_el: float, h_gas: float, cp_aware: bool = False) -> dict:
     """Scale in-grid electricity + gas generation and size ext-grid slack
     budgets so each carrier has headroom ``h`` over its *effective* demand,
@@ -429,6 +464,13 @@ def _apply_headroom(net, h_el: float, h_gas: float, cp_aware: bool = False) -> d
     invariant across CP densities while the CP fleet is fully fuelable at
     baseline. For additive CPs (off at baseline) use ``cp_aware=False`` so
     supply is sized on end-user demand only.
+
+    Decoupled-mirror children (``mirror_cp_*``) are plain generator/Source
+    children, but they stand in for the fixed-rating CP fleet: like CPs they
+    are never rescaled — their output is subtracted from the carrier target
+    and only the remaining primary pool is scaled. Uniform scaling would
+    silently break the "same capacity as the load-bearing CPs" contract of
+    the ``_decoupled`` family.
     """
     t = _carrier_totals(net)
     io = _cp_io_mw(net) if cp_aware else dict(p_in=0.0, g_in=0.0, p_out=0.0, g_out=0.0)
@@ -442,12 +484,24 @@ def _apply_headroom(net, h_el: float, h_gas: float, cp_aware: bool = False) -> d
             f"output ({io['p_out']:.4f} MW) exceeds (1+h/2)·effective demand "
             f"({p_demand_eff:.4f} MW). Reduce CP density/size or raise h_el."
         )
-    pgens = list(net.childs_by_type(mm.PowerGenerator))
+    pgens_all = list(net.childs_by_type(mm.PowerGenerator))
+    mirror_p_mw = sum(
+        abs(float(mm.value(c.model.p_mw) or 0.0))
+        for c in pgens_all if _is_mirror_child(c)
+    )
+    pgens = [c for c in pgens_all if not _is_mirror_child(c)]
+    p_pool_target_mw = p_target_mw - mirror_p_mw
+    if p_demand_eff > 1e-9 and p_pool_target_mw <= 0:
+        raise RuntimeError(
+            f"Electricity primary pool target {p_pool_target_mw:.4f} MW ≤ 0: "
+            f"mirror fleet output ({mirror_p_mw:.4f} MW) exceeds the carrier "
+            f"target ({p_target_mw:.4f} MW). Reduce CP density/size or raise h_el."
+        )
     p_ok = _scale_to_abs_total(
         pgens,
         get_val=lambda c: float(mm.value(c.model.p_mw) or 0.0),
         set_val=lambda c, v: setattr(c.model, "p_mw", v),
-        target_abs_total=p_target_mw,
+        target_abs_total=p_pool_target_mw,
     )
     if not p_ok and p_demand_eff > 1e-9:
         raise RuntimeError(
@@ -465,15 +519,27 @@ def _apply_headroom(net, h_el: float, h_gas: float, cp_aware: bool = False) -> d
             f"({g_demand_eff_mw:.4f} MW). Reduce CP density/size or raise h_gas."
         )
     g_target_kgps = g_target_mw / (3.6 * t["hhv"]) if t["hhv"] > 0 else 0.0
-    gsources = [
+    gsources_all = [
         c for c in net.childs_by_type(mm.Source)
         if c.grid is not None and getattr(c.grid, "name", None) == "gas"
     ]
+    mirror_g_kgps = sum(
+        abs(float(mm.value(c.model.mass_flow_kgs) or 0.0))
+        for c in gsources_all if _is_mirror_child(c)
+    )
+    gsources = [c for c in gsources_all if not _is_mirror_child(c)]
+    g_pool_target_kgps = g_target_kgps - mirror_g_kgps
+    if g_demand_eff_mw > 1e-9 and g_pool_target_kgps <= 0:
+        raise RuntimeError(
+            f"Gas primary pool target {g_pool_target_kgps:.6f} kg/s ≤ 0: "
+            f"mirror fleet output ({mirror_g_kgps:.6f} kg/s) exceeds the carrier "
+            f"target ({g_target_kgps:.6f} kg/s). Reduce CP density/size or raise h_gas."
+        )
     g_ok = _scale_to_abs_total(
         gsources,
         get_val=lambda c: float(mm.value(c.model.mass_flow_kgs) or 0.0),
         set_val=lambda c, v: setattr(c.model, "mass_flow_kgs", v),
-        target_abs_total=g_target_kgps,
+        target_abs_total=g_pool_target_kgps,
     )
     if not g_ok and g_demand_eff_mw > 1e-9:
         raise RuntimeError(
@@ -552,7 +618,8 @@ def _validate_headroom_balance(
 
 
 def create_large_lv_simbench(density, central=False, cp_capacity_invariant=False,
-                             h_el=0.20, h_gas=0.20, donor_gas_cp_margin=None):
+                             h_el=0.20, h_gas=0.20, donor_gas_cp_margin=None,
+                             decoupled=False):
     """Factory for one grid variant.
 
     ``h_el`` / ``h_gas`` are per-carrier headroom fractions (gen sized at
@@ -560,6 +627,15 @@ def create_large_lv_simbench(density, central=False, cp_capacity_invariant=False
     ``cp_capacity_invariant=True`` makes CPs replace primary generation
     (load-bearing) and switches the headroom sizing to CP-aware so the CP
     fleet is fuelable at baseline.
+
+    ``decoupled=True`` builds the decoupled mirror of the load-bearing
+    family: the identical seeded fleet realised as independent output-carrier
+    generators with no input draw (monee ``decoupled_generation``), still
+    replacing primary generation. The mirror children (name prefix
+    ``mirror_cp_``) keep their CP-rated output — ``_apply_headroom`` scales
+    only the non-mirror primary pool around them. Headroom stays CP-unaware
+    (``_cp_io_mw`` is zero here anyway): effective demand is end-user demand
+    only, since no input-carrier draw exists to cover.
 
     ``donor_gas_cp_margin`` (additive ``_backup`` family only) makes the *gas*
     headroom CP-aware: the gas surplus available to ramp the (gas-input) CP
@@ -588,7 +664,8 @@ def create_large_lv_simbench(density, central=False, cp_capacity_invariant=False
                 "p2g_p_share": 1,
                 "p2h_p_share": 0.2,
                 "cp_size_multiplier": 3.0,
-                "replace_primary_generation": cp_capacity_invariant,
+                "replace_primary_generation": cp_capacity_invariant or decoupled,
+                "decoupled_generation": decoupled,
             },
             heat_kwargs={
                 "node_based_heat_loads": True,
@@ -703,6 +780,14 @@ def _loadbearing(density):
     )
 
 
+# Decoupled mirror of _loadbearing: same fleet as independent generators,
+# no coupling constraint. loadbearing − decoupled = cross-carrier dependency.
+def _decoupled(density):
+    return create_large_lv_simbench(
+        density, decoupled=True, h_el=0.10, h_gas=0.10
+    )
+
+
 # Negative control: no donor surplus anywhere; additive CPs.
 def _control(density):
     return create_large_lv_simbench(density, h_el=0.04, h_gas=0.04)
@@ -727,8 +812,18 @@ ALL_GRIDS = {
     "simbench_lv_xxl_loadbearing": (_loadbearing(0.25), create_large_lv_simbench_ts),
 
     "simbench_lv_no_control": (_control(0.0), create_large_lv_simbench_ts),
+    "simbench_lv_low_control": (_control(0.05), create_large_lv_simbench_ts),
     "simbench_lv_mid_control": (_control(0.1), create_large_lv_simbench_ts),
+    "simbench_lv_high_control": (_control(0.15), create_large_lv_simbench_ts),
+    "simbench_lv_xl_control": (_control(0.2), create_large_lv_simbench_ts),
     "simbench_lv_xxl_control": (_control(0.25), create_large_lv_simbench_ts),
+
+    "simbench_lv_no_decoupled": (_decoupled(0.0), create_large_lv_simbench_ts),
+    "simbench_lv_low_decoupled": (_decoupled(0.05), create_large_lv_simbench_ts),
+    "simbench_lv_mid_decoupled": (_decoupled(0.1), create_large_lv_simbench_ts),
+    "simbench_lv_high_decoupled": (_decoupled(0.15), create_large_lv_simbench_ts),
+    "simbench_lv_xl_decoupled": (_decoupled(0.2), create_large_lv_simbench_ts),
+    "simbench_lv_xxl_decoupled": (_decoupled(0.25), create_large_lv_simbench_ts),
 }
 
 def print_demands(net: mm.Network) -> None:
@@ -750,7 +845,10 @@ def print_demands(net: mm.Network) -> None:
         elif isinstance(m, mm.Sink):
             gname = getattr(c.grid, "name", "?")
             if gname == "gas":
-                hhv = getattr(c.grid, "higher_heating_value", 15.3)
+                hhv = getattr(
+                    c.grid, "higher_heating_value_kwh_per_kg",
+                    DEFAULT_GAS_HHV_KWH_PER_KG,
+                )
                 mw = abs(float(mm.value(m.mass_flow_kgs))) * 3.6 * hhv
                 rows.append(("gas", "Sink", c.id, mw))
             else:

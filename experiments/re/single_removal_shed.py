@@ -6,6 +6,12 @@ The resulting (component_id → total_shed_mw) table is the deterministic,
 MC-independent ground truth that bounds what any structural criticality
 metric could achieve on this grid.
 
+The target set is the MC-priced failure surface: every branch, CP, and
+generation child whose model type has a base failure probability > 0 in
+``cmres.resilience.model.FAIL_BASE_PROBABILITY_MAP`` — so the N-1 sweep and
+the MC simulation share one contingency universe (classic N-1 practice,
+which includes generation-unit outages).
+
 Networks are built from ``experiments/re/test_grids.py::ALL_GRIDS`` — the
 same factories the MC resilience simulation uses — so a single grid name
 on the CLI resolves to exactly one configuration (CP density, ``central``
@@ -20,8 +26,8 @@ Per-shard run::
         --output-dir data/out/single_removal_shed \\
         --shard 1 --n-shards 8
 
-Each shard takes a contiguous slice of the component list, runs its
-deactivate-solve-reactivate loop, and writes
+Each shard takes a round-robin stripe of the cp_id-sorted component list,
+runs its deactivate-solve-reactivate loop, and writes
 ``single_removal_shed_<grid>_shard_<I>_of_<K>.csv``.
 
 Final merge::
@@ -56,6 +62,11 @@ import monee.problem as mp
 from monee import run_energy_flow_optimization
 from monee.solver.gurobipy import GurobipySolver
 
+_ROOT = Path(__file__).resolve().parents[2]
+if str(_ROOT / "src") not in sys.path:
+    sys.path.insert(0, str(_ROOT / "src"))
+from cmres.resilience.model import FAIL_BASE_PROBABILITY_MAP  # noqa: E402
+
 # ``solver="gurobi"`` resolves to monee's native gurobipy backend (the
 # single-period default), so per-solve params go on the solver instance — the
 # Pyomo ``PER_SOLVER_OPTIONS`` path no longer applies. ``MIPGap=1e-4`` keeps
@@ -75,8 +86,17 @@ log = logging.getLogger(__name__)
 
 def _enumerate_targets(monee_net) -> List[Tuple[str, str, object]]:
     """Return ``(cp_id_str, kind, component)`` triples for everything we'd
-    deactivate. Mirrors the enumeration used by ``mes_all_components_metric``
-    so the cp_id strings match df_eval's keys 1-1.
+    deactivate: the MC-priced failure surface (see module docstring).
+
+    Branch and CP cp_ids mirror the enumeration used by
+    ``mes_all_components_metric`` so they match df_eval's keys 1-1. Child
+    targets (kind ``"child"``: every child type priced > 0 in
+    FAIL_BASE_PROBABILITY_MAP — currently generators, gas sources, and
+    heat generators on the study grids) use the
+    ``child:<id>`` scheme of the metrics/impact tables instead; they have no
+    df_eval counterpart (topology metrics cannot score childs), so the E16
+    ranking join drops them, but the full-surface ceiling
+    (``E16_shed_vs_mc_ceiling_full.csv``) picks them up via the MC actuals.
     """
     targets: List[Tuple[str, str, object]] = []
 
@@ -119,6 +139,13 @@ def _enumerate_targets(monee_net) -> List[Tuple[str, str, object]]:
             if b.id in cp_branch_ids:
                 continue
             targets.append((str(b.id), "branch", b))
+
+    # Failable childs (PowerGenerator, gas Source, HeatGenerator — whatever
+    # the MC prices > 0) → cp_id "child:{id}". Covers the primary pools in
+    # every family and the _decoupled family's mirror fleet.
+    for c in monee_net.childs:
+        if FAIL_BASE_PROBABILITY_MAP.get(type(c.model), 0.0) > 0:
+            targets.append((f"child:{c.id}", "child", c))
 
     return targets
 
@@ -495,6 +522,26 @@ def main():
         # Drop duplicate baseline rows (each shard records one).
         baseline = merged[merged["cp_id"] == "_baseline_"].head(1)
         rest = merged[merged["cp_id"] != "_baseline_"]
+        # Coverage guard: shard striping depends on the enumerated target
+        # list, so shard CSVs from a different code/grid version merge into
+        # a silently wrong table (duplicated cp_ids that fan out through the
+        # E16 join, plus dropped components). Rebuild the target set and
+        # refuse to merge on any mismatch.
+        _, _, net_chk, _ = _resolve_grid(args.grid)
+        expected = {cp_id for cp_id, _k, _c in _enumerate_targets(net_chk)}
+        actual = set(rest["cp_id"].astype(str))
+        dupes = rest["cp_id"].astype(str).duplicated()
+        if actual != expected or bool(dupes.any()):
+            print(
+                f"shard CSVs do not cover the current target set for "
+                f"{args.grid}: {len(expected - actual)} missing, "
+                f"{len(actual - expected)} unexpected, "
+                f"{int(dupes.sum())} duplicated cp_ids — the shards were "
+                "likely produced by a different code version (target "
+                "striping changed). Re-run all shards before merging.",
+                file=sys.stderr,
+            )
+            return 1
         out = pd.concat([baseline, rest], ignore_index=True)
         out.to_csv(final_csv, index=False)
         print(f"wrote merged: {final_csv}  ({len(out)} rows)")

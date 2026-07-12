@@ -13,6 +13,7 @@ import pandas as pd
 import monee
 import monee.model as mm
 from monee.model.core import Node as MNode
+from monee.model.grid import DEFAULT_GAS_HHV_KWH_PER_KG
 
 jax.config.update("jax_enable_x64", True)
 
@@ -638,7 +639,7 @@ def _get_gas_hhv(monee_net) -> float:
             return float(gg.higher_heating_value_kwh_per_kg)
     except Exception:
         pass
-    return 15.3  # kWh/kg typical NG (≈55 MJ/kg)
+    return DEFAULT_GAS_HHV_KWH_PER_KG
 
 
 def _gas_pipe_max_flow(pipe_model, gas_grid) -> float:
@@ -1848,7 +1849,8 @@ def _cp_throughput_proxy(cp_or_branch, label: str, monee_net=None) -> float:
             # would collapse the score. Rated outputs follow from the gas
             # setpoint exactly as in the CHP conversion equations.
             m = cp_or_branch.model
-            hhv = _get_gas_hhv(monee_net) if monee_net is not None else 15.3
+            hhv = (_get_gas_hhv(monee_net) if monee_net is not None
+                   else DEFAULT_GAS_HHV_KWH_PER_KG)
             mdot = abs(_safe(getattr(m, "mass_flow_setpoint_kgs", 0.0)))
             el_mw = abs(_safe(getattr(m, "efficiency_power", 0.0))) * mdot * hhv * 3.6
             heat_mw = abs(_safe(getattr(m, "efficiency_heat", 0.0))) * mdot * hhv * 3.6
@@ -1858,7 +1860,8 @@ def _cp_throughput_proxy(cp_or_branch, label: str, monee_net=None) -> float:
             # Rated capacity from the gas setpoint (the control-node el_mw/heat_mw
             # are solved Vars that collapse to ~0 when idle), mirroring CHP.
             m = cp_or_branch.model
-            hhv = _get_gas_hhv(monee_net) if monee_net is not None else 15.3
+            hhv = (_get_gas_hhv(monee_net) if monee_net is not None
+                   else DEFAULT_GAS_HHV_KWH_PER_KG)
             mdot = abs(_safe(getattr(m, "mass_flow_setpoint_kgs", 0.0)))
             el_mw = abs(_safe(getattr(m, "efficiency_power", 0.0))) * mdot * hhv * 3.6
             heat_mw = abs(_safe(getattr(m, "efficiency_heat", 0.0))) * mdot * hhv * 3.6
@@ -1883,7 +1886,8 @@ def _cp_throughput_proxy(cp_or_branch, label: str, monee_net=None) -> float:
         if label == "PowerToGas":
             # Use fixed rated capacity (gas_mass_flow_kgs), not the solved Pyomo Var (to_mass_flow=0 when idle)
             m_dot = abs(_safe(getattr(cp_or_branch.model, "gas_mass_flow_kgs", 0.0)))
-            hhv = _get_gas_hhv(monee_net) if monee_net is not None else 15.3
+            hhv = (_get_gas_hhv(monee_net) if monee_net is not None
+                   else DEFAULT_GAS_HHV_KWH_PER_KG)
             # HHV is stored in kWh/kg; power [MW] = m_dot [kg/s] * HHV [kWh/kg] * 3.6 [MJ/kWh]
             return max((m_dot * hhv * 3.6) / sn_mva, 1e-6)
 

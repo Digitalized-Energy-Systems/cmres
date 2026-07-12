@@ -32,6 +32,12 @@ FAIL_BASE_PROBABILITY_MAP = {
     mm.GasToHeatHG: 0.1,
     mm.GasToPower: 0.1,
     mm.PowerGenerator: 0.1,
+    # Node-based heat generation (childs). Omitting this while pricing the
+    # legacy HeatExchangerGenerator branches left every node-based heat
+    # generator unfailable — including the _decoupled family's CP heat
+    # mirrors, which must fail at the same rate as the CHPHG/P2HHG units
+    # they stand in for.
+    mm.HeatGenerator: 0.1,
     mm.HeatExchanger: 0.1,
     mm.HeatExchangerGenerator: 0.1,
     mm.HeatExchangerLoad: 0.1,

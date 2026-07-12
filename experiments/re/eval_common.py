@@ -63,17 +63,30 @@ _NON_CP_BRANCH_TYPES = ("PowerLine", "GasPipe", "WaterPipe", "HeatExchanger")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Scenario-family split — shared by every cross-scenario plotter so the
-# ``_backup`` / ``_loadbearing`` / ``_control`` partitioning logic lives in
-# exactly one place (see test_grids.py module docstring for the family
-# semantics: backup = additive CPs + rich gas donor, loadbearing = CPs
-# replace primary generation, control = additive CPs + no donor surplus).
+# ``_backup`` / ``_loadbearing`` / ``_decoupled`` / ``_control`` partitioning
+# logic lives in exactly one place (see test_grids.py module docstring for the
+# family semantics: backup = additive CPs + rich gas donor, loadbearing = CPs
+# replace primary generation, decoupled = loadbearing's fleet as independent
+# generators without coupling constraints, control = additive CPs + no donor
+# surplus).
 # ─────────────────────────────────────────────────────────────────────────────
 
-FAMILY_ORDER = ("backup", "loadbearing", "control")
+FAMILY_ORDER = ("backup", "loadbearing", "decoupled", "control")
+
+# One colour per family across EVERY figure module (bars, lines, matrices) —
+# per-module palettes drifted apart (#17BECF meant "backup" in the cross-
+# carrier matrix but a different family in the E16 bars). Hues match
+# pub_style.QUAL_PALETTE entries.
+FAMILY_COLOR = {
+    "backup": "#17BECF",
+    "loadbearing": "#1F4E96",
+    "decoupled": "#9467BD",
+    "control": "#7F7F7F",
+}
 
 
 def scenario_family(scenario) -> str:
-    """Family of a scenario key (``backup`` / ``loadbearing`` / ``control``).
+    """Family of a scenario key (one of ``FAMILY_ORDER``).
 
     Unknown keys (legacy names, ad-hoc grids) map to ``"other"`` instead of
     raising so older result CSVs can still be plotted.

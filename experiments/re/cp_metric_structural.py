@@ -37,6 +37,7 @@ import numpy as np
 import pandas as pd
 
 import monee.model as mm
+from monee.model.grid import DEFAULT_GAS_HHV_KWH_PER_KG
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -48,7 +49,9 @@ def _gas_demand_mw(model, grid) -> float:
     """Convert a gas Sink's mass_flow to MW using the same convention as
     the resilience metric (kg/s × HHV [kWh/kg] × 3.6).
     """
-    hhv = float(getattr(grid, "higher_heating_value_kwh_per_kg", 15.3))
+    hhv = float(getattr(
+        grid, "higher_heating_value_kwh_per_kg", DEFAULT_GAS_HHV_KWH_PER_KG
+    ))
     try:
         m = float(mm.upper(model.mass_flow_kgs))
     except Exception:
@@ -350,7 +353,9 @@ def _cp_rated_capacity(cp, label: str) -> float:
             return abs(float(getattr(cp.model, "el_mw", 0.0) or 0.0))
         if label == "PowerToGas":
             m_dot = abs(float(getattr(cp.model, "gas_mass_flow_kgs", 0.0) or 0.0))
-            return m_dot * 15.3 * 3.6  # kg/s × HHV × 3.6 → MW
+            # kg/s × HHV [kWh/kg] × 3.6 → MW; the former hardcoded 15.3
+            # (H-gas) inflated P2G rated capacity ×1.30 vs the lgas grids.
+            return m_dot * DEFAULT_GAS_HHV_KWH_PER_KG * 3.6
     except Exception:
         return 1.0
     return 1.0

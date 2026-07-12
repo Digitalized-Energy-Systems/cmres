@@ -67,6 +67,8 @@ TYPE_TO_CARRIER = {
     "SubHG": "heat",
     "PowerLoad": "electricity",
     "HeatLoad": "heat",
+    "HeatGenerator": "heat",
+    "HeatExchangerGenerator": "heat",
     "Sink": "gas",
     "Source": "gas",
     "ExtPowerGrid": "electricity",
@@ -499,7 +501,7 @@ try:
     from grid_topology_table import SCENARIO_LABEL as _GTT_SCENARIO_LABEL  # noqa: E402
 except Exception:  # pragma: no cover
     # Mirror of grid_topology_table.SCENARIO_LABEL (families: bk = backup,
-    # lb = loadbearing, ctl = control — see test_grids.py).
+    # lb = loadbearing, dc = decoupled, ctl = control — see test_grids.py).
     _GTT_SCENARIO_LABEL = {
         f"simbench_lv_{stem}_{family}": f"{stem_label}-{family_label}"
         for stem, stem_label in {
@@ -507,7 +509,8 @@ except Exception:  # pragma: no cover
             "high": "LV-l", "xl": "LV-xl", "xxl": "LV-xxl",
         }.items()
         for family, family_label in {
-            "backup": "bk", "loadbearing": "lb", "control": "ctl",
+            "backup": "bk", "loadbearing": "lb", "decoupled": "dc",
+            "control": "ctl",
         }.items()
     }
 
@@ -2027,7 +2030,7 @@ def cp_only_pooled_metric_comparison(
 
 _RES_SIZE_LABEL = {"no": "LV-no", "low": "LV-s", "mid": "LV-m",
                    "high": "LV-l", "xl": "LV-xl", "xxl": "LV-xxl"}
-_RES_FAMILY_ORDER = {"backup": 0, "loadbearing": 1, "control": 2}
+_RES_FAMILY_ORDER = {"backup": 0, "loadbearing": 1, "decoupled": 2, "control": 3}
 _RES_CARRIER_TO_SECTOR = {"electricity": "power", "heat": "heat", "gas": "gas"}
 
 
@@ -2035,7 +2038,9 @@ def _resilience_short_label(network_type) -> str:
     """Short per-grid label (LV-no … LV-xxl) for the compact, side-by-side pooled
     performance-drop figures; the strategy is carried by the panel title."""
     import re as _re
-    m = _re.search(r"lv_([a-z]+)_(?:backup|loadbearing|control)$", str(network_type))
+    m = _re.search(
+        r"lv_([a-z]+)_(?:backup|loadbearing|decoupled|control)$", str(network_type)
+    )
     if m and m.group(1) in _RES_SIZE_LABEL:
         return _RES_SIZE_LABEL[m.group(1)]
     return pretty_scenario(network_type)
@@ -2043,7 +2048,7 @@ def _resilience_short_label(network_type) -> str:
 
 def _pooled_resilience_row(pooled, classes):
     """Combined cross-family performance-drop view: one horizontal stacked-bar
-    panel per scenario family (backup | loadbearing | control), shared legend, so
+    panel per scenario family (eval_common.FAMILY_ORDER), shared legend, so
     the three strategies sit in one row in the dissertation E1 figure."""
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
@@ -2230,13 +2235,16 @@ def generation_capacity_per_sector(monee_net) -> Dict[str, float]:
     it is a bounded import budget, not installed capacity.
     """
     import monee.model as mm
+    from monee.model.grid import DEFAULT_GAS_HHV_KWH_PER_KG
 
-    hhv = 15.3
+    hhv = DEFAULT_GAS_HHV_KWH_PER_KG
     for n in monee_net.nodes_by_type(mm.Junction):
         g = n.grid
         if (g is not None and not isinstance(g, list)
                 and getattr(g, "name", None) == "gas"):
-            hhv = float(getattr(g, "higher_heating_value_kwh_per_kg", 15.3))
+            hhv = float(getattr(
+                g, "higher_heating_value_kwh_per_kg", DEFAULT_GAS_HHV_KWH_PER_KG
+            ))
             break
 
     cap = {"electricity": 0.0, "heat": 0.0, "gas": 0.0}
@@ -2290,7 +2298,9 @@ def generation_capacity_df(net_type_to_net) -> pandas.DataFrame:
 
 # Family tick labels under each density group in the grouped-stacked pooled
 # figure — same short tags as SCENARIO_LABEL's suffixes.
-_RES_FAMILY_SHORT = {"backup": "bk", "loadbearing": "lb", "control": "ctl"}
+_RES_FAMILY_SHORT = {
+    "backup": "bk", "loadbearing": "lb", "decoupled": "dc", "control": "ctl",
+}
 
 
 def pooled_resilience_grouped_capacity(
@@ -2341,7 +2351,10 @@ def pooled_resilience_grouped_capacity(
             sorted(pooled["network_type"].unique(), key=scenario_sort_key)
         )
     )
-    fams = [f for f in ("backup", "loadbearing", "control") if classes.get(f)]
+    fams = [
+        f for f in ("backup", "loadbearing", "decoupled", "control")
+        if classes.get(f)
+    ]
     stems: list = []
     stem_label: dict = {}
     for nt in sorted(pooled["network_type"].unique(), key=scenario_sort_key):
@@ -2869,8 +2882,9 @@ def cross_carrier_density_matrix(impact_df: pandas.DataFrame, output_dir: str):
     df["source_carrier"] = df["type"].map(
         lambda t: TYPE_TO_CARRIER.get(_type_name(t))
     )
-    # Drops unmapped types (HeatGenerator) and ambiguous junctions — both
-    # are 100 % never-sampled (NaN impact), so no harm is lost.
+    # Drops ambiguous junctions (heat/gas) and any unmapped stragglers.
+    # HeatGenerator is mapped → heat since it became MC-failable (it carries
+    # the decoupled family's CP heat mirrors).
     df = df[df["source_carrier"].notna() & (df["source_carrier"] != "heat/gas")]
     df["harm"] = _ec.harm_from_impact(df["impact"])
 
@@ -2966,19 +2980,31 @@ def cross_carrier_density_matrix(impact_df: pandas.DataFrame, output_dir: str):
 
     _FAM_STYLE = {
         "backup": dict(
-            color="#17BECF", dash="dash", width=2, symbol="square", size=6,
+            color=_ec.FAMILY_COLOR["backup"], dash="dash", width=2,
+            symbol="square", size=6,
             label="Backup — additive CPs + donor"),
         "loadbearing": dict(
-            color=pub_style.QUAL_PALETTE[0], dash="solid", width=2.5,
+            color=_ec.FAMILY_COLOR["loadbearing"], dash="solid", width=2.5,
             symbol="circle", size=7,
             label="Loadbearing — CPs replace generation"),
+        "decoupled": dict(
+            color=_ec.FAMILY_COLOR["decoupled"], dash="dashdot", width=2,
+            symbol="triangle-up", size=7,
+            label="Decoupled — mirrored capacity, no coupling"),
         "control": dict(
-            color="#7F7F7F", dash="dot", width=2, symbol="diamond", size=6,
+            color=_ec.FAMILY_COLOR["control"], dash="dot", width=2,
+            symbol="diamond", size=6,
             label="Control — additive, no donor"),
     }
     for i, s in enumerate(SOURCES):
         for j, t in enumerate(TARGETS):
             for fam in fams:
+                # The decoupled family has no multi-carrier components at any
+                # density — its "multi" cells are reindex-filled zeros, and a
+                # trace would render a measured-looking flat line for a
+                # structurally undefined quantity.
+                if fam == "decoupled" and s == "multi":
+                    continue
                 st = _FAM_STYLE[fam]
                 pts = excess[fam][(s, t)]
                 fig.add_trace(go.Scatter(
@@ -3094,13 +3120,17 @@ def cross_carrier_density_matrix(impact_df: pandas.DataFrame, output_dir: str):
         font=dict(size=17, color=pub_style.MUTED_COLOR),
     )
     if "control" in fams:
-        fig.add_annotation(
-            text=("control family: densities 0 / 0.10 / 0.25 only — "
-                  "dotted line interpolates"),
-            xref="paper", x=1.0, xanchor="right",
-            yref="paper", y=-0.075, yanchor="top", showarrow=False,
-            font=dict(size=12, color=pub_style.MUTED_COLOR),
-        )
+        ctl_d = sorted({d for f, d in scen_info.values() if f == "control"})
+        all_d = sorted({d for _, d in scen_info.values()})
+        if ctl_d != all_d:
+            fig.add_annotation(
+                text=("control family: densities "
+                      + " / ".join(f"{d:g}" for d in ctl_d)
+                      + " only — dotted line interpolates"),
+                xref="paper", x=1.0, xanchor="right",
+                yref="paper", y=-0.075, yanchor="top", showarrow=False,
+                font=dict(size=12, color=pub_style.MUTED_COLOR),
+            )
 
     Path(output_dir).mkdir(exist_ok=True, parents=True)
     eval.write_all_in_one(
@@ -3406,7 +3436,8 @@ def _scenario_density_distribution(network_type: str):
 
 
 def _make_cmres_artefact(
-    label, df_eval, monee_net, mc_npz_path, density, distribution
+    label, df_eval, monee_net, mc_npz_path, density, distribution,
+    impact_df_nt=None,
 ):
     """Lazy-import wrapper so cp_cn_evaluation.py doesn't hard-depend on
     cmres_eval at module load (the CMRES evaluation experiments are
@@ -3419,6 +3450,7 @@ def _make_cmres_artefact(
         mc_npz_path=mc_npz_path,
         density=density,
         distribution=distribution,
+        impact_df_nt=impact_df_nt,
     )
 
 
@@ -3525,6 +3557,7 @@ def evaluate(folder_id):
                     mc_npz_path=mc_npz if mc_npz.exists() else None,
                     density=density,
                     distribution=distribution,
+                    impact_df_nt=impact_df_nt,
                 )
             )
 

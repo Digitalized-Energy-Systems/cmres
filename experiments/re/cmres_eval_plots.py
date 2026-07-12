@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
 from eval_common import (  # noqa: E402  # canonical scenario-family helpers,
+    FAMILY_COLOR,
     FAMILY_ORDER,          # used by every cross-scenario plotter.
     scenario_family,
     scenario_stem,
@@ -2414,13 +2415,13 @@ def _e16_per_sector_heatmap(df: pd.DataFrame) -> go.Figure:
     return heat
 
 
-# One colour + hatch per scenario family for figures that put all three
-# strategies on one axis. QUAL_PALETTE hues so a family bar never reads as
-# a sector bar.
-_FAMILY_BAR_COLOR = {
-    fam: pub_style.QUAL_PALETTE[i] for i, fam in enumerate(FAMILY_ORDER)
+# One colour + hatch per scenario family for figures that put all
+# strategies on one axis. Colours come from eval_common.FAMILY_COLOR so
+# every figure module renders a family in the same hue.
+_FAMILY_BAR_COLOR = {fam: FAMILY_COLOR[fam] for fam in FAMILY_ORDER}
+_FAMILY_BAR_PATTERN = {
+    "backup": "", "loadbearing": "/", "decoupled": "x", "control": "\\",
 }
-_FAMILY_BAR_PATTERN = {"backup": "", "loadbearing": "/", "control": "\\"}
 
 
 def _stem_label(scenario: str) -> str:
@@ -2436,7 +2437,7 @@ def _stem_label(scenario: str) -> str:
 def _e16_ceiling_rho_combined(ceil: pd.DataFrame) -> go.Figure:
     """All-strategy ceiling comparison: grouped horizontal bars of
     ρ(N-1 shed, MC actual) with one bar per family at each density, so
-    backup / loadbearing / control sit on one shared axis instead of one
+    all families (eval_common.FAMILY_ORDER) sit on one shared axis instead of one
     figure each."""
     df = ceil.copy()
     df["family"] = df["scenario"].map(scenario_family)

@@ -101,6 +101,7 @@ def run_one(grid: str, input_dir: Path, shed_dir: Path, output_dir: Path):
         mc_npz_path=None,
         density=density,
         distribution=distribution,
+        impact_df_nt=impact_df_nt,
     )
     return artefact
 

@@ -33,7 +33,7 @@
 #SBATCH --nodelist=mpcs046,mpcs047
 
 # Tunable knobs — must match the launcher's defaults.
-N_GRIDS=${N_GRIDS:-15}
+N_GRIDS=${N_GRIDS:-24}
 N_SHARDS=${N_SHARDS:-8}
 
 # SLURM array index → (grid_idx, shard_idx) — both 0-based.

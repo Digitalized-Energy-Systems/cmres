@@ -22,6 +22,7 @@ from __future__ import annotations
 from typing import Tuple
 
 import monee.model as mm
+from monee.model.grid import DEFAULT_GAS_HHV_KWH_PER_KG
 
 from test_grids import ALL_GRIDS
 
@@ -33,7 +34,8 @@ from test_grids import ALL_GRIDS
 
 # Family suffixes (see test_grids.py): ``-bk`` = backup (additive CPs, rich
 # gas donor), ``-lb`` = loadbearing (CPs replace primary generation),
-# ``-ctl`` = control (additive CPs, no donor surplus).
+# ``-dc`` = decoupled (loadbearing's fleet as independent generators, no
+# coupling constraints), ``-ctl`` = control (additive CPs, no donor surplus).
 _STEM_LABEL = {
     "no": "LV-no",
     "low": "LV-s",
@@ -42,7 +44,9 @@ _STEM_LABEL = {
     "xl": "LV-xl",
     "xxl": "LV-xxl",
 }
-_FAMILY_LABEL = {"backup": "bk", "loadbearing": "lb", "control": "ctl"}
+_FAMILY_LABEL = {
+    "backup": "bk", "loadbearing": "lb", "decoupled": "dc", "control": "ctl",
+}
 
 SCENARIO_LABEL = {
     f"simbench_lv_{stem}_{family}": f"{stem_label}-{family_label}"
@@ -95,7 +99,9 @@ def _count_branches(net: mm.Network) -> Tuple[int, int, int]:
     return n_e, n_g, n_h
 
 
-def _gas_hhv(net: mm.Network, default: float = 15.3) -> float:
+def _gas_hhv(
+    net: mm.Network, default: float = DEFAULT_GAS_HHV_KWH_PER_KG
+) -> float:
     for n in net.nodes:
         g = getattr(n, "grid", None)
         if g is not None and getattr(g, "name", "") == "gas":

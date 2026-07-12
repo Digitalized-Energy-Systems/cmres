@@ -81,6 +81,10 @@ class ScenarioArtefacts:
     ``distribution``: ``"distributed" | "centralized" | None`` for E4.
     ``multilayer_G``: cached multilayer graph (built lazily by E8 and reused
         by E9, E11, E12, E13).
+    ``impact_df_nt``: optional per-scenario MC impact slice (the input
+        ``build_matched_df`` consumed). E16 uses it for the full-surface
+        ceiling — shed rows without a metric score (kind ``"child"``) can
+        only be joined to MC actuals through it, not through df_eval.
     """
 
     label: str
@@ -90,6 +94,7 @@ class ScenarioArtefacts:
     density: Optional[float] = None
     distribution: Optional[str] = None
     multilayer_G: Optional[nx.Graph] = field(default=None, repr=False)
+    impact_df_nt: Optional[pd.DataFrame] = field(default=None, repr=False)
 
     def get_multilayer_graph(self) -> nx.Graph:
         if self.multilayer_G is None:
@@ -900,8 +905,8 @@ def _e16_join_id(cp_id, cp_type) -> str:
     return cp_id_str
 
 
-def _e16_merge_one(art: "ScenarioArtefacts", shed_csv: Path) -> pd.DataFrame:
-    """Return the per-scenario merged dataframe (or empty if nothing joins).
+def _load_shed_csv(shed_csv: Path) -> pd.DataFrame:
+    """Load a single-removal shed CSV, baseline-subtracted.
 
     Per-carrier sheds are baseline-subtracted: every solved shed includes
     the no-fault baseline (nonzero on several grids — up to 0.055 MW power
@@ -922,11 +927,45 @@ def _e16_merge_one(art: "ScenarioArtefacts", shed_csv: Path) -> pd.DataFrame:
             if base_val > 0:
                 shed[col] = (shed[col] - base_val).clip(lower=0)
     shed = shed[shed["cp_id"] != "_baseline_"].copy()
+    shed["cp_id"] = shed["cp_id"].astype(str)
+    return shed
+
+
+def _shed_impact_id(cp_id, kind, impact_ids, branch_lookup) -> Optional[str]:
+    """Map a shed-CSV row to the metrics/impact id space (``child:3``,
+    ``compound:5``, ``branch:(5, 134, 0)``). Kind-based, unlike
+    ``eval_common.match_impact_id`` which keys off the metric-side cp_type;
+    shed rows carry ``kind`` instead. Returns ``None`` when unmatched."""
+    s = str(cp_id)
+    if kind in ("child", "compound"):
+        return s if s in impact_ids else None
+    if kind == "branch":
+        candidate = f"branch:{s}"
+        if candidate in impact_ids:
+            return candidate
+        parts = [p.strip() for p in s.strip("()").split(",")]
+        return branch_lookup.get((parts[0], parts[1])) if len(parts) >= 2 else None
+    if kind == "branch_cp":
+        try:
+            from_id, to_id = s.split("→")
+        except ValueError:
+            return None
+        return branch_lookup.get((from_id.strip(), to_id.strip()))
+    return None
+
+
+def _e16_merge_one(art: "ScenarioArtefacts", shed_csv: Path) -> pd.DataFrame:
+    """Return the per-scenario merged dataframe (or empty if nothing joins).
+
+    Inner join on df_eval: shed rows without a metric score (kind
+    ``"child"``) drop out here by design — they are consumed by the
+    full-surface ceiling instead (see the caller).
+    """
+    shed = _load_shed_csv(shed_csv)
     df = art.df_eval.copy()
     df["_join_cp_id"] = df.apply(
         lambda r: _e16_join_id(r["cp_id"], r.get("cp_type", "")), axis=1
     )
-    shed["cp_id"] = shed["cp_id"].astype(str)
     keep = ["cp_id", "kind", "total_shed", "power_shed", "heat_shed", "gas_shed"]
     return df.merge(
         shed[keep], left_on="_join_cp_id", right_on="cp_id", how="inner",
@@ -958,9 +997,14 @@ def experiment_e16_single_removal_validation(
     ``"compound:5"``) so compounds aren't silently dropped.
 
     Outputs (in ``output_dir``):
-      - ``E16_metric_vs_shed.csv``      : ρ per (scenario, metric)
-      - ``E16_shed_vs_mc_ceiling.csv``  : ρ shed vs MC actual_total
-      - ``E16_<scenario>_merged.csv``   : raw joined dataframe per scenario
+      - ``E16_metric_vs_shed.csv``           : ρ per (scenario, metric)
+      - ``E16_shed_vs_mc_ceiling.csv``       : ρ shed vs MC actual_total,
+        metric-scored components only (branches + CPs — the rows the
+        ranking analysis sees)
+      - ``E16_shed_vs_mc_ceiling_full.csv``  : same ρ over the FULL swept
+        surface incl. score-less child targets (generation outages), joined
+        straight onto the MC actuals; needs ``art.impact_df_nt``
+      - ``E16_<scenario>_merged.csv``        : raw joined dataframe per scenario
 
     Plotting is handled by ``cmres_eval_plots.plot_e16_single_removal``,
     which consumes these CSVs.
@@ -980,6 +1024,7 @@ def experiment_e16_single_removal_validation(
 
     rows: List[dict] = []
     ceiling_rows: List[dict] = []
+    full_ceiling_rows: List[dict] = []
     cp_pool_frames: List[pd.DataFrame] = []
     for art in artefacts:
         shed_csv = Path(shed_dir) / f"single_removal_shed_{art.label}.csv"
@@ -1006,6 +1051,40 @@ def experiment_e16_single_removal_validation(
                     "rho_shed_vs_mc": rho, "p_shed_vs_mc": p,
                     "ci_lo": lo, "ci_hi": hi,
                     "n": int(cmask.sum()),
+                })
+
+        # Full-surface ceiling: the merge above is an inner join on df_eval,
+        # so score-less child targets (generation outages) never reach it.
+        # Join the shed table straight onto the MC actuals instead — this is
+        # the honest "what any predictor could achieve over the whole
+        # MC-priced failure surface" number.
+        if art.impact_df_nt is not None:
+            shed_all = _load_shed_csv(shed_csv)
+            impact_ids, blk, total_lookup, _pc = _ec.build_actual_lookups(
+                art.impact_df_nt
+            )
+            shed_all["_impact_id"] = [
+                _shed_impact_id(cid, k, impact_ids, blk)
+                for cid, k in zip(shed_all["cp_id"], shed_all["kind"])
+            ]
+            m_full = shed_all.dropna(subset=["_impact_id"]).copy()
+            m_full["actual_total"] = m_full["_impact_id"].map(total_lookup)
+            fmask = (
+                m_full["actual_total"].astype(float) > _ec.MC_FAILED_EPS
+            ) & m_full["total_shed"].notna()
+            if fmask.sum() >= 3:
+                rho, p, lo, hi = _spearman_with_ci(
+                    m_full.loc[fmask, "total_shed"],
+                    m_full.loc[fmask, "actual_total"],
+                )
+                full_ceiling_rows.append({
+                    "scenario": art.label,
+                    "rho_shed_vs_mc": rho, "p_shed_vs_mc": p,
+                    "ci_lo": lo, "ci_hi": hi,
+                    "n": int(fmask.sum()),
+                    "n_child": int(
+                        (m_full.loc[fmask, "kind"] == "child").sum()
+                    ),
                 })
 
         # Per-metric ρ — sliced into five groups so the per-sector signal on
@@ -1147,6 +1226,10 @@ def experiment_e16_single_removal_validation(
     if ceiling_rows:
         ceil_df = pd.DataFrame(ceiling_rows)
         ceil_df.to_csv(out_dir / "E16_shed_vs_mc_ceiling.csv", index=False)
+    if full_ceiling_rows:
+        pd.DataFrame(full_ceiling_rows).to_csv(
+            out_dir / "E16_shed_vs_mc_ceiling_full.csv", index=False
+        )
 
     # Cross-scenario pooled CP evaluation. Per scenario the CP slice is
     # n≈14 — too small for stable rank statistics (P@10 random baseline

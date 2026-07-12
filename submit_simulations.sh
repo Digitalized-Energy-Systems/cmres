@@ -26,7 +26,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-N_GRIDS=${N_GRIDS:-15}
+N_GRIDS=${N_GRIDS:-24}
 N_SHARDS=${N_SHARDS:-96}
 SUBMIT_MERGE=${SUBMIT_MERGE:-1}
 GRID_NAME=${GRID_NAME:-}

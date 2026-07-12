@@ -49,11 +49,11 @@ DEFAULT_DIR = Path("data/out/single_removal_shed")
 # label so the three strategies can sit in one row.
 _SIZE_LABEL = {"no": "LV-no", "low": "LV-s", "mid": "LV-m",
                "high": "LV-l", "xl": "LV-xl", "xxl": "LV-xxl"}
-_FAMILY_ORDER = {"backup": 0, "loadbearing": 1, "control": 2}
+_FAMILY_ORDER = {"backup": 0, "loadbearing": 1, "decoupled": 2, "control": 3}
 
 
 def _short_grid(grid: str) -> str:
-    m = re.search(r"lv_([a-z]+)_(?:backup|loadbearing|control)$", str(grid))
+    m = re.search(r"lv_([a-z]+)_(?:backup|loadbearing|decoupled|control)$", str(grid))
     if m and m.group(1) in _SIZE_LABEL:
         return _SIZE_LABEL[m.group(1)]
     return pretty_scenario(grid)
@@ -226,14 +226,17 @@ def _srs_bump_all_fonts_by(fig: go.Figure, delta: int) -> None:
 # a grid without CPs (no ``compound`` / ``branch_cp`` rows) must still leave
 # the ``branch`` colour unchanged, otherwise the visual reading flips
 # between scenarios. ``_enumerate_targets`` in single_removal_shed.py emits
-# exactly these three kinds; any extension MUST add an entry here.
+# exactly these four kinds; any extension MUST add an entry here.
 KIND_COLOR_MAP = {
     "branch":    ev.PALETTE_QUAL[0],  # plain branches (PowerLine, GasPipe, …)
     "branch_cp": ev.PALETTE_QUAL[1],  # branch-level CPs (PowerToGas, …)
     "compound":  ev.PALETTE_QUAL[2],  # compound CPs (CHP, PowerToHeat, …)
+    # PALETTE_QUAL[3] (#e45756) is reserved for the baseline reference
+    # line/marker (see _hist_total / _pooled_total_shed_box) — skip it.
+    "child":     ev.PALETTE_QUAL[4],  # generation childs (gens, sources, heat gens)
 }
 # Stable category order so px doesn't re-order the legend by row count.
-KIND_ORDER = ["branch", "branch_cp", "compound"]
+KIND_ORDER = ["branch", "branch_cp", "compound", "child"]
 
 
 def _load(csv_path: Path):
@@ -381,7 +384,7 @@ def _kind_summary(sweep: pd.DataFrame, grid: str) -> go.Figure:
                marker=pub_style.bar_marker(pub_style.QUAL_PALETTE[1],
                                            pattern_shape=pub_style.PATTERN_SHAPES[1])),
     ])
-    # Kept vertical: only three (ordinal) component kinds, read left-to-right.
+    # Kept vertical: few (ordinal) component kinds, read left-to-right.
     fig.update_layout(barmode="group")
     pub_style.apply_theme(
         fig, title=f"{pretty_scenario(grid)}: total shed by component kind (mean vs max)",
@@ -432,8 +435,13 @@ from eval_common import (  # noqa: E402
 
 # Per-family line dash / opacity so grids sharing a density stem (and hence
 # a hue, see _grid_color_map) stay visually distinguishable across families.
-_FAMILY_DASH = {"backup": "solid", "loadbearing": "dash", "control": "dot"}
-_FAMILY_OPACITY = {"backup": 1.0, "loadbearing": 0.7, "control": 0.45}
+_FAMILY_DASH = {
+    "backup": "solid", "loadbearing": "dash", "decoupled": "dashdot",
+    "control": "dot",
+}
+_FAMILY_OPACITY = {
+    "backup": 1.0, "loadbearing": 0.7, "decoupled": 0.55, "control": 0.45,
+}
 
 
 def _grid_color_map(grids: List[str]) -> Dict[str, str]:
@@ -807,7 +815,7 @@ def _pooled_mean_shed_by_carrier_row(
         records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
         classes: List[Tuple[str, List[str]]]) -> go.Figure:
     """Combined cross-family view: one horizontal stacked-bar panel per scenario
-    family (backup | loadbearing | control) sharing a single legend, so the three
+    family (eval_common.FAMILY_ORDER) sharing a single legend, so the
     strategies sit in one row in the dissertation. Mirrors
     :func:`_pooled_mean_shed_by_carrier` but across families."""
     carriers = (("electricity", "power_shed"), ("heat", "heat_shed"), ("gas", "gas_shed"))
