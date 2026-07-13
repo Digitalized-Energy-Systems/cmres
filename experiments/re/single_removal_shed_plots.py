@@ -811,6 +811,66 @@ def _pooled_mean_shed_by_carrier(records: Dict[str, Tuple[pd.DataFrame, pd.Serie
     return fig
 
 
+def _pooled_total_shed_by_carrier(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
+                                  grids: List[str]) -> go.Figure:
+    """Total shed summed over all single-component removals, grouped bars per
+    carrier.
+
+    Mirrors :func:`_pooled_mean_shed_by_carrier` but sums each carrier's shed
+    column instead of averaging it, so bar length is the grid's cumulative
+    shed mass across the whole sweep rather than the per-component mean.
+    Unlike the mean view this scales with the number of components swept, so
+    grids with more removals contribute proportionally more.
+    """
+    carriers = ("electricity", "heat", "gas")
+    col_map = {"electricity": "power_shed", "heat": "heat_shed", "gas": "gas_shed"}
+    rows = []
+    for g in grids:
+        sweep, _ = records[g]
+        if sweep.empty:
+            continue
+        for c in carriers:
+            col = col_map[c]
+            if col not in sweep.columns:
+                continue
+            rows.append({
+                "grid": g,
+                "carrier": c,
+                "total_shed": float(sweep[col].sum()),
+                "n": int(len(sweep)),
+            })
+    if not rows:
+        return go.Figure()
+    df = pd.DataFrame(rows)
+    fig = go.Figure()
+    for c in carriers:
+        sub = df[df["carrier"] == c]
+        if sub.empty:
+            continue
+        fig.add_trace(go.Bar(
+            name=pub_style.SECTOR_PRETTY[c],
+            y=[_short_grid(g) for g in sub["grid"]],
+            x=sub["total_shed"],
+            orientation="h",
+            marker=pub_style.sector_marker(c),
+            hovertemplate=("<b>%{y}</b><br>" + pub_style.SECTOR_PRETTY[c]
+                           + ": total = %{x:.4f} MW"
+                           "<br>n = %{customdata[0]}<extra></extra>"),
+            customdata=np.c_[sub["n"].values],
+        ))
+    # Stacked horizontal: bar length = total shed summed over the sweep, so the
+    # segments show the per-sector composition while grids stay comparable.
+    fig.update_layout(barmode="stack")
+    pub_style.apply_theme(
+        fig, title="Total load shed by carrier",
+        height=pub_style.hbar_height(len(grids), 3),
+        width=pub_style.BAR_FIG_WIDTH, font_bump=1, legend_top=True,
+    )
+    fig.update_yaxes(autorange="reversed")
+    fig.update_xaxes(title="Total shed (MW)")
+    return fig
+
+
 def _pooled_mean_shed_by_carrier_row(
         records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
         classes: List[Tuple[str, List[str]]]) -> go.Figure:
@@ -939,6 +999,7 @@ def _emit_pooled_report(
         _pooled_pareto(records, grids),
         _pooled_carrier_box(records, grids),
         _pooled_mean_shed_by_carrier(records, grids),
+        _pooled_total_shed_by_carrier(records, grids),
         _pooled_kind_summary(records, grids),
         _pooled_top_components(records, grids, top_n=10),
         _pooled_solve_time(records, grids),
@@ -950,6 +1011,7 @@ def _emit_pooled_report(
         "Pareto curves overlaid",
         "Per-carrier shed by grid",
         "Mean per-component shed by sector",
+        "Total shed by sector",
         "Mean total shed by kind, per grid",
         "Top-10 components per grid",
         "Solve-time per grid",
@@ -961,6 +1023,7 @@ def _emit_pooled_report(
         "pareto_overlay",
         "carrier_box",
         "mean_shed_by_carrier",
+        "total_shed_by_carrier",
         "kind_summary",
         "top10_components",
         "solve_time",

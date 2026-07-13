@@ -11,15 +11,22 @@ Three scenario families demonstrate how CPs affect resilience:
                      stays 50 % above the CP fleet's rated gas draw at every
                      density. Electrical failures can be rescued by CHPs
                      drawing on the gas surplus → "CPs help".
-  ``_loadbearing`` - CPs replace primary generation (``cp_capacity_invariant``),
-                     symmetric h=0.10 sized CP-aware so the CP fleet is fully
-                     fuelable at baseline. Gas-side failures cascade through
-                     the load-bearing CHPs → "CPs hurt".
+  ``_loadbearing`` - CPs replace primary generation (``cp_capacity_invariant``).
+                     CHP installed capacity is weighted far above P2G/P2H and
+                     the headroom/slack is minimal (h=0.06), so CHP is the
+                     marginal electricity supply pushed to the primary-el pool
+                     ceiling: the electricity grid genuinely depends on the gas
+                     grid. Losing the gas-fed CHP fleet strands ~26 %/48 % of el
+                     demand at mid/xxl (net CHP el injection p_out−p_in exceeds
+                     the h·D buffer at every density ≥ low). Gas-side failures
+                     cascade through the load-bearing CHPs → "CPs hurt". Knobs in
+                     ``_LB_CP_KWARGS`` / ``_LB_H``; P2G/P2H reduced but present.
   ``_decoupled``   - decoupled mirror of ``_loadbearing``: the identical
                      seeded fleet (sites, types, rated outputs) realised as
                      independent single-carrier generators with no
                      input-carrier draw (monee ``decoupled_generation``),
-                     still replacing primary generation; symmetric h=0.10.
+                     still replacing primary generation; shares ``_loadbearing``'s
+                     CHP-heavy sizing and minimal h=0.06 so the fleets match.
                      ``loadbearing − decoupled`` isolates the cross-carrier
                      dependency, ``decoupled − no-CP`` the pure re-siting
                      effect of moving capacity onto the CP buses.
@@ -638,7 +645,8 @@ def _validate_headroom_balance(
 
 def create_large_lv_simbench(density, central=False, cp_capacity_invariant=False,
                              h_el=0.20, h_gas=0.20, donor_gas_cp_margin=None,
-                             decoupled=False):
+                             decoupled=False, chp_p_share=1.6, p2g_p_share=1.0,
+                             p2h_p_share=0.2, cp_size_multiplier=3.0):
     """Factory for one grid variant.
 
     ``h_el`` / ``h_gas`` are per-carrier headroom fractions (gen sized at
@@ -679,10 +687,10 @@ def create_large_lv_simbench(density, central=False, cp_capacity_invariant=False
             coupling_kwargs={
                 "seed": 1,
                 "use_hg_variants": True,
-                "chp_p_share": 1.6,
-                "p2g_p_share": 1,
-                "p2h_p_share": 0.2,
-                "cp_size_multiplier": 3.0,
+                "chp_p_share": chp_p_share,
+                "p2g_p_share": p2g_p_share,
+                "p2h_p_share": p2h_p_share,
+                "cp_size_multiplier": cp_size_multiplier,
                 "replace_primary_generation": cp_capacity_invariant or decoupled,
                 "decoupled_generation": decoupled,
             },
@@ -792,18 +800,42 @@ def _backup(density):
     )
 
 
-# "CPs hurt": CPs replace primary generation; CP-aware symmetric sizing.
+# "CPs hurt": CHPs replace primary electricity generation and are sized to be
+# the marginal el supply, so the electricity grid genuinely depends on the gas
+# grid. CHP capacity is weighted far above P2G/P2H (per-node 5.4 : 0.5 : 0.4 ×
+# p_ref) — pushed to the native primary-el pool ceiling that
+# ``replace_primary_generation`` allows (CHP el output cannot exceed the pool it
+# replaces). Headroom/slack is minimal (h=0.06): the smallest value for which
+# the sparsest (low-density) baseline still solves to ≈0 shed — below it, losses
+# exceed the buffer. With this tuning the net CHP el injection (p_out − p_in)
+# exceeds the h·D buffer at every density ≥ low, so losing the gas-fed CHP fleet
+# (e.g. a shared gas-corridor failure) strands ~30 %/52 % of el demand at
+# mid/xxl (numerically verified). P2G and P2H remain in the fleet; they are the
+# el-consuming CPs whose curtailment would otherwise mask the dependency, so
+# their share is reduced but non-zero.
+_LB_CP_KWARGS = dict(
+    chp_p_share=3.0, p2g_p_share=0.3, p2h_p_share=0.2, cp_size_multiplier=1.8
+)
+_LB_H = 0.06
+
+
 def _loadbearing(density):
     return create_large_lv_simbench(
-        density, cp_capacity_invariant=True, h_el=0.10, h_gas=0.10
+        density, cp_capacity_invariant=True, h_el=_LB_H, h_gas=_LB_H,
+        **_LB_CP_KWARGS,
     )
 
 
-# Decoupled mirror of _loadbearing: same fleet as independent generators,
-# no coupling constraint. loadbearing − decoupled = cross-carrier dependency.
+# Decoupled mirror of _loadbearing: the IDENTICAL seeded fleet (same sizing
+# knobs and headroom, hence the shared ``_LB_CP_KWARGS`` / ``_LB_H``) realised as
+# independent single-carrier generators with no input draw. Its el mirror
+# generators are gas-independent, so the gas failure that strands el in
+# loadbearing cannot strand el here — loadbearing − decoupled isolates the
+# gas→electricity dependency.
 def _decoupled(density):
     return create_large_lv_simbench(
-        density, decoupled=True, h_el=0.10, h_gas=0.10
+        density, decoupled=True, h_el=_LB_H, h_gas=_LB_H,
+        **_LB_CP_KWARGS,
     )
 
 
