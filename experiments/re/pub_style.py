@@ -102,8 +102,8 @@ def qual_pattern(i: int) -> str:
 # Typography / layout constants (from scare plots.py)
 # ─────────────────────────────────────────────────────────────────────────────
 
-_FONT_FAMILY = "Inter, -apple-system, Segoe UI, Roboto, sans-serif"
-_TITLE_FONT_FAMILY = "Charter, Georgia, 'Times New Roman', serif"
+_FONT_FAMILY = "Libertinus Sans, Inter, -apple-system, Segoe UI, Roboto, sans-serif"
+_TITLE_FONT_FAMILY = "Libertinus Sans, Inter, -apple-system, Segoe UI, Roboto, sans-serif"
 
 _FIG_WIDTH = 1000
 _FIG_HEIGHT = 440

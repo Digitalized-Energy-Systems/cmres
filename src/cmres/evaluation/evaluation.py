@@ -30,7 +30,7 @@ pio.kaleido.scope.mathjax = None
 # Carrier-coloured plots keep using ``NETWORK_COLOR_MAP``.
 # ─────────────────────────────────────────────────────────────────────────────
 
-_FONT_FAMILY = "Inter, Helvetica Neue, Helvetica, Arial, sans-serif"
+_FONT_FAMILY = "Libertinus Sans, Inter, Helvetica Neue, Helvetica, Arial, sans-serif"
 _FONT_COLOR = "#1f2933"
 _AXIS_LINE = "#cbd2d7"
 _AXIS_GRID = "#e6e8eb"

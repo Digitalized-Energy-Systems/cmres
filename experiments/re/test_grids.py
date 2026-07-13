@@ -37,12 +37,14 @@ Three scenario families demonstrate how CPs affect resilience:
   ``_control``     - additive CPs, both carriers tight (h=0.04). Negative
                      control: without donor-carrier surplus CPs cannot help.
 
-Headroom ``h`` per carrier is split 50/50: in-grid generation is sized at
-``(1 + h/2) ×`` effective demand and the ext-grid slack bound at
-``±(h/2) ×`` effective demand, where effective demand includes the rated CP
-input draw (and generation is credited with the rated CP output) in the
-CP-aware ``_loadbearing`` family. Heat is never rescaled — the heat-side ext
-grid mass flow is hydraulically fixed by the water sinks.
+Headroom ``h`` per carrier sets a fixed absolute net capacity ``h × D`` over
+demand (``D`` = end-user demand), split 50/50 between in-grid generation
+over-provision and the ext-grid slack bound. In the CP-aware ``_loadbearing``
+family, generation additionally covers the rated CP input draw and is credited
+with the rated CP output, so the CP fleet is fuelable at baseline while the
+net-capacity margin stays sized on the density-invariant ``D`` (not on
+``D + CPin``, which grows ~40 % over the density sweep). Heat is never rescaled
+— the heat-side ext grid mass flow is hydraulically fixed by the water sinks.
 
 Every baseline (no-fault) grid must solve to ≈ zero end-user load shed; see
 ``experiments/re/analyze_baseline_shed.py --assert-clean``.
@@ -447,23 +449,30 @@ def _is_mirror_child(c) -> bool:
 
 def _apply_headroom(net, h_el: float, h_gas: float, cp_aware: bool = False) -> dict:
     """Scale in-grid electricity + gas generation and size ext-grid slack
-    budgets so each carrier has headroom ``h`` over its *effective* demand,
-    split 50/50 between generation and slack. Heat untouched.
+    budgets so each carrier carries a fixed absolute net capacity ``h · D``
+    over its demand, split 50/50 between generation over-provision and slack.
+    Heat untouched.
 
     Per carrier with headroom ``h``::
 
-        gen_target = (1 + h/2) · (D + CPin) − CPout
-        slack      =     (h/2) · (D + CPin)
+        gen_target = (D + CPin) + (h/2) · D − CPout
+        slack      =              (h/2) · D
 
     where ``D`` is end-user demand and ``CPin`` / ``CPout`` are the rated CP
-    input draw / output on that carrier (zero unless ``cp_aware``).
+    input draw / output on that carrier (zero unless ``cp_aware``). Generation
+    covers the full effective demand ``D + CPin`` (so the CP fleet is fuelable
+    at baseline) plus half the margin; the slack carries the other half, giving
 
-    ``cp_aware=True`` is meant for the ``_loadbearing`` family: combined with
-    the demand rebalancing of ``_balance_demand_for_cp_replacement``
-    (``D + CPin`` = no-CP demand), total supply capacity ``gen + CPout`` stays
-    invariant across CP densities while the CP fleet is fully fuelable at
-    baseline. For additive CPs (off at baseline) use ``cp_aware=False`` so
-    supply is sized on end-user demand only.
+        net capacity = (gen + CPout + slack) − (D + CPin) = h · D
+
+    sized on the density-invariant end-user demand ``D`` — so it stays constant
+    across the CP-density sweep. (The ``_loadbearing`` family previously sized
+    the margin on ``D + CPin``, so both generation and the fault-time slack
+    reserve grew ~40 % over the sweep, a confound for the resilience metric.)
+
+    ``cp_aware=True`` is meant for the ``_loadbearing`` family. For additive CPs
+    (off at baseline) use ``cp_aware=False`` (``CPin = CPout = 0``), which
+    reduces the above to the plain ``(1 + h/2)·D`` sizing.
 
     Decoupled-mirror children (``mirror_cp_*``) are plain generator/Source
     children, but they stand in for the fixed-rating CP fleet: like CPs they
@@ -476,13 +485,20 @@ def _apply_headroom(net, h_el: float, h_gas: float, cp_aware: bool = False) -> d
     io = _cp_io_mw(net) if cp_aware else dict(p_in=0.0, g_in=0.0, p_out=0.0, g_out=0.0)
 
     # Electricity ──────────────────────────────────────────────────────────
+    # Margin (net capacity) is sized on the density-invariant end-user demand
+    # p_margin_base, NOT on D+CPin, so the *absolute* net capacity h·D_base
+    # stays constant across the CP-density sweep. Generation still covers the
+    # full effective demand D+CPin (fuelling the CP fleet) plus half the fixed
+    # margin; the ext-grid slack carries the other half.
     p_demand_eff = t["p_demand_mw"] + io["p_in"]
-    p_target_mw = (1.0 + h_el / 2.0) * p_demand_eff - io["p_out"]
+    p_margin_base = t["p_demand_mw"]
+    p_target_mw = p_demand_eff + (h_el / 2.0) * p_margin_base - io["p_out"]
     if p_demand_eff > 1e-9 and p_target_mw <= 0:
         raise RuntimeError(
             f"Electricity gen target {p_target_mw:.4f} MW ≤ 0: rated CP power "
-            f"output ({io['p_out']:.4f} MW) exceeds (1+h/2)·effective demand "
-            f"({p_demand_eff:.4f} MW). Reduce CP density/size or raise h_el."
+            f"output ({io['p_out']:.4f} MW) exceeds effective demand + margin "
+            f"({p_demand_eff + (h_el / 2.0) * p_margin_base:.4f} MW). "
+            f"Reduce CP density/size or raise h_el."
         )
     pgens_all = list(net.childs_by_type(mm.PowerGenerator))
     mirror_p_mw = sum(
@@ -511,12 +527,14 @@ def _apply_headroom(net, h_el: float, h_gas: float, cp_aware: bool = False) -> d
 
     # Gas ─────────────────────────────────────────────────────────────────
     g_demand_eff_mw = t["g_demand_mw"] + io["g_in"]
-    g_target_mw = (1.0 + h_gas / 2.0) * g_demand_eff_mw - io["g_out"]
+    g_margin_base_mw = t["g_demand_mw"]
+    g_target_mw = g_demand_eff_mw + (h_gas / 2.0) * g_margin_base_mw - io["g_out"]
     if g_demand_eff_mw > 1e-9 and g_target_mw <= 0:
         raise RuntimeError(
             f"Gas gen target {g_target_mw:.4f} MW ≤ 0: rated CP gas output "
-            f"({io['g_out']:.4f} MW) exceeds (1+h/2)·effective demand "
-            f"({g_demand_eff_mw:.4f} MW). Reduce CP density/size or raise h_gas."
+            f"({io['g_out']:.4f} MW) exceeds effective demand + margin "
+            f"({g_demand_eff_mw + (h_gas / 2.0) * g_margin_base_mw:.4f} MW). "
+            f"Reduce CP density/size or raise h_gas."
         )
     g_target_kgps = g_target_mw / (3.6 * t["hhv"]) if t["hhv"] > 0 else 0.0
     gsources_all = [
@@ -548,8 +566,8 @@ def _apply_headroom(net, h_el: float, h_gas: float, cp_aware: bool = False) -> d
         )
 
     return dict(
-        slack_el_mw=(h_el / 2.0) * p_demand_eff,
-        slack_gas_kgps=(h_gas / 2.0) * g_demand_eff_mw / (3.6 * t["hhv"]),
+        slack_el_mw=(h_el / 2.0) * p_margin_base,
+        slack_gas_kgps=(h_gas / 2.0) * g_margin_base_mw / (3.6 * t["hhv"]),
     )
 
 
@@ -563,47 +581,47 @@ def _validate_headroom_balance(
     label: str = "",
     tol: float = 0.01,
 ) -> None:
-    """Verify the carrier totals match the headroom contract:
+    """Verify the carrier totals match the fixed-net-capacity contract:
 
-      (gen + CPout) ≈ (1 + h/2) × (demand + CPin)   (within ``tol`` relative)
-      slack         ≈ (    h/2) × (demand + CPin)   (within ``tol`` relative)
+      net capacity (gen + CPout + slack) − (demand + CPin) ≈ h · D
+      slack                                                ≈ (h/2) · D
 
-    with CPin/CPout = 0 unless ``cp_aware``, so the headroom is *actually*
-    reached and *evenly* split between in-grid generation and slack budget.
-    Heat is intentionally not checked. Raises ``AssertionError`` with a
-    diagnostic message on mismatch.
+    where ``D`` is the density-invariant end-user demand (``margin_base``) and
+    CPin/CPout = 0 unless ``cp_aware``. This confirms the absolute net capacity
+    is sized on ``D`` — constant across the density sweep — not on ``D + CPin``,
+    and that generation still covers the full effective demand (net capacity
+    stays ≥ 0, i.e. the CP fleet is fuelable). Heat is intentionally not
+    checked. Raises ``AssertionError`` with a diagnostic message on mismatch.
     """
     t = _carrier_totals(net)
     io = _cp_io_mw(net) if cp_aware else dict(p_in=0.0, g_in=0.0, p_out=0.0, g_out=0.0)
     prefix = f"[headroom:{label}]" if label else "[headroom]"
 
-    def _check(carrier, h, demand_eff, supply, slack, slack_human):
-        expected_gen = 1.0 + h / 2.0
-        expected_slack = h / 2.0
+    def _check(carrier, h, demand_eff, margin_base, supply, slack, slack_human):
         if demand_eff <= 1e-9:
             print(f"{prefix} {carrier}: demand=0 — nothing to check")
             return
-        gen_r, slack_r = supply / demand_eff, slack / demand_eff
-        gen_err = gen_r - expected_gen
-        slack_err = slack_r - expected_slack
+        overprov = supply - demand_eff
+        net_cap = overprov + slack
+        net_r = net_cap / margin_base if margin_base > 1e-9 else float("nan")
+        slack_r = slack / margin_base if margin_base > 1e-9 else float("nan")
         print(
-            f"{prefix} {carrier}: demand_eff={demand_eff:.4f} MW  "
-            f"gen+CPout={supply:.4f} MW (×{gen_r:.4f}, target ×{expected_gen:.2f}, Δ={gen_err:+.4f})  "
-            f"slack=±{slack_human} (×{slack_r:.4f}, target ×{expected_slack:.2f}, Δ={slack_err:+.4f})"
+            f"{prefix} {carrier}: demand_eff={demand_eff:.4f} MW  D_base={margin_base:.4f} MW  "
+            f"gen+CPout={supply:.4f} MW  slack=±{slack_human}  "
+            f"net_cap={net_cap:.4f} MW (×D_base {net_r:.4f}, target ×{h:.2f}, Δ={net_r - h:+.4f})"
         )
-        assert abs(gen_err) <= tol, (
-            f"{prefix} {carrier} (gen+CPout)/demand_eff={gen_r:.4f}, "
-            f"expected ≈{expected_gen:.4f} (tol={tol})"
+        assert abs(net_r - h) <= tol, (
+            f"{prefix} {carrier} net_cap/D_base={net_r:.4f}, expected ≈{h:.4f} (tol={tol})"
         )
-        assert abs(slack_err) <= tol, (
-            f"{prefix} {carrier} slack/demand_eff={slack_r:.4f}, "
-            f"expected ≈{expected_slack:.4f} (tol={tol})"
+        assert abs(slack_r - h / 2.0) <= tol, (
+            f"{prefix} {carrier} slack/D_base={slack_r:.4f}, expected ≈{h / 2.0:.4f} (tol={tol})"
         )
 
     _check(
         "electricity",
         h_el,
         t["p_demand_mw"] + io["p_in"],
+        t["p_demand_mw"],
         t["p_gen_mw"] + io["p_out"],
         slack_el_mw, f"{slack_el_mw:.4f} MW",
     )
@@ -611,6 +629,7 @@ def _validate_headroom_balance(
         "gas",
         h_gas,
         t["g_demand_mw"] + io["g_in"],
+        t["g_demand_mw"],
         t["g_gen_mw"] + io["g_out"],
         slack_gas_kgps * 3.6 * t["hhv"],
         f"{slack_gas_kgps:.6f} kg/s ≈ {slack_gas_kgps * 3.6 * t['hhv']:.4f} MW",
