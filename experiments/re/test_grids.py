@@ -789,6 +789,21 @@ def create_large_lv_simbench_ts(
     return TimeseriesData()
 
 # Per-family factory shorthands (see module docstring for the semantics).
+#
+# Additive-family CP size. Lowered from the shared default 3.0 so the
+# fault-time *connected* (recoverable) shed forms a descending staircase across
+# the CP-density sweep instead of saturating early: at 3.0 the backup CHPs
+# recover 100 % of the connected shed by mid density (a cliff, connected shed
+# ≈0 from mid on); at 0.8 the recovery is spread over the whole ladder
+# (top-6 connected shed 0.238→0.230→0.189→0.162→0.044→0.000 MW across
+# no…xxl, tight-gap N-1 measurement). Baseline feasibility is unaffected —
+# additive CPs are off at baseline and _apply_headroom sizes gen/slack
+# independently of CP size (cp_aware=False). Backup and control share this
+# size (they differ only in the gas donor surplus), so the backup−control
+# contrast stays a clean isolation of the donor-gas effect.
+_ADDITIVE_CP_SIZE = 0.8
+
+
 # "CPs help": tight receiver (el), rich donor (gas); additive CPs. The gas
 # headroom is CP-aware (``donor_gas_cp_margin``) so the donor surplus stays
 # 50 % above the CP fleet's rated gas draw at every density — a fixed h_gas is
@@ -796,7 +811,8 @@ def create_large_lv_simbench_ts(
 # backup would otherwise collapse onto control at the higher densities.
 def _backup(density):
     return create_large_lv_simbench(
-        density, h_el=0.10, h_gas=0.10, donor_gas_cp_margin=0.5
+        density, h_el=0.10, h_gas=0.10, donor_gas_cp_margin=0.5,
+        cp_size_multiplier=_ADDITIVE_CP_SIZE,
     )
 
 
@@ -839,9 +855,16 @@ def _decoupled(density):
     )
 
 
-# Negative control: no donor surplus anywhere; additive CPs.
+# Negative control: no donor surplus anywhere; additive CPs. Same CP fleet size
+# as _backup (``_ADDITIVE_CP_SIZE``) so backup−control isolates the donor-gas
+# effect. NB: control's tight h=0.04 leaves ~6× more connected shed than backup
+# (4.76 vs 0.75 MW at density 0), most of it beyond CP reach, so at this size
+# control's connected shed stays high and nearly flat across density (CPs help
+# little without the donor surplus) rather than forming backup's staircase.
 def _control(density):
-    return create_large_lv_simbench(density, h_el=0.04, h_gas=0.04)
+    return create_large_lv_simbench(
+        density, h_el=0.04, h_gas=0.04, cp_size_multiplier=_ADDITIVE_CP_SIZE
+    )
 
 
 # NOTE: keep ALL_GRIDS a literal dict with one quoted key per line —
