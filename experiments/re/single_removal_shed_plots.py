@@ -760,6 +760,16 @@ def _pooled_mean_shed_by_carrier(records: Dict[str, Tuple[pd.DataFrame, pd.Serie
     For each (grid, carrier) pair, plots the mean of the carrier's shed
     column across all single-component removals. Reads "which sector tends
     to lose load when an arbitrary component drops?" directly per grid.
+
+    The mean is ``sum(shed) / n_runs`` where ``n_runs = len(sweep)`` is the
+    number of single-component removals attempted — so every bar here is
+    exactly the matching :func:`_pooled_total_shed_by_carrier` bar divided by
+    the run count. Dividing by ``len(sweep)`` (not pandas ``.mean()``, which
+    silently drops NaN survivors) keeps the denominator equal to the ``n``
+    shown on hover even if some removals fail to solve; a failed removal then
+    contributes 0 to the numerator (its shed is unknown), so the mean is a
+    lower bound when the sweep is not fully clean. On a clean sweep (every
+    removal solves) this is identical to ``sweep[col].mean()``.
     """
     carriers = ("electricity", "heat", "gas")
     col_map = {"electricity": "power_shed", "heat": "heat_shed", "gas": "gas_shed"}
@@ -768,6 +778,7 @@ def _pooled_mean_shed_by_carrier(records: Dict[str, Tuple[pd.DataFrame, pd.Serie
         sweep, _ = records[g]
         if sweep.empty:
             continue
+        n_runs = len(sweep)
         for c in carriers:
             col = col_map[c]
             if col not in sweep.columns:
@@ -775,8 +786,8 @@ def _pooled_mean_shed_by_carrier(records: Dict[str, Tuple[pd.DataFrame, pd.Serie
             rows.append({
                 "grid": g,
                 "carrier": c,
-                "mean_shed": float(sweep[col].mean()),
-                "n": int(len(sweep)),
+                "mean_shed": float(sweep[col].sum() / n_runs),
+                "n": int(n_runs),
             })
     if not rows:
         return go.Figure()
@@ -794,7 +805,7 @@ def _pooled_mean_shed_by_carrier(records: Dict[str, Tuple[pd.DataFrame, pd.Serie
             marker=pub_style.sector_marker(c),
             hovertemplate=("<b>%{y}</b><br>" + pub_style.SECTOR_PRETTY[c]
                            + ": mean = %{x:.4f} MW"
-                           "<br>n = %{customdata[0]}<extra></extra>"),
+                           "<br>over %{customdata[0]} removals<extra></extra>"),
             customdata=np.c_[sub["n"].values],
         ))
     # Stacked horizontal: bar length = mean *total* shed per component, so grids
@@ -812,7 +823,7 @@ def _pooled_mean_shed_by_carrier(records: Dict[str, Tuple[pd.DataFrame, pd.Serie
 
 
 def _pooled_total_shed_by_carrier(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
-                                  grids: List[str]) -> go.Figure:
+                                  grids: List[str], conn: bool = False) -> go.Figure:
     """Total shed summed over all single-component removals, grouped bars per
     carrier.
 
@@ -821,9 +832,19 @@ def _pooled_total_shed_by_carrier(records: Dict[str, Tuple[pd.DataFrame, pd.Seri
     shed mass across the whole sweep rather than the per-component mean.
     Unlike the mean view this scales with the number of components swept, so
     grids with more removals contribute proportionally more.
+
+    ``conn=True`` sums the ``*_shed_conn`` columns — curtailment of loads that
+    stay *connected* after the removal, excluding the topologically islanded
+    nameplate that no dispatch can recover. This is the only shed dispatch (and
+    hence CP capacity) can influence, so the connected view is where a CP-density
+    effect is legible: on the study grids the disconnected/islanded mass swamps
+    ``total_shed`` and is CP-count-invariant, whereas this recoverable mass
+    shrinks as CPs are added.
     """
     carriers = ("electricity", "heat", "gas")
-    col_map = {"electricity": "power_shed", "heat": "heat_shed", "gas": "gas_shed"}
+    suffix = "_conn" if conn else ""
+    col_map = {"electricity": f"power_shed{suffix}", "heat": f"heat_shed{suffix}",
+               "gas": f"gas_shed{suffix}"}
     rows = []
     for g in grids:
         sweep, _ = records[g]
@@ -862,12 +883,15 @@ def _pooled_total_shed_by_carrier(records: Dict[str, Tuple[pd.DataFrame, pd.Seri
     # segments show the per-sector composition while grids stay comparable.
     fig.update_layout(barmode="stack")
     pub_style.apply_theme(
-        fig, title="Total load shed by carrier",
+        fig,
+        title=("Total connected-load (recoverable) shed by carrier" if conn
+               else "Total load shed by carrier"),
         height=pub_style.hbar_height(len(grids), 3),
         width=pub_style.BAR_FIG_WIDTH, font_bump=1, legend_top=True,
     )
     fig.update_yaxes(autorange="reversed")
-    fig.update_xaxes(title="Total shed (MW)")
+    fig.update_xaxes(title=("Total connected-load shed (MW)" if conn
+                            else "Total shed (MW)"))
     return fig
 
 
@@ -890,7 +914,7 @@ def _pooled_mean_shed_by_carrier_row(
             x = []
             for g in grids:
                 sweep, _ = records[g]
-                x.append(float(sweep[col].mean())
+                x.append(float(sweep[col].sum() / len(sweep))
                          if (not sweep.empty and col in sweep.columns) else 0.0)
             fig.add_trace(go.Bar(
                 y=y, x=x, orientation="h",
@@ -1035,6 +1059,16 @@ def _emit_pooled_report(
         figs.insert(3, _pooled_excess_shed_box(records, grids, conn=True))
         titles.insert(3, "Excess connected-load shed (delta over baseline) per grid")
         slug_names.insert(3, "excess_shed_conn_box")
+        # Absolute connected-load (recoverable) shed by carrier, next to its
+        # total-shed twin. total_shed is dominated by the topologically islanded
+        # nameplate, which no dispatch can recover and is CP-count-invariant;
+        # this recoverable slice is the only part CPs move, so it's where the
+        # CP-density effect reads directly (it shrinks as CPs are added). The
+        # insert(3) above shifted total_shed_by_carrier from index 6 to 7, so
+        # the connected twin lands at 8 (immediately after it).
+        figs.insert(8, _pooled_total_shed_by_carrier(records, grids, conn=True))
+        titles.insert(8, "Total connected-load (recoverable) shed by sector")
+        slug_names.insert(8, "total_shed_conn_by_carrier")
     suffix = f"_{class_label}" if class_label else ""
     slugs = [f"pooled{suffix}_{s}" for s in slug_names]
     out_html = out_dir / f"pooled{suffix}_report.html"
