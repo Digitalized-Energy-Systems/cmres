@@ -84,6 +84,22 @@ FAMILY_COLOR = {
     "control": "#7F7F7F",
 }
 
+# Figure-visible name per family. The keys stay the historic directory /
+# filename tokens; only the rendered label changes. ``control`` reads as
+# "the control" of the whole study, but it is specifically backup's
+# reserve-less twin (decoupled is loadbearing's control), so it is labelled
+# by what it lacks.
+FAMILY_LABEL = {
+    "backup": "backup",
+    "loadbearing": "loadbearing",
+    "decoupled": "decoupled",
+    "control": "no-reserve",
+}
+
+
+def family_label(fam) -> str:
+    return FAMILY_LABEL.get(str(fam), str(fam))
+
 
 def scenario_family(scenario) -> str:
     """Family of a scenario key (one of ``FAMILY_ORDER``).
@@ -557,35 +573,82 @@ def partial_spearman(x, y, control) -> Tuple[float, float]:
     return float(res.statistic), float(res.pvalue)
 
 
+# Which component classes *belong to* each carrier. The per-carrier
+# evaluation slices on this, NOT on "did this component's removal shed
+# something on that carrier".
+#
+# Slicing on the outcome conditions on a collider: ``shed_k > 0`` is caused
+# both by the component's carrier membership and by its severity, so the
+# admitted population depends on how leaky the reference is. Under the
+# analytical N-1 reference that is nearly harmless (the surviving rows are
+# 97-100 % carrier-native anyway). Under the RQMC reference it is fatal —
+# ~62 % of every slice became foreign-carrier components, and a bare
+# membership indicator with no physics in it scored ρ ≈ +0.63 there,
+# beating all ten real metrics. Membership slicing puts both references on
+# one population, which is also what makes the analytical↔RQMC deltas
+# interpretable at all.
+CARRIER_MEMBER_TYPES: Dict[str, frozenset] = {
+    "power": frozenset({"PowerLine", "Trafo", "GenericPowerBranch"}),
+    "heat":  frozenset({"WaterPipe", "HeatExchanger"}),
+    "gas":   frozenset({"GasPipe"}),
+}
+
+#: Column order the per-carrier reference tuples use, so a shed/actual
+#: column can be mapped back to its carrier tag by position.
+CARRIER_TAG_ORDER = ("power", "heat", "gas")
+
+
+def carrier_member_mask(df, tag: str):
+    """Boolean mask: rows whose component belongs to carrier ``tag``."""
+    types = CARRIER_MEMBER_TYPES.get(tag)
+    if types is None or "cp_type" not in df.columns:
+        return pd.Series(True, index=df.index)
+    return df["cp_type"].astype(str).isin(types)
+
+
 def carrier_rank_pooled(
     df,
     shed_cols: Sequence[str],
     branch_mask,
     ref_col: str = "_ranked_ref",
     min_shed: float = SHED_EPS,
+    member_masks: Optional[Sequence] = None,
 ):
     """Long frame for the carrier-rank pooled evaluation.
 
-    For each carrier shed column: take branch rows with shed above the
-    noise floor (``min_shed``, default :data:`SHED_EPS`) and replace the
-    shed by its percentile rank *within that carrier*, then concatenate.
-    Correlating a metric against ``ref_col`` on the result gives a pooled
-    "overall" ρ that is immune to the Simpson flip of raw cross-carrier
-    pooling (raw scales differ by orders of magnitude between carriers, so
-    pooled raw ρ came out negative in 15/15 scenarios while every
-    within-carrier ρ was positive). Components affecting several carriers
-    appear once per carrier — intentional: each appearance is one ranking
-    task. Returns a new frame with ``ref_col`` added.
+    For each carrier shed column: take that carrier's branch rows and
+    replace the shed by its percentile rank *within that carrier*, then
+    concatenate. Correlating a metric against ``ref_col`` on the result
+    gives a pooled "overall" ρ that is immune to the Simpson flip of raw
+    cross-carrier pooling (raw scales differ by orders of magnitude between
+    carriers, so pooled raw ρ came out negative in 15/15 scenarios while
+    every within-carrier ρ was positive). Components affecting several
+    carriers appear once per carrier — intentional: each appearance is one
+    ranking task. Returns a new frame with ``ref_col`` added.
+
+    ``member_masks`` (one mask per entry of ``shed_cols``) selects each
+    carrier's rows by :data:`CARRIER_MEMBER_TYPES` membership and is the
+    supported path; the value is clipped at 0 rather than thresholded, so
+    the population is identical whichever reference is being ranked.
+    Without it the legacy ``> min_shed`` outcome filter applies, which
+    makes the pool reference-dependent — callers must then pass the
+    reference's own floor, since the default is the analytical one.
     """
     parts = []
-    for col in shed_cols:
+    masks = list(member_masks) if member_masks is not None else None
+    for i, col in enumerate(shed_cols):
         if col not in df.columns:
             continue
-        sub = df[branch_mask & df[col].notna() & (df[col] > min_shed)]
+        if masks is not None:
+            sub = df[branch_mask & masks[i] & df[col].notna()]
+            values = sub[col].clip(lower=0.0)
+        else:
+            sub = df[branch_mask & df[col].notna() & (df[col] > min_shed)]
+            values = sub[col]
         if len(sub) < 3:
             continue
         part = sub.copy()
-        part[ref_col] = sub[col].rank(pct=True)
+        part[ref_col] = values.rank(pct=True)
         parts.append(part)
     if not parts:
         out = df.iloc[0:0].copy()

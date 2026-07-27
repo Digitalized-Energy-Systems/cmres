@@ -1,4 +1,4 @@
-from typing import Dict
+from typing import Any, Dict
 import argparse
 import os
 import sys
@@ -27,6 +27,7 @@ from cmres_eval_plots import (
     # Shared per-sector / heatmap / per-network-type builders so the MC and
     # analytical (E16) criticality figures use one styled code path.
     MC_SECTOR_SPECS,
+    RQMC_HINT,
     ranking_per_sector_figure,
     style_corr_heatmap,
     rho_per_network_type_figure,
@@ -170,11 +171,26 @@ def extend_impact_df(net_type_to_net: Dict[str, Network], metrics_df, impact_df)
     return pandas.concat([impact_df, agg], ignore_index=True)
 
 
-def create_impact_df(perf_df: pandas.DataFrame, fail_df, metrics_df):
+def create_impact_df(perf_df: pandas.DataFrame, fail_df, metrics_df,
+                     value_cols=("0", "1", "2")):
+    """Signed per-(component, carrier) degradation from the MC runs.
+
+    ``value_cols`` picks which per-carrier performance columns to score, in
+    ``(electricity, heat, gas)`` order. The default is the raw total shed;
+    pass :data:`mc_connected_shed.CONN_COLS` to build the connected-load
+    (islanding-free) twin of the same frame.
+    """
     # Vectorised: replaces a per-metric-row double-axis-1 apply over perf_df.
     # Failures now persist from f.step to the end of the run (no repair) — see
     # SimpleResilienceModel.step where process_network_state is disabled.
-    perf_df = perf_df.rename(columns={"Unnamed: 0": "step"}).dropna()
+    value_cols = list(value_cols)
+    perf_df = perf_df.rename(columns={"Unnamed: 0": "step"})
+    # Subset-scoped: perf_df may carry optional columns (connected-shed values
+    # that only exist for grids with a cache), and a blanket dropna() would
+    # delete every row of the grids that lack them.
+    perf_df = perf_df.dropna(
+        subset=["step", "id", "experiment", "network_type"] + value_cols
+    )
     perf_df = perf_df.copy()
     perf_df["id"] = perf_df["id"].astype(str)
     perf_df["experiment"] = perf_df["experiment"].astype(str)
@@ -212,7 +228,7 @@ def create_impact_df(perf_df: pandas.DataFrame, fail_df, metrics_df):
     rules_df["network_type"] = rules_df["network_type"].astype(str)
 
     # Totals per network_type — basis for "not during fault" stats.
-    totals = perf_df.groupby("network_type")[["0", "1", "2"]].agg(["sum", "count"])
+    totals = perf_df.groupby("network_type")[value_cols].agg(["sum", "count"])
 
     # "In fault" rows: perf rows that match a rule and have step ≥ fail_step.
     if not rules_df.empty:
@@ -221,7 +237,7 @@ def create_impact_df(perf_df: pandas.DataFrame, fail_df, metrics_df):
         )
         in_active = in_merge[in_merge["step"] >= in_merge["fail_step"]]
         in_agg = (
-            in_active.groupby(["metric_id", "network_type"])[["0", "1", "2"]]
+            in_active.groupby(["metric_id", "network_type"])[value_cols]
             .agg(["sum", "count"])
         )
     else:
@@ -231,7 +247,10 @@ def create_impact_df(perf_df: pandas.DataFrame, fail_df, metrics_df):
     totals_dict = {nt: totals.loc[nt] for nt in totals.index}
     in_agg_dict = {idx: in_agg.loc[idx] for idx in in_agg.index} if not in_agg.empty else {}
 
-    carrier_pairs = (("heat", "1"), ("gas", "2"), ("electricity", "0"))
+    carrier_pairs = (
+        ("heat", value_cols[1]), ("gas", value_cols[2]),
+        ("electricity", value_cols[0]),
+    )
     global_rows = []
     for row in metrics_df.itertuples(index=False):
         metric_id = str(row.id)
@@ -276,11 +295,14 @@ def create_impact_df(perf_df: pandas.DataFrame, fail_df, metrics_df):
     return pandas.DataFrame(global_rows)
 
 
-def create_or_load_impact_df(fail_df, perf_df, metrics_df, folder_id):
-    impact_out = OUTPUT + f"/{folder_id}/impact.csv"
+def create_or_load_impact_df(fail_df, perf_df, metrics_df, folder_id,
+                             value_cols=("0", "1", "2"), name="impact"):
+    impact_out = OUTPUT + f"/{folder_id}/{name}.csv"
     if Path(impact_out).exists():
         return pandas.read_csv(impact_out)
-    impact_df = create_impact_df(perf_df, fail_df, metrics_df)
+    impact_df = create_impact_df(perf_df, fail_df, metrics_df,
+                                 value_cols=value_cols)
+    Path(impact_out).parent.mkdir(exist_ok=True, parents=True)
     impact_df.to_csv(Path(impact_out))
     return impact_df
 
@@ -562,12 +584,53 @@ def sort_scenarios(names):
     return sorted(names, key=scenario_sort_key)
 
 
-def resilience_per_scenario(perf_df: pandas.DataFrame, folder_id):
-    # experiment, id 0 1 2
-    # Per run: average instantaneous load shed across the 16-step horizon (MW).
-    # Across runs: MC expectation. Result is bounded by total grid demand.
-    resilience_per_carrier_per_scenario = (
-        perf_df.groupby(["network_type", "experiment", "id"])[["0", "1", "2"]]
+# ─────────────────────────────────────────────────────────────────────────────
+# Shed views — every performance-drop figure exists twice: once over the raw
+# per-carrier shed (which counts the full nameplate of loads a failure
+# topologically islanded, and is CP-count-invariant by construction) and once
+# over the *connected* shed that dispatch — and therefore CP capacity — can
+# actually influence. See ``mc_connected_shed`` for how the connected columns
+# are reconstructed and ``single_removal_shed_plots`` for the N-1 twin of the
+# same split.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def shed_view(conn: bool) -> Dict[str, Any]:
+    """Naming / column bundle for one shed view (``conn=True`` = connected).
+
+    The total-shed strings are pinned to the wording the figures already
+    shipped with: ``evaluation.write_all_in_one`` derives each single-figure
+    PDF name from the title, and the dissertation references those filenames.
+    """
+    if conn:
+        from mc_connected_shed import CONN_COLS
+        return {
+            "value_cols": tuple(CONN_COLS),
+            "slug": "_conn",
+            "suffix": " (connected load)",
+            "drop": "connected-load shed",
+            "loss": "connected-load shed",
+            "axis": "Mean connected-load shed (MW)",
+        }
+    return {
+        "value_cols": ("0", "1", "2"),
+        "slug": "",
+        "suffix": "",
+        "drop": "performance drop",
+        "loss": "performance loss",
+        "axis": "Mean performance loss (MW)",
+    }
+
+
+def _resilience_long(perf_df: pandas.DataFrame, value_cols) -> pandas.DataFrame:
+    """``(network_type, experiment, carrier) → resilience_mean``.
+
+    Per run: average instantaneous load shed across the 16-step horizon (MW).
+    Across runs: MC expectation. Result is bounded by total grid demand.
+    """
+    cols = list(value_cols)
+    long = (
+        perf_df.groupby(["network_type", "experiment", "id"])[cols]
         .mean()
         .reset_index()
         .groupby(["network_type", "experiment"])
@@ -575,10 +638,24 @@ def resilience_per_scenario(perf_df: pandas.DataFrame, folder_id):
         .reset_index()
         .melt(
             id_vars=["network_type", "experiment"],
-            value_vars=["0", "1", "2"],
+            value_vars=cols,
             var_name="carrier",
             value_name="resilience_mean",
         )
+    )
+    long["carrier"] = long["carrier"].map(
+        dict(zip(cols, ("electricity", "heat", "gas")))
+    )
+    return long
+
+
+def resilience_per_scenario(perf_df: pandas.DataFrame, folder_id,
+                            conn: bool = False):
+    view = shed_view(conn)
+    if conn and not all(c in perf_df.columns for c in view["value_cols"]):
+        return
+    resilience_per_carrier_per_scenario = _resilience_long(
+        perf_df, view["value_cols"]
     )
     # Experiment label is now the grid name (one experiment per grid).
     # Extract from the folder path "<EXPERIMENT_NAME>-<grid>".
@@ -587,26 +664,10 @@ def resilience_per_scenario(perf_df: pandas.DataFrame, folder_id):
             lambda v: v.split("/")[-1].split("-", 1)[1]
         )
     )
-    resilience_per_carrier_per_scenario["carrier"] = (
-        resilience_per_carrier_per_scenario["carrier"].apply(
-            lambda v: CARRIER_REPLACE_MAP[v]
-        )
-    )
     # Replace technical scenario keys with display labels (file paths still
     # use the raw key, only the chart-visible columns are remapped).
     resilience_per_carrier_per_scenario["experiment"] = (
         resilience_per_carrier_per_scenario["experiment"].map(pretty_scenario)
-    )
-    # Stacked so the bar height = total performance drop across sectors —
-    # full sheddings stay directly comparable between scenarios while the
-    # segments still show the per-sector composition. Kept VERTICAL: the
-    # scenarios form an ordered density series that reads left-to-right and
-    # the stacked composition is clearest in columns.
-    _stacked_carrier_bar(
-        resilience_per_carrier_per_scenario,
-        cat_col="experiment", value_col="resilience_mean",
-        title="Performance drop by scenario, by carrier",
-        yaxis_title="mean performance loss in MW", xaxis_title="scenario",
     )
     unique_network_types = sort_scenarios(
         pandas.unique(resilience_per_carrier_per_scenario["network_type"])
@@ -644,7 +705,7 @@ def resilience_per_scenario(perf_df: pandas.DataFrame, folder_id):
             [f"<b>{pretty_scenario(net_type)}</b>" for net_type in unique_network_types],
             len(unique_experiments),
             [str(exp) for exp in unique_experiments] * len(unique_network_types),
-            yaxis_title="<b>mean performance loss in MW</b>",
+            yaxis_title=f"<b>mean {view['loss']} in MW</b>",
             multi_level_distance=-0.4,
         )
     )
@@ -663,8 +724,14 @@ def resilience_per_scenario(perf_df: pandas.DataFrame, folder_id):
         ],
         "Figure",
         Path("."),
-        OUTPUT + f"/{folder_id}/resilience_per_carrier_per_scenario.html",
-        titles=["Performance drop by scenario, by carrier grouped by cp density"],
+        OUTPUT
+        + f"/{folder_id}/resilience_per_carrier_per_scenario{view['slug']}.html",
+        titles=[
+            f"Performance drop by scenario, by carrier grouped by cp density"
+            f"{view['suffix']}"
+        ],
+        # Explicit: both views' titles slugify to the same 60-char prefix.
+        slugs=[f"resilience_per_carrier_per_scenario{view['slug']}"],
     )
 
 
@@ -933,7 +1000,12 @@ def _impact_carrier_hbar(agg_df, cat_col, value_col, *, cat_title, title):
     return fig
 
 
-def impact_aggregated_component_carrier(impact_df: pandas.DataFrame, folder_id):
+def impact_aggregated_component_carrier(impact_df: pandas.DataFrame, folder_id,
+                                        conn: bool = False):
+    """Per-grid Σ / mean harm broken down by component type, carrier type and
+    density. ``conn=True`` only re-labels; pass the connected-load
+    ``impact_df`` twin to get the islanding-free view."""
+    view = shed_view(conn)
     new_impact_df = impact_df.copy()
     # Signed harm clamp, not abs — see eval_common.harm_from_impact.
     new_impact_df["impact"] = _ec.harm_from_impact(new_impact_df["impact"])
@@ -964,21 +1036,25 @@ def impact_aggregated_component_carrier(impact_df: pandas.DataFrame, folder_id):
     # component type by carrier impacts
     figures.append(_impact_carrier_hbar(
         average_impact_per_component, "type", "impact",
-        cat_title="component type", title="Average impacts by component type"))
-    titles.append("Average impacts by component type")
+        cat_title="component type",
+        title=f"Average{view['suffix']} impacts by component type"))
+    titles.append(f"Average{view['suffix']} impacts by component type")
     figures.append(_impact_carrier_hbar(
         impact_per_component, "type", "impact",
-        cat_title="component type", title="Total impacts by component type"))
-    titles.append("Total impacts by component type")
+        cat_title="component type",
+        title=f"Total{view['suffix']} impacts by component type"))
+    titles.append(f"Total{view['suffix']} impacts by component type")
     # carrier type with carrier impacts
     figures.append(_impact_carrier_hbar(
         average_impact_per_carrier, "type_carrier", "impact",
-        cat_title="carrier", title="Average impacts by carrier type"))
-    titles.append("Average impacts by carrier type")
+        cat_title="carrier",
+        title=f"Average{view['suffix']} impacts by carrier type"))
+    titles.append(f"Average{view['suffix']} impacts by carrier type")
     figures.append(_impact_carrier_hbar(
         impact_per_carrier, "type_carrier", "impact",
-        cat_title="carrier", title="Total impacts by carrier type"))
-    titles.append("Total impacts by carrier type")
+        cat_title="carrier",
+        title=f"Total{view['suffix']} impacts by carrier type"))
+    titles.append(f"Total{view['suffix']} impacts by carrier type")
 
     average_impact_per_carrier_net_type = (
         new_impact_df.groupby(["type_carrier", "carrier", "network_type"])
@@ -1003,13 +1079,13 @@ def impact_aggregated_component_carrier(impact_df: pandas.DataFrame, folder_id):
     figures.append(_impact_carrier_hbar(
         average_impact_per_carrier_net_type, "carrier_net_type", "impact",
         cat_title="carrier-density",
-        title="Average impacts by carrier type and density"))
-    titles.append("Average impacts by carrier type and density")
+        title=f"Average{view['suffix']} impacts by carrier type and density"))
+    titles.append(f"Average{view['suffix']} impacts by carrier type and density")
     figures.append(_impact_carrier_hbar(
         impact_per_carrier_net_type, "carrier_net_type", "impact",
         cat_title="carrier-density",
-        title="Total impacts by carrier type and density"))
-    titles.append("Total impacts by carrier type and density")
+        title=f"Total{view['suffix']} impacts by carrier type and density"))
+    titles.append(f"Total{view['suffix']} impacts by carrier type and density")
 
     average_impact_per_net_type = (
         new_impact_df.groupby(["carrier", "network_type"]).mean(numeric_only=True).reset_index()
@@ -1026,18 +1102,21 @@ def impact_aggregated_component_carrier(impact_df: pandas.DataFrame, folder_id):
 
     figures.append(_impact_carrier_hbar(
         average_impact_per_net_type, "network_type", "impact",
-        cat_title="density", title="Average impacts by density"))
-    titles.append("Average impacts by density")
+        cat_title="density",
+        title=f"Average{view['suffix']} impacts by density"))
+    titles.append(f"Average{view['suffix']} impacts by density")
     figures.append(_impact_carrier_hbar(
         total_impact_per_net_type, "network_type", "impact",
-        cat_title="density", title="Total impacts by density"))
-    titles.append("Total impacts by density")
+        cat_title="density",
+        title=f"Total{view['suffix']} impacts by density"))
+    titles.append(f"Total{view['suffix']} impacts by density")
 
     eval.write_all_in_one(
         figures,
         "Figure",
         Path("."),
-        OUTPUT + f"/{folder_id}/impact_aggregated_component_carrier.html",
+        OUTPUT
+        + f"/{folder_id}/impact_aggregated_component_carrier{view['slug']}.html",
         titles=titles,
     )
 
@@ -2034,6 +2113,19 @@ _RES_FAMILY_ORDER = {"backup": 0, "loadbearing": 1, "decoupled": 2, "control": 3
 _RES_CARRIER_TO_SECTOR = {"electricity": "power", "heat": "heat", "gas": "gas"}
 
 
+def _stacked_x_max(pooled) -> float:
+    """Longest stacked bar (sum over carriers) anywhere in ``pooled``.
+
+    Every per-density × per-strategy shed figure is pinned to this so bar
+    lengths mean the same thing across panels *and* across the per-family
+    figures the chapter puts side by side."""
+    if pooled is None or pooled.empty:
+        return 1.0
+    totals = pooled.groupby("network_type")["resilience_mean"].sum()
+    m = float(totals.max()) if len(totals) else 0.0
+    return m if m > 0 else 1.0
+
+
 def _resilience_short_label(network_type) -> str:
     """Short per-grid label (LV-no … LV-xxl) for the compact, side-by-side pooled
     performance-drop figures; the strategy is carried by the panel title."""
@@ -2046,17 +2138,19 @@ def _resilience_short_label(network_type) -> str:
     return pretty_scenario(network_type)
 
 
-def _pooled_resilience_row(pooled, classes):
+def _pooled_resilience_row(pooled, classes, view=None):
     """Combined cross-family performance-drop view: one horizontal stacked-bar
     panel per scenario family (eval_common.FAMILY_ORDER), shared legend, so
     the three strategies sit in one row in the dissertation E1 figure."""
+    view = view or shed_view(False)
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
     carriers_present = [c for c in ("electricity", "heat", "gas")
                         if c in pooled["carrier"].unique()]
     fams = sorted(list(classes), key=lambda c: _RES_FAMILY_ORDER.get(c[0], 99))
     fig = make_subplots(rows=1, cols=len(fams), shared_xaxes=False,
-                        horizontal_spacing=0.06, subplot_titles=[f for f, _ in fams])
+                        horizontal_spacing=0.06,
+                        subplot_titles=[_ec.family_label(f) for f, _ in fams])
     for ci, (_fam, types) in enumerate(fams, start=1):
         sub_all = pooled[pooled["network_type"].isin(list(types))]
         order = sorted(sub_all["network_type"].unique(), key=scenario_sort_key)
@@ -2073,44 +2167,44 @@ def _pooled_resilience_row(pooled, classes):
             ), row=1, col=ci)
     fig.update_layout(barmode="stack", bargap=0.25)
     fig.update_yaxes(autorange="reversed")
-    fig.update_xaxes(title_text="Mean performance loss (MW)",
-                     row=1, col=(len(fams) + 1) // 2)
+    fig.update_xaxes(title_text=view["axis"], row=1, col=(len(fams) + 1) // 2)
     pub_style.apply_theme(
-        fig, title="Mean per-carrier performance loss, per density and strategy",
+        fig,
+        title=(f"Mean per-carrier {view['loss']}, per density and strategy "
+               f"— {RQMC_HINT}"),
         width=1180, height=430, legend_top=True)
+    pub_style.clear_subplot_titles(fig)
+    # One value scale across the panels: the whole point of the row layout is
+    # reading a density across strategies, which per-panel autoranging breaks
+    # (a shorter bar can render longer than a bigger one next to it).
+    fig.update_xaxes(range=[0, _stacked_x_max(pooled) * 1.06])
     return fig
 
 
-def pooled_resilience_per_scenario(perf_df: pandas.DataFrame, output_dir: str):
+def pooled_resilience_per_scenario(perf_df: pandas.DataFrame, output_dir: str,
+                                   conn: bool = False):
     """Pooled performance loss per carrier across all scenarios / network types.
 
     One figure showing the mean per-carrier performance loss for every scenario
     (= folder = grid) found in *perf_df*, grouped on the x-axis by network type.
     Mirrors the per-network ``resilience_per_scenario`` aggregation but
     consolidates everything into a single output.
+
+    ``conn=True`` renders the connected-load twin (see :func:`shed_view`) and
+    is skipped silently when *perf_df* carries no connected columns.
     """
     if perf_df.empty:
         print("Pooled resilience plot: empty perf_df — skipping.")
         return
+    view = shed_view(conn)
+    if conn and not all(c in perf_df.columns for c in view["value_cols"]):
+        print("Pooled resilience plot: no connected-shed columns — skipping.")
+        return
 
-    pooled = (
-        perf_df.groupby(["network_type", "experiment", "id"])[["0", "1", "2"]]
-        .mean()
-        .reset_index()
-        .groupby(["network_type", "experiment"])
-        .mean(numeric_only=True)
-        .reset_index()
-        .melt(
-            id_vars=["network_type", "experiment"],
-            value_vars=["0", "1", "2"],
-            var_name="carrier",
-            value_name="resilience_mean",
-        )
-    )
+    pooled = _resilience_long(perf_df, view["value_cols"])
     pooled["experiment"] = pooled["experiment"].apply(
         lambda v: v.split("/")[-1].split("-", 1)[1]
     )
-    pooled["carrier"] = pooled["carrier"].map(CARRIER_REPLACE_MAP)
     pooled["scenario"] = pooled["network_type"].map(pretty_scenario)
     # Order rows (and therefore the x-axis categories below) by the
     # canonical ALL_GRIDS scheme so figures are consistent across runs.
@@ -2165,7 +2259,7 @@ def pooled_resilience_per_scenario(perf_df: pandas.DataFrame, output_dir: str):
                 hovertemplate=(
                     "scenario=%{y}<br>"
                     f"carrier={carrier_label}<br>"
-                    "mean performance loss=%{x:.4f} MW<extra></extra>"
+                    f"mean {view['loss']}=%{{x:.4f}} MW<extra></extra>"
                 ),
             ))
         return fig, order
@@ -2178,29 +2272,45 @@ def pooled_resilience_per_scenario(perf_df: pandas.DataFrame, output_dir: str):
     classes = _ec.split_scenarios_by_family(pooled["network_type"].drop_duplicates())
     Path(output_dir).mkdir(exist_ok=True, parents=True)
 
+    # Shared across every family figure below, so the four per-strategy PDFs
+    # the chapter shows next to each other are read on one scale.
+    x_max = _stacked_x_max(pooled) * 1.06
+
     def _emit(sub_pooled, class_label):
         fig, scens = _build_fig(sub_pooled)
         suffix = f" ({class_label})" if class_label else ""
-        slug_suffix = f"_{class_label}" if class_label else ""
+        slug_suffix = f"_{class_label}{view['slug']}" if class_label else view["slug"]
         # Stacked horizontal: bar length = total performance drop; the segments
         # show the per-sector composition. Horizontal to align with the other
         # pooled bar figures (ceiling, per-sector, ranking).
         fig.update_layout(barmode="stack")
         pub_style.apply_theme(
-            fig, title=f"Pooled performance drop by scenario, by carrier{suffix}",
+            fig,
+            title=(f"Pooled {view['drop']} by scenario, by carrier"
+                   f"{suffix} — {RQMC_HINT}"),
             height=pub_style.hbar_height(len(scens), 3),
             width=pub_style.BAR_FIG_WIDTH, font_bump=1, legend_top=True,
         )
+        # Plotly reverses the legend on stacked bars; on a *horizontal* stack
+        # that reads backwards against the row figure, which is not reversed.
+        fig.update_layout(legend_traceorder="normal")
         fig.update_yaxes(autorange="reversed")
-        fig.update_xaxes(title="Mean performance loss (MW)")
+        fig.update_xaxes(title=view["axis"], range=[0, x_max])
+        # Explicit slug: the title-derived fallback truncates at 60 chars,
+        # which collapses the connected "…_by_carrier_loadbearing" name onto
+        # its own family-less prefix. The total-shed slug is pinned to the
+        # name the title used to produce so existing references keep working.
+        base_slug = ("pooled_connected_shed_by_scenario_by_carrier" if conn
+                     else "pooled_performance_drop_by_scenario_by_carrier")
         eval.write_all_in_one(
             [fig], "Figure", Path("."),
             f"{output_dir}/resilience_per_carrier_per_scenario_pooled{slug_suffix}.html",
             titles=[
-                f"Pooled performance drop by scenario{suffix} "
+                f"Pooled {view['drop']} by scenario{suffix} "
                 f"(n_scenarios={sub_pooled['scenario'].nunique()}, "
                 f"n_network_types={sub_pooled['network_type'].nunique()})"
             ],
+            slugs=[base_slug + (f"_{class_label}" if class_label else "")],
         )
 
     if len(classes) <= 1:
@@ -2211,9 +2321,10 @@ def pooled_resilience_per_scenario(perf_df: pandas.DataFrame, output_dir: str):
         # Combined cross-family row used in the dissertation: the three
         # strategies side by side, horizontal stacked bars, one shared legend.
         try:
-            row_fig = _pooled_resilience_row(pooled, classes)
+            row_fig = _pooled_resilience_row(pooled, classes, view)
             row_fig.write_image(
-                f"{output_dir}/resilience_per_carrier_per_scenario_pooled_row.pdf")
+                f"{output_dir}/resilience_per_carrier_per_scenario_pooled"
+                f"{view['slug']}_row.pdf")
         except Exception as e:  # pragma: no cover
             print(f"  resilience row skipped: {e}")
 
@@ -2307,6 +2418,7 @@ def pooled_resilience_grouped_capacity(
     perf_df: pandas.DataFrame,
     capacity_df: pandas.DataFrame,
     output_dir: str,
+    conn: bool = False,
 ):
     """One large grouped stacked-bar figure of the mean per-carrier
     performance loss: y groups = density (LV-no … LV-xxl), inside each group
@@ -2320,26 +2432,19 @@ def pooled_resilience_grouped_capacity(
     not help" signal. Dividing by the per-sector minimum keeps the value in
     MW (weight ≥ 1; the leanest grid's weighted bar equals its raw shed) and
     both bars on one shared axis.
+
+    ``conn=True`` renders the connected-load twin (see :func:`shed_view`).
     """
     if perf_df.empty:
         print("Grouped capacity resilience plot: empty perf_df — skipping.")
         return
+    view = shed_view(conn)
+    if conn and not all(c in perf_df.columns for c in view["value_cols"]):
+        print("Grouped capacity resilience plot: no connected-shed columns "
+              "— skipping.")
+        return
 
-    pooled = (
-        perf_df.groupby(["network_type", "experiment", "id"])[["0", "1", "2"]]
-        .mean()
-        .reset_index()
-        .groupby(["network_type", "experiment"])
-        .mean(numeric_only=True)
-        .reset_index()
-        .melt(
-            id_vars=["network_type", "experiment"],
-            value_vars=["0", "1", "2"],
-            var_name="carrier",
-            value_name="resilience_mean",
-        )
-    )
-    pooled["carrier"] = pooled["carrier"].map(CARRIER_REPLACE_MAP)
+    pooled = _resilience_long(perf_df, view["value_cols"])
     pooled = pooled.merge(capacity_df, on=["network_type", "carrier"], how="left")
 
     # One panel per strategy with the densities as a SHARED row axis: reading
@@ -2448,29 +2553,29 @@ def pooled_resilience_grouped_capacity(
     fig.update_yaxes(autorange="reversed")
     pub_style.apply_theme(
         fig,
-        title=("Mean per-carrier performance loss per density and strategy —<br>"
+        title=(f"Mean per-carrier {view['loss']} per density and strategy "
+               f"({RQMC_HINT}) —<br>"
                "solid: absolute; lightened: × installed-capacity weight "
                "(sector capacity ÷ leanest grid)"),
         width=1180, height=520, legend_top=True,
     )
     # One shared value scale so bar lengths compare across the panels.
     fig.update_xaxes(range=[0, x_max * 1.06])
-    fig.update_xaxes(title_text="Mean performance loss (MW)",
-                     row=1, col=(len(fams) + 1) // 2)
+    fig.update_xaxes(title_text=view["axis"], row=1, col=(len(fams) + 1) // 2)
 
     Path(output_dir).mkdir(exist_ok=True, parents=True)
-    out_path = f"{output_dir}/resilience_grouped_capacity.html"
+    out_path = f"{output_dir}/resilience_grouped_capacity{view['slug']}.html"
     eval.write_all_in_one(
         [fig], "Figure", Path("."), out_path,
-        titles=["Pooled performance drop, grouped by density × strategy, "
+        titles=[f"Pooled {view['drop']}, grouped by density × strategy, "
                 "with capacity-weighted twin bars"],
-        slugs=["resilience_grouped_capacity"],
+        slugs=[f"resilience_grouped_capacity{view['slug']}"],
     )
     print(f"Grouped capacity resilience plot → {out_path}")
 
 
 def cross_carrier_impact_per_scenario(
-    impact_df: pandas.DataFrame, output_dir: str
+    impact_df: pandas.DataFrame, output_dir: str, conn: bool = False
 ):
     """Cross-sector impact figure: one panel per scenario, no averaging.
 
@@ -2498,6 +2603,7 @@ def cross_carrier_impact_per_scenario(
     if impact_df is None or impact_df.empty:
         print("Cross-carrier impact: empty impact_df — skipping.")
         return
+    view = shed_view(conn)
 
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
@@ -2610,25 +2716,26 @@ def cross_carrier_impact_per_scenario(
             )
 
         suffix = f" ({class_label})" if class_label else ""
-        slug_suffix = f"_{class_label}" if class_label else ""
+        slug_suffix = (f"_{class_label}{view['slug']}" if class_label
+                       else view["slug"])
         fig.update_layout(barmode="group")
         pub_style.apply_theme(
-            fig, title=f"Cross-carrier impact per scenario{suffix}",
+            fig,
+            title=(f"Cross-carrier{view['suffix']} impact per scenario{suffix}"),
             height=300 * n_rows + 110, width=min(1000, 360 * n_cols),
             legend_top=True,
         )
+        out_path = (f"{output_dir}/cross_carrier_impact_per_scenario"
+                    f"{slug_suffix}.html")
         eval.write_all_in_one(
-            [fig], "Figure", Path("."),
-            f"{output_dir}/cross_carrier_impact_per_scenario{slug_suffix}.html",
+            [fig], "Figure", Path("."), out_path,
             titles=[
-                f"Cross-carrier impact per scenario{suffix} "
+                f"Cross-carrier{view['suffix']} impact per scenario{suffix} "
                 f"(n_scenarios={n}, source × target, no averaging)"
             ],
+            slugs=[f"cross-carrier_impact_per_scenario{slug_suffix}"],
         )
-        print(
-            f"Cross-carrier impact{suffix}: {n} scenarios → "
-            f"{output_dir}/cross_carrier_impact_per_scenario{slug_suffix}.html"
-        )
+        print(f"Cross-carrier impact{view['suffix']}{suffix}: {n} scenarios → {out_path}")
 
     # Split by scenario family so a full roster doesn't become 8 subplot rows.
     classes = _ec.split_scenarios_by_family(nets)
@@ -2640,7 +2747,7 @@ def cross_carrier_impact_per_scenario(
 
 
 def cross_carrier_impact_aggregated(
-    impact_df: pandas.DataFrame, output_dir: str
+    impact_df: pandas.DataFrame, output_dir: str, conn: bool = False
 ):
     """Cross-sector impact, averaged across all scenarios.
 
@@ -2664,6 +2771,7 @@ def cross_carrier_impact_aggregated(
     if impact_df is None or impact_df.empty:
         print("Cross-carrier impact (aggregated): empty impact_df — skipping.")
         return
+    view = shed_view(conn)
 
     import numpy as _np
     import plotly.graph_objects as go
@@ -2808,7 +2916,7 @@ def cross_carrier_impact_aggregated(
             ))
         fig.update_layout(barmode="group")
         pub_style.apply_theme(
-            fig, title="Mean cross-carrier impact",
+            fig, title=f"Mean cross-carrier{view['suffix']} impact",
             height=340, width=pub_style.vbar_width(len(source_order), 3, base=560),
             font_bump=1, legend_top=True,
         )
@@ -2830,24 +2938,59 @@ def cross_carrier_impact_aggregated(
     )
 
     Path(output_dir).mkdir(exist_ok=True, parents=True)
+    out_path = (f"{output_dir}/cross_carrier_impact_aggregated"
+                f"{view['slug']}.html")
     eval.write_all_in_one(
-        [fig_total, fig_per_comp], "Figure", Path("."),
-        output_dir + "/cross_carrier_impact_aggregated.html",
+        [fig_total, fig_per_comp], "Figure", Path("."), out_path,
         titles=[
-            f"Cross-carrier impact aggregated across all scenarios "
+            f"Cross-carrier{view['suffix']} impact aggregated across all scenarios "
             f"(n_scenarios={total_stack.shape[0]}, mean ± std)",
-            f"Cross-carrier impact per source-side component "
+            f"Cross-carrier{view['suffix']} impact per source-side component "
             f"(n_scenarios={total_stack.shape[0]}, "
             "Σ |impact| ÷ n_components in that source bucket)",
         ],
     )
     print(
-        f"Cross-carrier impact (aggregated): {total_stack.shape[0]} scenarios → "
-        f"{output_dir}/cross_carrier_impact_aggregated.html (total + per-component)"
+        f"Cross-carrier impact (aggregated){view['suffix']}: "
+        f"{total_stack.shape[0]} scenarios → {out_path} (total + per-component)"
     )
 
 
-def cross_carrier_density_matrix(impact_df: pandas.DataFrame, output_dir: str):
+def cp_count_per_density(net_type_to_net: Dict[str, Network]) -> Dict[float, int]:
+    """``{CP density → realized coupling-point count}`` from the networks.
+
+    Counts the compound CPs (CHP/CHPHG/PowerToHeat) and branch CPs
+    (PowerToGas, GasToPower, PowerToHeatHG, GasToHeatHG) of every CP-bearing
+    grid; a compound's internal ``GenericTransferBranch`` legs are *not*
+    coupling points and are excluded. The ``decoupled`` family is skipped:
+    it realises the same seeded fleet as independent single-carrier
+    generators, so it has zero CPs at every density by construction and
+    would flatten the ladder to 0.
+    """
+    from monee.model.multi import MultiGridBranchModel, MultiGridCompoundModel
+
+    counts: Dict[float, int] = {}
+    for network_type, net in net_type_to_net.items():
+        if _ec.scenario_family(network_type) == "decoupled":
+            continue
+        density, _ = _scenario_density_distribution(network_type)
+        if density is None:
+            continue
+        n = sum(
+            1 for c in net.compounds
+            if isinstance(c.model, MultiGridCompoundModel)
+        ) + sum(
+            1 for b in net.branches
+            if isinstance(b.model, MultiGridBranchModel)
+            and type(b.model).__name__ != "GenericTransferBranch"
+        )
+        counts.setdefault(density, n)
+    return counts
+
+
+def cross_carrier_density_matrix(impact_df: pandas.DataFrame, output_dir: str,
+                                 conn: bool = False,
+                                 cp_counts: Dict[float, int] = None):
     """Source × target matrix of cross-sector harm vs CP density.
 
     A 4×3 subplot grid that *is* the source→target matrix (rows = source
@@ -2866,10 +3009,18 @@ def cross_carrier_density_matrix(impact_df: pandas.DataFrame, output_dir: str):
     low–high densities, and the gas→gas "donor relief" in the CP-aware
     families — and the control family's spread provides an honest noise
     envelope to read the lines against.
+
+    ``conn=True`` only re-labels the figure; pass the connected-load
+    ``impact_df`` twin (``create_impact_df(..., value_cols=CONN_COLS)``) to
+    get the islanding-free view. ``cp_counts`` (see
+    :func:`cp_count_per_density`) turns the x-axis ticks into realized CP
+    counts instead of the abstract density; without it the ticks stay
+    densities.
     """
     if impact_df is None or impact_df.empty:
         print("Cross-carrier density matrix: empty impact_df — skipping.")
         return
+    view = shed_view(conn)
 
     import numpy as _np
     import plotly.graph_objects as go
@@ -2964,37 +3115,36 @@ def cross_carrier_density_matrix(impact_df: pandas.DataFrame, output_dir: str):
                       if s != "multi" and s != t for d, e, _ in pts if d > 0]
     q = float(_np.percentile(noise_vals, 95)) if noise_vals else 0.0
 
-    _SECTOR_SQ = {
-        "electricity": "#ffa000", "heat": "#d32f2f", "gas": "#388e3c",
-        "multi": "#7e57c2",
+    _SECTOR_LABEL = {
+        s: SECTOR_PRETTY[_RES_CARRIER_TO_SECTOR.get(s, s)] for s in SOURCES
     }
-    col_titles = [
-        f"<span style='color:{_SECTOR_SQ[t]}'>■</span> → {SECTOR_PRETTY[_RES_CARRIER_TO_SECTOR[t]]}"
-        for t in TARGETS
-    ]
+    cp_counts = cp_counts or {}
+
+    def cp_of(density) -> str:
+        """CP count at *density*, or the density itself when the caller did
+        not supply the counts (they need the pickled networks)."""
+        n = cp_counts.get(float(density))
+        return f"{float(density):g}" if n is None else str(n)
+
     fig = make_subplots(
         rows=4, cols=3, shared_xaxes=True, shared_yaxes=True,
         horizontal_spacing=0.035, vertical_spacing=0.055,
-        subplot_titles=col_titles + [""] * 9,
+        subplot_titles=[_SECTOR_LABEL[t] for t in TARGETS] + [""] * 9,
     )
 
     _FAM_STYLE = {
         "backup": dict(
             color=_ec.FAMILY_COLOR["backup"], dash="dash", width=2,
-            symbol="square", size=6,
-            label="Backup — additive CPs + donor"),
+            symbol="square", size=6, label="Backup"),
         "loadbearing": dict(
             color=_ec.FAMILY_COLOR["loadbearing"], dash="solid", width=2.5,
-            symbol="circle", size=7,
-            label="Loadbearing — CPs replace generation"),
+            symbol="circle", size=7, label="Loadbearing"),
         "decoupled": dict(
             color=_ec.FAMILY_COLOR["decoupled"], dash="dashdot", width=2,
-            symbol="triangle-up", size=7,
-            label="Decoupled — mirrored capacity, no coupling"),
+            symbol="triangle-up", size=7, label="Decoupled"),
         "control": dict(
             color=_ec.FAMILY_COLOR["control"], dash="dot", width=2,
-            symbol="diamond", size=6,
-            label="Control — additive, no donor"),
+            symbol="diamond", size=6, label=_ec.family_label("control").capitalize()),
     }
     for i, s in enumerate(SOURCES):
         for j, t in enumerate(TARGETS):
@@ -3017,9 +3167,11 @@ def cross_carrier_density_matrix(impact_df: pandas.DataFrame, output_dir: str):
                                 color=st["color"],
                                 line=dict(color=pub_style.BAR_LINE_COLOR,
                                           width=0.8)),
-                    customdata=[[r, base[fam][(s, t)]] for _, _, r in pts],
+                    customdata=[[r, base[fam][(s, t)], cp_of(d)]
+                                for d, _, r in pts],
                     hovertemplate=(
                         f"{fam} | {s} → {t}<br>density=%{{x}}"
+                        " (%{customdata[2]} CPs)"
                         "<br>excess=%{y:.3f} MW"
                         "<br>raw=%{customdata[0]:.3f} MW, "
                         "no-CP baseline=%{customdata[1]:.3f} MW"
@@ -3037,11 +3189,9 @@ def cross_carrier_density_matrix(impact_df: pandas.DataFrame, output_dir: str):
             # against (3-family mean; per-family subtraction differs only
             # at MC-noise scale). Top-right where the curves stay clear;
             # the multi row instead rises to the right, so it anchors left.
-            if s == "multi":
-                anno, ax, axanchor = "no CPs at d=0", 0.04, "left"
-            else:
-                b = _np.mean([base[fam][(s, t)] for fam in fams])
-                anno, ax, axanchor = f"no-CP: {b:.2g} MW", 0.97, "right"
+            b = _np.mean([base[fam][(s, t)] for fam in fams])
+            anno = f"no-CP: {b:.2g} MW"
+            ax, axanchor = (0.04, "left") if s == "multi" else (0.97, "right")
             fig.add_annotation(
                 text=anno, xref="x domain", yref="y domain",
                 x=ax, y=0.96, xanchor=axanchor, yanchor="top",
@@ -3082,22 +3232,22 @@ def cross_carrier_density_matrix(impact_df: pandas.DataFrame, output_dir: str):
     y_lo = min(-q, min(all_e)) - 0.15
     y_hi = max(q, max(all_e)) + 0.15
 
+    harm_label = "connected-load harm" if conn else "harm"
     pub_style.apply_theme(
         fig,
-        title=("Cross-sector harm vs coupling-point density<br>"
-               "excess over the family's no-CP grid — below 0: CPs relieve "
-               "harm, above 0: CPs create harm"),
+        title=(f"Cross-sector {harm_label} vs coupling points<br>"
+               "rows: failed sector · columns: impacted sector"),
         width=1180, height=780, font_bump=1, legend_top=True,
     )
     # Axis dressing after apply_theme: the theme broadcast resets zerolines
     # and would otherwise override these.
     fig.update_yaxes(range=[y_lo, y_hi], zeroline=True,
                      zerolinecolor="#BBBBBB", zerolinewidth=1)
-    fig.update_xaxes(range=[-0.012, 0.262],
-                     tickvals=[0, .05, .10, .15, .20, .25],
-                     ticktext=["0", ".05", ".10", ".15", ".20", ".25"])
+    densities = sorted({d for _, d in scen_info.values()})
+    fig.update_xaxes(range=[-0.012, 0.262], tickvals=densities,
+                     ticktext=[cp_of(d) for d in densities])
     fig.update_xaxes(
-        title_text="CP density (realized CPs: 0, 12, 14, 15, 20, 30)",
+        title_text="Coupling points" if cp_counts else "CP density",
         row=4, col=2,
     )
     fig.update_layout(margin=dict(l=150, b=90))
@@ -3105,48 +3255,49 @@ def cross_carrier_density_matrix(impact_df: pandas.DataFrame, output_dir: str):
     for i, s in enumerate(SOURCES):
         dom = fig.get_subplot(i + 1, 1).yaxis.domain
         fig.add_annotation(
-            text=(f"<span style='color:{_SECTOR_SQ[s]}'>■</span> "
-                  + SECTOR_PRETTY[
-                      _RES_CARRIER_TO_SECTOR.get(s, s)]),
+            text=_SECTOR_LABEL[s],
             textangle=-90, xref="paper", x=-0.045,
             yref="paper", y=(dom[0] + dom[1]) / 2,
             xanchor="center", yanchor="middle", showarrow=False,
             font=dict(size=15),
         )
     fig.add_annotation(
-        text="Source of failed component — excess harm vs no-CP grid (MW)",
+        text=f"Excess {harm_label} vs no-CP grid (MW)",
         textangle=-90, xref="paper", x=-0.085, yref="paper", y=0.5,
         xanchor="center", yanchor="middle", showarrow=False,
         font=dict(size=17, color=pub_style.MUTED_COLOR),
     )
+    notes = []
     if "control" in fams:
         ctl_d = sorted({d for f, d in scen_info.values() if f == "control"})
-        all_d = sorted({d for _, d in scen_info.values()})
-        if ctl_d != all_d:
-            fig.add_annotation(
-                text=("control family: densities "
-                      + " / ".join(f"{d:g}" for d in ctl_d)
-                      + " only — dotted line interpolates"),
-                xref="paper", x=1.0, xanchor="right",
-                yref="paper", y=-0.075, yanchor="top", showarrow=False,
-                font=dict(size=12, color=pub_style.MUTED_COLOR),
+        if ctl_d != densities:
+            notes.append(
+                "control: only " + " / ".join(f"{d:g}" for d in ctl_d)
+                + " — dotted line interpolates"
             )
+    if "decoupled" in fams:
+        notes.append("decoupled: same fleet as mirrored generators, no CPs")
+    if notes:
+        fig.add_annotation(
+            text=" · ".join(notes),
+            xref="paper", x=1.0, xanchor="right",
+            yref="paper", y=-0.075, yanchor="top", showarrow=False,
+            font=dict(size=12, color=pub_style.MUTED_COLOR),
+        )
 
     Path(output_dir).mkdir(exist_ok=True, parents=True)
+    out_path = f"{output_dir}/cross_carrier_density_matrix{view['slug']}.html"
     eval.write_all_in_one(
-        [fig], "Figure", Path("."),
-        f"{output_dir}/cross_carrier_density_matrix.html",
+        [fig], "Figure", Path("."), out_path,
         titles=[
-            "Cross-sector harm vs CP density (source × target matrix, "
-            f"excess over same-family no-CP baseline; "
-            f"n_scenarios={len(scen_info)})"
+            f"Cross-sector {harm_label} vs coupling points "
+            f"(excess over the no-CP grid; n_scenarios={len(scen_info)})"
         ],
-        slugs=["cross_carrier_density_matrix"],
+        slugs=[f"cross_carrier_density_matrix{view['slug']}"],
     )
     print(
-        f"Cross-carrier density matrix: {len(scen_info)} scenarios, "
-        f"noise band ±{q:.3f} MW → "
-        f"{output_dir}/cross_carrier_density_matrix.html"
+        f"Cross-carrier density matrix{view['slug']}: {len(scen_info)} scenarios, "
+        f"noise band ±{q:.3f} MW → {out_path}"
     )
 
 
@@ -3344,12 +3495,12 @@ def pooled_metric_comparison(pooled_df, output_dir, class_label: str = ""):
     rank_fig = ranking_per_sector_figure(
         valid, MC_SECTOR_SPECS,
         title="Pooled across scenarios (n={n}): per-sector ranking accuracy "
-              "vs MC actual impact")
+              f"vs MC actual impact — {RQMC_HINT}")
     if rank_fig.data:
         figures.append(rank_fig)
         titles.append(
             f"Pooled per-sector ranking accuracy vs MC actual "
-            f"(Kendall τ / NDCG@10 / precision@10, n={n_total})")
+            f"(Kendall τ / rNDCG@k* / rP@k*, n={n_total})")
 
     # ── Filtered-vs-unfiltered ρ comparison (pooled) ───────────────────────
     if n_mc >= 3 and n_all > n_mc:
@@ -3455,11 +3606,29 @@ def _make_cmres_artefact(
 
 
 def evaluate(folder_id):
+    import mc_connected_shed as _conn
+
     fail_df, perf_df, metrics_df, net_type_to_net = load_dfs(folder_id)
+    # Connected-load twin of the per-carrier shed, reconstructed from the
+    # networks + failure log (the MC runs record totals only). Every
+    # ``conn=True`` figure below is gated on these columns existing, so a
+    # result set without them still renders the total-shed views.
+    perf_df = _conn.attach_connected_shed(perf_df, net_type_to_net, folder_id)
+    has_conn = _conn.has_connected(perf_df)
+
     impact_df = create_or_load_impact_df(
         fail_df, perf_df, metrics_df, folder_id
     )
     impact_df = extend_impact_df(net_type_to_net, metrics_df, impact_df)
+    impact_conn_df = None
+    if has_conn:
+        impact_conn_df = create_or_load_impact_df(
+            fail_df, perf_df, metrics_df, folder_id,
+            value_cols=_conn.CONN_COLS, name="impact_connected",
+        )
+        impact_conn_df = extend_impact_df(
+            net_type_to_net, metrics_df, impact_conn_df
+        )
 
     per_network_dfs = []
     # Bundle of per-scenario inputs the CMRES eval block consumes after
@@ -3467,14 +3636,28 @@ def evaluate(folder_id):
     # carry state.
     cmres_artefacts = []
 
-
+    capacity_df = generation_capacity_df(net_type_to_net)
+    cp_counts = cp_count_per_density(net_type_to_net)
     pooled_resilience_per_scenario(perf_df, OUTPUT + "/pooled")
-    pooled_resilience_grouped_capacity(
-        perf_df, generation_capacity_df(net_type_to_net), OUTPUT + "/pooled"
-    )
+    pooled_resilience_grouped_capacity(perf_df, capacity_df, OUTPUT + "/pooled")
     cross_carrier_impact_per_scenario(impact_df, OUTPUT + "/pooled")
     cross_carrier_impact_aggregated(impact_df, OUTPUT + "/pooled")
-    cross_carrier_density_matrix(impact_df, OUTPUT + "/pooled")
+    cross_carrier_density_matrix(impact_df, OUTPUT + "/pooled",
+                                 cp_counts=cp_counts)
+    if has_conn:
+        pooled_resilience_per_scenario(perf_df, OUTPUT + "/pooled", conn=True)
+        pooled_resilience_grouped_capacity(
+            perf_df, capacity_df, OUTPUT + "/pooled", conn=True
+        )
+        cross_carrier_impact_per_scenario(
+            impact_conn_df, OUTPUT + "/pooled", conn=True
+        )
+        cross_carrier_impact_aggregated(
+            impact_conn_df, OUTPUT + "/pooled", conn=True
+        )
+        cross_carrier_density_matrix(
+            impact_conn_df, OUTPUT + "/pooled", conn=True, cp_counts=cp_counts
+        )
 
     for network_type, monee_net in net_type_to_net.items():
         print(network_type)
@@ -3533,6 +3716,12 @@ def evaluate(folder_id):
 
         resilience_per_scenario(perf_df_nt, network_type)
         impact_aggregated_component_carrier(impact_df_nt, network_type)
+        if has_conn:
+            resilience_per_scenario(perf_df_nt, network_type, conn=True)
+            impact_aggregated_component_carrier(
+                impact_conn_df[impact_conn_df["network_type"] == network_type],
+                network_type, conn=True,
+            )
         impact_over_metrics(
             {network_type: monee_net},
             impact_df_nt,

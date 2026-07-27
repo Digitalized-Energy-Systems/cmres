@@ -110,6 +110,11 @@ _FIG_HEIGHT = 440
 
 # Compact width for bar charts (the full-width default is for trajectories).
 BAR_FIG_WIDTH = 720
+# Bar charts whose top legend carries 5+ entries: ``apply_theme(legend_top=…)``
+# wraps the strip once the items exceed ``width - 84``, and at the E16 legend
+# size a 5-sector legend needs ~830 px to stay on one row. Anything narrower
+# degenerates into a stacked (vertical-looking) block above the plot.
+WIDE_BAR_FIG_WIDTH = 1040
 
 _BASE_FONT_SIZE = 17
 _TITLE_FONT_SIZE = 22
@@ -403,6 +408,22 @@ def apply_theme(
             ),
             margin=dict(l=84, r=40, t=top_margin, b=64),
         )
+    return fig
+
+
+def clear_subplot_titles(fig: go.Figure, pad: int = 34) -> go.Figure:
+    """Push the plot area down by ``pad`` px on a ``make_subplots`` figure.
+
+    ``apply_theme(legend_top=True)`` parks the legend strip in container
+    coordinates directly above the plot domain, which is exactly where
+    ``make_subplots`` anchors its per-panel titles — they overlap by
+    construction. Growing the top margin (and the height with it, so the
+    panels keep their size) moves the titles clear of the strip. Call after
+    ``apply_theme``."""
+    fig.update_layout(
+        height=(fig.layout.height or _FIG_HEIGHT) + pad,
+        margin=dict(t=(fig.layout.margin.t or 0) + pad),
+    )
     return fig
 
 

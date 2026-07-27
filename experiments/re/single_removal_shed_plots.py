@@ -59,6 +59,39 @@ def _short_grid(grid: str) -> str:
     return pretty_scenario(grid)
 
 
+#: Named in the title of every shed figure: the RQMC study (cp_cn_evaluation)
+#: reports per-carrier shed in MW on the same grids, so an unqualified
+#: "mean shed" title does not say which simulation produced it.
+SINGLE_REMOVAL_HINT = "single-removal (N−1) experiment"
+
+_CARRIER_COLS = (("electricity", "power_shed"), ("heat", "heat_shed"),
+                 ("gas", "gas_shed"))
+
+
+def _stacked_x_max(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
+                   grids: List[str], *, mean: bool, suffix: str = "") -> float:
+    """Longest stacked (all-carrier) bar over ``grids``.
+
+    Pins the value axis of the per-density × per-strategy shed bars so a
+    density's bar is the same length in every family's figure — the per-family
+    PDFs are printed side by side and per-figure autoranging silently rescales
+    them against each other.
+    """
+    best = 0.0
+    for g in grids:
+        sweep, _ = records.get(g, (pd.DataFrame(), None))
+        if sweep.empty:
+            continue
+        total = 0.0
+        for _sec, col in _CARRIER_COLS:
+            col = f"{col}{suffix}"
+            if col in sweep.columns:
+                s = float(sweep[col].sum())
+                total += s / len(sweep) if mean else s
+        best = max(best, total)
+    return best if best > 0 else 1.0
+
+
 # Single-column dissertation typography. Same sizing convention as the
 # E16 plots in cmres_eval_plots: figures are rendered at ~750-1200 px
 # then scaled down to a ~84 mm column, so every text element is bumped
@@ -428,6 +461,7 @@ def _grid_order(grids: List[str]) -> List[str]:
 # Canonical scenario-family helpers live in eval_common so every
 # cross-scenario plotter shares the same partitioning logic.
 from eval_common import (  # noqa: E402
+    family_label as _family_label,
     scenario_family as _scenario_family,
     scenario_stem as _grid_base,
     split_scenarios_by_family as _split_scenarios_by_family,
@@ -754,7 +788,8 @@ def _pooled_kind_summary(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
 
 
 def _pooled_mean_shed_by_carrier(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
-                                 grids: List[str]) -> go.Figure:
+                                 grids: List[str],
+                                 x_max: float | None = None) -> go.Figure:
     """Average per-component shed across all grids, grouped bars per carrier.
 
     For each (grid, carrier) pair, plots the mean of the carrier's shed
@@ -813,17 +848,23 @@ def _pooled_mean_shed_by_carrier(records: Dict[str, Tuple[pd.DataFrame, pd.Serie
     # composition. Horizontal to align with the other pooled bar figures.
     fig.update_layout(barmode="stack")
     pub_style.apply_theme(
-        fig, title="Mean per-component load shed by carrier",
+        fig,
+        title=f"Mean per-component load shed by carrier — {SINGLE_REMOVAL_HINT}",
         height=pub_style.hbar_height(len(grids), 3),
         width=pub_style.BAR_FIG_WIDTH, font_bump=1, legend_top=True,
     )
+    # Plotly reverses the legend on stacked bars; on a *horizontal* stack that
+    # reads backwards against the row figure's legend, which is not reversed.
+    fig.update_layout(legend_traceorder="normal")
     fig.update_yaxes(autorange="reversed")
-    fig.update_xaxes(title="Mean shed per component (MW)")
+    fig.update_xaxes(title="Mean shed per component (MW)",
+                     range=[0, x_max * 1.06] if x_max else None)
     return fig
 
 
 def _pooled_total_shed_by_carrier(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
-                                  grids: List[str], conn: bool = False) -> go.Figure:
+                                  grids: List[str], conn: bool = False,
+                                  x_max: float | None = None) -> go.Figure:
     """Total shed summed over all single-component removals, grouped bars per
     carrier.
 
@@ -884,14 +925,17 @@ def _pooled_total_shed_by_carrier(records: Dict[str, Tuple[pd.DataFrame, pd.Seri
     fig.update_layout(barmode="stack")
     pub_style.apply_theme(
         fig,
-        title=("Total connected-load (recoverable) shed by carrier" if conn
-               else "Total load shed by carrier"),
+        title=(("Total connected-load (recoverable) shed by carrier" if conn
+                else "Total load shed by carrier")
+               + f" — {SINGLE_REMOVAL_HINT}"),
         height=pub_style.hbar_height(len(grids), 3),
         width=pub_style.BAR_FIG_WIDTH, font_bump=1, legend_top=True,
     )
+    fig.update_layout(legend_traceorder="normal")
     fig.update_yaxes(autorange="reversed")
     fig.update_xaxes(title=("Total connected-load shed (MW)" if conn
-                            else "Total shed (MW)"))
+                            else "Total shed (MW)"),
+                     range=[0, x_max * 1.06] if x_max else None)
     return fig
 
 
@@ -902,15 +946,14 @@ def _pooled_mean_shed_by_carrier_row(
     family (eval_common.FAMILY_ORDER) sharing a single legend, so the
     strategies sit in one row in the dissertation. Mirrors
     :func:`_pooled_mean_shed_by_carrier` but across families."""
-    carriers = (("electricity", "power_shed"), ("heat", "heat_shed"), ("gas", "gas_shed"))
     fams = sorted(classes, key=lambda c: _FAMILY_ORDER.get(c[0], 99))
     fig = make_subplots(rows=1, cols=len(fams), shared_xaxes=False,
                         horizontal_spacing=0.06,
-                        subplot_titles=[f for f, _ in fams])
+                        subplot_titles=[_family_label(f) for f, _ in fams])
     for ci, (_fam, subset) in enumerate(fams, start=1):
         grids = _grid_order(subset)
         y = [_short_grid(g) for g in grids]
-        for sec, col in carriers:
+        for sec, col in _CARRIER_COLS:
             x = []
             for g in grids:
                 sweep, _ = records[g]
@@ -926,8 +969,15 @@ def _pooled_mean_shed_by_carrier_row(
     fig.update_xaxes(title_text="Mean shed per component (MW)",
                      row=1, col=(len(fams) + 1) // 2)
     pub_style.apply_theme(
-        fig, title="Mean per-component load shed by carrier, per density and strategy",
+        fig, title=("Mean per-component load shed by carrier, per density and "
+                    f"strategy — {SINGLE_REMOVAL_HINT}"),
         width=1180, height=430, legend_top=True, font_bump=2)
+    pub_style.clear_subplot_titles(fig)
+    # One value scale across the panels: the row layout exists to compare a
+    # density across strategies, which per-panel autoranging defeats.
+    all_grids = [g for _f, subset in fams for g in subset]
+    fig.update_xaxes(
+        range=[0, _stacked_x_max(records, all_grids, mean=True) * 1.06])
     return fig
 
 
@@ -1010,20 +1060,26 @@ def _emit_pooled_report(
     grids: List[str],
     out_dir: Path,
     class_label: str = "",
+    x_max: Dict[str, float] | None = None,
 ) -> Path:
     """Build the pooled cross-grid figures for one scenario-family subset and
     write them to ``pooled[_<class>]_report.html`` plus per-figure PDFs
     under ``single/``. ``class_label=""`` keeps the legacy filename so
     runs with only baseline grids stay byte-identical to before.
+
+    ``x_max`` carries the cross-family value-axis maxima (see
+    :func:`_stacked_x_max`) so the per-strategy shed bars printed next to
+    each other in the chapter share one scale.
     """
+    x_max = x_max or {}
     figs: List[go.Figure] = [
         _pooled_baseline(records, grids),
         _pooled_total_shed_box(records, grids),
         _pooled_excess_shed_box(records, grids),
         _pooled_pareto(records, grids),
         _pooled_carrier_box(records, grids),
-        _pooled_mean_shed_by_carrier(records, grids),
-        _pooled_total_shed_by_carrier(records, grids),
+        _pooled_mean_shed_by_carrier(records, grids, x_max=x_max.get("mean")),
+        _pooled_total_shed_by_carrier(records, grids, x_max=x_max.get("total")),
         _pooled_kind_summary(records, grids),
         _pooled_top_components(records, grids, top_n=10),
         _pooled_solve_time(records, grids),
@@ -1066,7 +1122,8 @@ def _emit_pooled_report(
         # CP-density effect reads directly (it shrinks as CPs are added). The
         # insert(3) above shifted total_shed_by_carrier from index 6 to 7, so
         # the connected twin lands at 8 (immediately after it).
-        figs.insert(8, _pooled_total_shed_by_carrier(records, grids, conn=True))
+        figs.insert(8, _pooled_total_shed_by_carrier(
+            records, grids, conn=True, x_max=x_max.get("total_conn")))
         titles.insert(8, "Total connected-load (recoverable) shed by sector")
         slug_names.insert(8, "total_shed_conn_by_carrier")
     suffix = f"_{class_label}" if class_label else ""
@@ -1102,12 +1159,19 @@ def plot_pooled(records: Dict[str, Tuple[pd.DataFrame, pd.Series]],
         # Legacy / single-class run — emit unsuffixed filenames.
         return _emit_pooled_report(records, grids, out_dir, class_label="")
 
+    # Value-axis maxima over *every* family, so the per-strategy figures the
+    # chapter prints side by side are comparable bar-for-bar.
+    x_max = {
+        "mean": _stacked_x_max(records, grids, mean=True),
+        "total": _stacked_x_max(records, grids, mean=False),
+        "total_conn": _stacked_x_max(records, grids, mean=False, suffix="_conn"),
+    }
     # Mixed run — one report per scenario family so each stays compact.
     last_path: Path | None = None
     for class_label, subset in classes:
         sub_records = {g: records[g] for g in subset}
         last_path = _emit_pooled_report(sub_records, subset, out_dir,
-                                        class_label=class_label)
+                                        class_label=class_label, x_max=x_max)
     # Combined cross-family row used in the dissertation: the three strategies
     # side by side, horizontal stacked bars, one shared legend.
     try:

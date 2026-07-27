@@ -35,7 +35,8 @@ from test_grids import ALL_GRIDS
 # Family suffixes (see test_grids.py): ``-bk`` = backup (additive CPs, rich
 # gas donor), ``-lb`` = loadbearing (CPs replace primary generation),
 # ``-dc`` = decoupled (loadbearing's fleet as independent generators, no
-# coupling constraints), ``-ctl`` = control (additive CPs, no donor surplus).
+# coupling constraints), ``-ctl`` = control (additive CPs, no donor surplus;
+# labelled "no-reserve" in prose — it is backup's reserve-less twin).
 _STEM_LABEL = {
     "no": "LV-no",
     "low": "LV-s",

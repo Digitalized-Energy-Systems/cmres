@@ -25,6 +25,7 @@ from typing import Dict, List, Optional, Sequence
 from eval_common import (  # noqa: E402  # canonical scenario-family helpers,
     FAMILY_COLOR,
     FAMILY_ORDER,          # used by every cross-scenario plotter.
+    family_label,
     scenario_family,
     scenario_stem,
     split_scenarios_by_family,
@@ -258,9 +259,29 @@ SECTOR_PRETTY: Dict[str, str] = {
     "gas":   "Gas",
 }
 
+#: Which simulation a figure's reference values come from. Both experiments
+#: produce per-carrier shed in MW on the same grids and the same components,
+#: so a bare "mean shed" title is ambiguous — every figure names its source.
+SINGLE_REMOVAL_HINT = "single-removal (N−1) experiment"
+RQMC_HINT = "RQMC experiment"
+
 #: Canonical sector display order. Anything that builds a sector legend
 #: should iterate this list (skipping keys it doesn't carry).
-SECTOR_ORDER: List[str] = ["total", "ranked", "multi", "power", "heat", "gas"]
+#:
+#: ``total`` is deliberately absent: it pools raw MW sheds across carriers, so
+#: it is confounded by the cross-carrier scale mixing that ``ranked``
+#: (within-carrier percentile ranks) removes. On the study data the two
+#: disagree in sign on 36 of 312 (scenario, metric) cells where *every*
+#: per-carrier ρ is positive — textbook Simpson reversals — and ``total``
+#: tracks the mean per-carrier ρ at Spearman 0.63 against ``ranked``'s 0.88.
+#: ``ranked`` is therefore the only honest "overall" number and ``total``
+#: only invited misreading, so it is no longer plotted.
+SECTOR_ORDER: List[str] = ["ranked", "multi", "power", "heat", "gas"]
+
+#: Tags whose slice is defined by component carrier membership. ``ranked``
+#: builds its own per-carrier membership masks; ``multi`` and ``total`` are
+#: kind-filtered, not carrier-filtered.
+CARRIER_MEMBER_TAGS = frozenset({"power", "heat", "gas"})
 
 
 def outlined_marker(color: str) -> dict:
@@ -1492,9 +1513,11 @@ def _e16_sector_hbar(metric_labels: List[str], traces: list, *,
                      title: str) -> go.Figure:
     """Render a horizontal grouped per-sector ρ bar in the shared scare style.
 
-    ``metric_labels`` is the bottom→top y-category order (highest ρ on top).
+    ``metric_labels`` is the top→bottom y-category order (the y-axis is
+    reversed, so the first entry lands on top and the canonical CORE_METRICS
+    order reads down the axis exactly as it does in the ranking panels).
     ``traces`` is a list of ``(tag, rho_array, err_hi, err_lo, n_arr)`` where
-    ``tag`` is a sector key (``total`` / ``multi`` / ``power`` / ``heat`` /
+    ``tag`` is a sector key (``ranked`` / ``multi`` / ``power`` / ``heat`` /
     ``gas``). Sector hue is kept; a CVD hatch is layered on top; legend rides
     on top horizontally and the figure height tracks the metric count so the
     bars stay slim instead of ballooning.
@@ -1534,52 +1557,60 @@ def _e16_sector_hbar(metric_labels: List[str], traces: list, *,
     pub_style.apply_theme(
         bar, title=title,
         height=pub_style.hbar_height(len(metric_labels), n_series),
-        width=pub_style.BAR_FIG_WIDTH, font_bump=4, legend_top=True,
+        width=pub_style.WIDE_BAR_FIG_WIDTH, font_bump=4, legend_top=True,
     )
     bar.update_xaxes(title="Spearman ρ", range=[-1.10, 1.10])
-    bar.update_yaxes(title="")
+    bar.update_yaxes(title="", autorange="reversed")
     return bar
 
 
-def _e16_rho_per_sector_bar(df: pd.DataFrame, scenario: str) -> go.Figure:
+def _e16_rho_per_sector_bar(df: pd.DataFrame, scenario: str,
+                            conn: bool = False) -> go.Figure:
     """Grouped bar chart for one scenario: per metric, one bar per
     *sector slice* (total / multi / electricity / heat / gas), with sector
     legend and CI error bars.
 
     The slices are partitioned by component kind so the per-carrier signal
     isn't distorted by coupling-point rows:
-      total       — every matched row (the headline number).
+      ranked      — non-CP rows, within-carrier percentile ranks pooled
+                    across carriers (the de-confounded overall number).
       multi       — CP rows only (compound + branch_cp), vs total_shed —
                     how well the metric ranks coupling components.
       power/heat/gas — non-CP rows only, vs same-sector shed — clean
                     within-carrier ranking on plain branches/pipes.
 
     This is the canonical per-scenario per-sector correlation view."""
+    view = e16_shed_view(conn)
+    sfx = view["sfx"]
     sub = df[df["scenario"] == scenario]
-    if sub.empty:
+    if sub.empty or f"rho_vs_ranked_shed{sfx}" not in sub.columns:
         return go.Figure()
-    order = sub.sort_values("rho_vs_total_shed",
-                            na_position="last")["metric"].tolist()
+    # Canonical CORE_METRICS order (not ρ-sorted) so this figure, the pooled
+    # twin and the ranking panels put the same metric on the same row.
+    order = [m for m in _core_metric_cols() if m in set(sub["metric"])]
+    if not order:
+        return go.Figure()
     sub_t = sub.set_index("metric").reindex(order).reset_index()
     metric_labels = metric_label(list(sub_t["metric"]))
     traces = []
     for tag in SECTOR_ORDER:
-        rho_col = f"rho_vs_{tag}_shed"
+        rho_col = f"rho_vs_{tag}_shed{sfx}"
         if rho_col not in sub.columns:
             continue
         rho = sub_t[rho_col].astype(float)
         if not rho.notna().any():
             continue
-        hi = sub_t.get(f"ci_hi_{tag}_shed", pd.Series(dtype=float))
-        lo = sub_t.get(f"ci_lo_{tag}_shed", pd.Series(dtype=float))
+        hi = sub_t.get(f"ci_hi_{tag}_shed{sfx}", pd.Series(dtype=float))
+        lo = sub_t.get(f"ci_lo_{tag}_shed{sfx}", pd.Series(dtype=float))
         err_hi = (hi - rho).clip(lower=0) if not hi.empty else None
         err_lo = (rho - lo).clip(lower=0) if not lo.empty else None
-        n_col = f"n_{tag}" if tag != "total" else "n"
+        n_col = f"n_{tag}{sfx}"
         n_arr = sub_t[n_col] if n_col in sub_t.columns else sub_t.get("n")
         traces.append((tag, rho, err_hi, err_lo, n_arr))
     return _e16_sector_hbar(
         metric_labels, traces,
-        title=f"{pretty_scenario(scenario)}: Spearman ρ vs analytical shed, per sector",
+        title=(f"{pretty_scenario(scenario)}: Spearman ρ vs "
+               f"{view['label']}, per sector — {SINGLE_REMOVAL_HINT}"),
     )
 
 
@@ -1618,7 +1649,7 @@ def _e16_top_overlap(merged: pd.DataFrame, scenario: str,
 
 
 def _e16_rho_per_sector_bar_aggregated(
-    merged_files: Sequence[Path],
+    merged_files: Sequence[Path], conn: bool = False,
 ) -> go.Figure:
     """Pooled per-sector ρ bar chart: ρ recomputed on rows concatenated
     across every scenario's ``E16_<scenario>_merged.csv``.
@@ -1661,76 +1692,50 @@ def _e16_rho_per_sector_bar_aggregated(
     if not frames:
         return go.Figure()
     pooled = pd.concat(frames, ignore_index=True)
+    view = e16_shed_view(conn)
+    sfx = view["sfx"]
+    if conn and not e16_has_conn(pooled):
+        return go.Figure()
 
     # Same partitioning as cmres_eval._E16 sector_specs. "ranked" is the
     # carrier-rank pooled slice (within-carrier percentile ranks pooled
     # across carriers) — the de-confounded overall ρ; see the sector-spec
     # comment above ANALYTICAL_SECTOR_SPECS.
     sector_specs = [
-        ("total",  "total_shed", None),
-        ("ranked", "_ranked_ref", "branch"),
-        ("multi",  "total_shed", "cp"),
-        ("power",  "power_shed", "branch"),
-        ("heat",   "heat_shed",  "branch"),
-        ("gas",    "gas_shed",   "branch"),
+        ("ranked", ("power_shed" + sfx, "heat_shed" + sfx, "gas_shed" + sfx),
+         "branch"),
+        ("multi",  f"total_shed{sfx}", "cp"),
+        ("power",  f"power_shed{sfx}", "branch"),
+        ("heat",   f"heat_shed{sfx}",  "branch"),
+        ("gas",    f"gas_shed{sfx}",   "branch"),
     ]
-    from eval_common import carrier_rank_pooled as _crp
-    _branch_mask = (
-        pooled["kind"] == "branch" if "kind" in pooled.columns
-        else pd.Series(True, index=pooled.index)
-    )
-    ranked_pool = _crp(
-        pooled, ["power_shed", "heat_shed", "gas_shed"], _branch_mask
-    )
 
-    # Candidate metric columns: any non-meta column with float-like values
-    # present on every scenario. Exclude the known-shed / id / metadata
-    # columns so we don't accidentally rank against keys.
-    META = {
-        "scenario", "metric", "cp_id", "cp_type", "kind",
-        "total_shed", "power_shed", "heat_shed", "gas_shed",
-        "_join_cp_id", "_scenario",
-    }
+    # Metric axis = the canonical CORE line-up, in canonical order. This used
+    # to be "every numeric column that isn't obviously metadata", which swept
+    # in the merged frame's intermediate factors (topo_factor,
+    # demand_coupling_mult, …) *and* the MC ground truth (actual_electricity /
+    # actual_heat / actual_gas) — the latter then rendered as near-perfect
+    # "predictors" of the very quantity they are.
     candidate_metrics = [
-        c for c in pooled.columns
-        if c not in META and pd.api.types.is_numeric_dtype(pooled[c])
-    ]
-    # Cosmetic: keep only the same set of metrics the per-scenario bar
-    # already reports on, i.e. those that produced ρ rows in the metric
-    # CSV. To avoid plumbing that list around, derive it from any metric
-    # that has at least one non-NaN value across the pooled set AND varies.
-    candidate_metrics = [
-        m for m in candidate_metrics
-        if pooled[m].notna().sum() >= 3 and pooled[m].nunique() >= 2
-        and m not in {"actual_total", "rho_vs_shed"}
+        m for m in _core_metric_cols()
+        if m in pooled.columns
+        and pooled[m].notna().sum() >= 3 and pooled[m].nunique() >= 2
     ]
     if not candidate_metrics:
         return go.Figure()
 
-    # ρ table: rows = metric, cols = sector tag.
+    # ρ table: rows = metric, cols = sector tag. Slicing goes through the
+    # shared _sector_subset so this figure, the ranking panels and the
+    # per-scenario bars cannot drift apart in their population definition.
     rho_records: List[dict] = []
     for m in candidate_metrics:
         row: dict = {"metric": m}
-        for tag, col, kind_filter in sector_specs:
-            if tag == "ranked":
-                sub = (ranked_pool[ranked_pool[m].notna()]
-                       if m in ranked_pool.columns else ranked_pool.iloc[0:0])
-            else:
-                sub = pooled[pooled[m].notna()]
-                if col not in sub.columns:
-                    row[f"rho_{tag}"] = float("nan")
-                    row[f"n_{tag}"] = 0
-                    continue
-                if kind_filter == "branch" and "kind" in sub.columns:
-                    sub = sub[sub["kind"] == "branch"]
-                elif kind_filter == "cp" and "kind" in sub.columns:
-                    sub = sub[sub["kind"] != "branch"]
-                if tag != "total":
-                    # Analytical-shed noise floor; see eval_common.SHED_EPS.
-                    from eval_common import SHED_EPS as _EPS
-                    sub = sub[sub[col].notna() & (sub[col] > _EPS)]
-                else:
-                    sub = sub[sub[col].notna()]
+        for tag, spec_col, kind_filter in sector_specs:
+            sub, col = _sector_subset(pooled, m, tag, spec_col, kind_filter)
+            if col not in sub.columns:
+                row[f"rho_{tag}"] = float("nan")
+                row[f"n_{tag}"] = 0
+                continue
             if len(sub) < 3 or sub[m].nunique() < 2 or sub[col].nunique() < 2:
                 row[f"rho_{tag}"] = float("nan")
                 row[f"ci_lo_{tag}"] = float("nan")
@@ -1746,10 +1751,9 @@ def _e16_rho_per_sector_bar_aggregated(
     rho_df = pd.DataFrame(rho_records)
     if rho_df.empty:
         return go.Figure()
-    # Order metrics by the headline (total) ρ, NaN-last, matching the
-    # per-scenario bar so the two figures read in the same direction.
-    # Ascending so the highest-ρ metric lands on top of the horizontal bar.
-    rho_df = rho_df.sort_values("rho_total", ascending=True, na_position="first")
+    # ``candidate_metrics`` is already in canonical CORE_METRICS order and
+    # _e16_sector_hbar reverses the y-axis, so no sort here — the pooled bar,
+    # the per-scenario bar and the ranking panels share one row order.
     metric_labels = metric_label(rho_df["metric"].tolist())
 
     traces = []
@@ -1766,22 +1770,38 @@ def _e16_rho_per_sector_bar_aggregated(
         err_lo = (rho - lo).clip(lower=0) if not lo.empty else None
         n_arr = rho_df[f"n_{tag}"]
         traces.append((tag, rho, err_hi, err_lo, n_arr))
-    n_total_row = int(rho_df["n_total"].max()) if "n_total" in rho_df.columns else 0
     return _e16_sector_hbar(
         metric_labels, traces,
         title=(
-            f"Pooled across all scenarios (n={n_total_row}): "
-            "Spearman ρ vs analytical shed, per sector"
+            f"Pooled across all scenarios (n={len(pooled)}): Spearman ρ vs "
+            f"{view['label']}, per sector — {SINGLE_REMOVAL_HINT}"
         ),
     )
 
 
-_E16_RANK_METRICS = [
-    "predicted_score", "predicted_score_cp_aware", "predicted_score_balanced",
-    "predicted_stress", "topo_bc", "stress_bc", "katz_score", "vitality_score",
-    "local_score", "self_score",
-    "predicted_power", "predicted_heat", "predicted_gas",
-]
+def _core_metric_cols() -> List[str]:
+    """The canonical 10-metric line-up, in ``eval_common.CORE_METRICS`` order.
+
+    Every E16 metric axis is built from this list so the ρ bars, the ranking
+    panels and the heatmap all read top-to-bottom (or left-to-right) in the
+    same order. The carrier-matched predictors (``predicted_power`` / ``_heat``
+    / ``_gas``) are *not* here: each is only defined on its own carrier's
+    slice, so it renders as one bar and four gaps and cannot be compared
+    against a general predictor on the same axis.
+    """
+    try:
+        from eval_common import CORE_METRIC_COLS
+        return list(CORE_METRIC_COLS)
+    except Exception:  # pragma: no cover — module imported standalone
+        return [
+            "predicted_score", "predicted_score_cp_aware",
+            "predicted_score_balanced", "predicted_stress", "topo_bc",
+            "stress_bc", "katz_score", "vitality_score", "local_score",
+            "self_score",
+        ]
+
+
+_E16_RANK_METRICS = _core_metric_cols()
 
 # ── Shared per-sector criticality-figure code path (analytical E16 + MC) ───────
 # Sector partitioning. (tag, reference column, kind_filter): kind_filter selects
@@ -1794,17 +1814,54 @@ _E16_RANK_METRICS = [
 # (eval_common.carrier_rank_pooled). That is the de-confounded overall
 # number — pooling raw sheds across carriers ("total") flips ρ negative via
 # Simpson (CP rows + cross-carrier scale mixing) even when every
-# within-carrier ρ is positive.
+# within-carrier ρ is positive, which is why "total" is no longer plotted
+# (see SECTOR_ORDER).
 ANALYTICAL_SECTOR_SPECS = [
-    ("total",  "total_shed", None),
     ("ranked", ("power_shed", "heat_shed", "gas_shed"), "branch"),
     ("power",  "power_shed", "branch"),
     ("heat",   "heat_shed",  "branch"),
     ("gas",    "gas_shed",   "branch"),
     ("multi",  "total_shed", "cp"),
 ]
+
+# ── Connected-load shed view ─────────────────────────────────────────────────
+# ``total_shed`` counts the full nameplate of loads the removal topologically
+# islanded plus the curtailment of the loads that stay reachable. The islanded
+# part is unrecoverable by any dispatch and CP-count-invariant by construction,
+# so it dominates the ranking on these radial LV grids. The ``*_shed_conn``
+# columns hold the recoverable part alone; every analytical E16 figure is
+# emitted for both views so a metric's ranking can be judged against the shed
+# the system can actually do something about. See ``mc_connected_shed`` for the
+# MC-side twin of the same split.
+E16_CONN_SUFFIX = "_conn"
+
+ANALYTICAL_SECTOR_SPECS_CONN = [
+    (tag,
+     tuple(c + E16_CONN_SUFFIX for c in col) if isinstance(col, tuple)
+     else col + E16_CONN_SUFFIX,
+     kind)
+    for tag, col, kind in ANALYTICAL_SECTOR_SPECS
+]
+
+
+def e16_shed_view(conn: bool) -> Dict[str, str]:
+    """Column suffix / display strings for one analytical shed view."""
+    if conn:
+        return {"sfx": E16_CONN_SUFFIX, "slug": E16_CONN_SUFFIX,
+                "label": "connected-load shed", "suffix": " (connected load)"}
+    return {"sfx": "", "slug": "", "label": "analytical shed", "suffix": ""}
+
+
+def e16_has_conn(df: pd.DataFrame) -> bool:
+    """True when *df* carries the connected-load columns of either shape
+    (raw ``*_shed_conn`` sheds, or the ``rho_vs_*_shed_conn`` ρ table)."""
+    if df is None or df.empty:
+        return False
+    return ("total_shed" + E16_CONN_SUFFIX in df.columns
+            or "rho_vs_shed" + E16_CONN_SUFFIX in df.columns)
+
+
 MC_SECTOR_SPECS = [
-    ("total",  "actual_total", None),
     ("ranked", ("actual_electricity", "actual_heat", "actual_gas"), "branch"),
     ("power",  "actual_electricity", "branch"),
     ("heat",   "actual_heat",        "branch"),
@@ -1831,29 +1888,33 @@ def _sector_subset(pooled: pd.DataFrame, metric: str, tag: str,
     the reference column can differ from ``col`` for derived slices (the
     "ranked" tag builds a within-carrier percentile-rank pool and returns
     its synthetic reference column)."""
+    from eval_common import CARRIER_TAG_ORDER, carrier_member_mask, carrier_rank_pooled
+
     sub = pooled[pooled[metric].notna()]
     if isinstance(col, tuple):
-        from eval_common import carrier_rank_pooled
-        present = [c for c in col if c in sub.columns]
-        if not present:
+        pairs = [(CARRIER_TAG_ORDER[i], c) for i, c in enumerate(col)
+                 if c in sub.columns]
+        if not pairs:
             return sub.iloc[0:0], "_ranked_ref"
         mask = ~_cp_mask(sub) if kind_filter == "branch" \
             else pd.Series(True, index=sub.index)
-        return carrier_rank_pooled(sub, present, mask), "_ranked_ref"
+        return carrier_rank_pooled(
+            sub, [c for _t, c in pairs], mask,
+            member_masks=[carrier_member_mask(sub, t) for t, _c in pairs],
+        ), "_ranked_ref"
     if col not in sub.columns:
         return sub.iloc[0:0], col
     if kind_filter == "branch":
         sub = sub[~_cp_mask(sub)]
     elif kind_filter == "cp":
         sub = sub[_cp_mask(sub)]
-    if tag != "total":
-        # Analytical sheds: > SHED_EPS, not > 0 — MIPGap-level sheds are
-        # solver noise and their inclusion inflates carrier-aware
-        # predictors. MC actuals are probability-weighted (genuinely small
-        # values exist), so they keep the sampled-at-all MC_FAILED_EPS.
-        from eval_common import MC_FAILED_EPS, SHED_EPS
-        eps = MC_FAILED_EPS if str(col).startswith("actual") else SHED_EPS
-        sub = sub[sub[col].notna() & (sub[col] > eps)]
+    if tag in CARRIER_MEMBER_TAGS:
+        # Membership, not outcome — see eval_common.CARRIER_MEMBER_TYPES for
+        # why conditioning on ``shed_k > eps`` breaks the RQMC slices. The
+        # value is clipped rather than thresholded so both references are
+        # scored on the identical population.
+        sub = sub[carrier_member_mask(sub, tag) & sub[col].notna()]
+        sub = sub.assign(**{col: sub[col].clip(lower=0.0)})
     else:
         sub = sub[sub[col].notna()]
     return sub, col
@@ -1865,12 +1926,20 @@ def _rank_metrics_present(pooled: pd.DataFrame) -> List[str]:
             and pooled[m].nunique() >= 2]
 
 
-_RANK_MEASURE_KEYS = ("kendall", "wtau", "rndcg", "rprec")
+# Top-weighted Kendall τ (scipy ``weightedtau``) used to sit alongside the
+# plain τ here. It was dropped: its hyperbolic rank weights make the value
+# depend on slice length, so a ~14-row CP slice and a ~2000-row power slice
+# are not on one scale, and it has no random baseline — exactly the two
+# problems rNDCG@k* and rP@k* were added to solve. Head-of-ranking agreement
+# is therefore still covered (twice), by the two measures that *are*
+# comparable across slices, while plain τ-b keeps the global, ties-corrected
+# concordance number that pairs one-to-one with the Spearman ρ figures.
+_RANK_MEASURE_KEYS = ("kendall", "rndcg", "rprec")
 # Measures whose sign encodes ranking *direction* (a strong negative is an
 # inverted-but-informative ranker) — the delta figures compare magnitudes
 # |B|−|A| for these. rNDCG / rP@k negatives mean "worse than random", which
 # is NOT invertible information, so their deltas stay signed.
-_RANK_SIGNED_CORR_KEYS = frozenset({"kendall", "wtau"})
+_RANK_SIGNED_CORR_KEYS = frozenset({"kendall"})
 
 
 def _slice_k(k: int, n: int) -> int:
@@ -1882,25 +1951,22 @@ def _slice_k(k: int, n: int) -> int:
 
 
 def per_sector_ranking_table(pooled, sector_specs, metrics, k=10):
-    """{(metric, tag): {"kendall":…, "wtau":…, "rndcg":…, "rprec":…}}, n_total.
+    """{(metric, tag): {"kendall":…, "rndcg":…, "rprec":…}}, n_pooled.
 
-    Kendall τ, top-weighted τ (hyperbolic weights — head agreement, the
-    deployment-relevant part of the ranking), random-normalised NDCG@k* and
-    random-normalised precision@k* of each metric against the sector's
-    reference, per slice. k* adapts to the slice size (:func:`_slice_k`);
-    the random normalisation makes values comparable across slice sizes
-    (0 = chance, 1 = perfect, negative = worse than random).
+    Kendall τ-b, random-normalised NDCG@k* and random-normalised
+    precision@k* of each metric against the sector's reference, per slice.
+    k* adapts to the slice size (:func:`_slice_k`); the random normalisation
+    makes values comparable across slice sizes (0 = chance, 1 = perfect,
+    negative = worse than random).
     """
-    from scipy.stats import kendalltau as _kendalltau, weightedtau as _wtau
+    from scipy.stats import kendalltau as _kendalltau
     from eval_common import random_normalized_ndcg, rprecision_at_k
     table: dict = {}
-    n_total = 0
+    n_pooled = len(pooled)
     nan_row = {key: np.nan for key in _RANK_MEASURE_KEYS}
     for m in metrics:
         for tag, col, kf in sector_specs:
             sub, ref_col = _sector_subset(pooled, m, tag, col, kf)
-            if tag == "total":
-                n_total = max(n_total, len(sub))
             if (len(sub) < 3 or sub[m].nunique() < 2
                     or sub[ref_col].nunique() < 2):
                 table[(m, tag)] = dict(nan_row)
@@ -1909,11 +1975,10 @@ def per_sector_ranking_table(pooled, sector_specs, metrics, k=10):
             kk = _slice_k(k, len(sub))
             table[(m, tag)] = {
                 "kendall": float(_kendalltau(x, ref).correlation),
-                "wtau": float(_wtau(x, ref).correlation),
                 "rndcg": random_normalized_ndcg(ref, x, k=kk),
                 "rprec": rprecision_at_k(ref, x, kk),
             }
-    return table, n_total
+    return table, n_pooled
 
 
 def per_sector_spearman_table(pooled, sector_specs, metrics):
@@ -1928,19 +1993,16 @@ def per_sector_spearman_table(pooled, sector_specs, metrics):
             r = _spr(a, b)
             return float(r.statistic), float(r.pvalue), np.nan, np.nan
     table: dict = {}
-    n_total = 0
     for m in metrics:
         for tag, col, kf in sector_specs:
             sub, ref_col = _sector_subset(pooled, m, tag, col, kf)
-            if tag == "total":
-                n_total = max(n_total, len(sub))
             if (len(sub) < 3 or sub[m].nunique() < 2
                     or sub[ref_col].nunique() < 2):
                 table[(m, tag)] = {"rho": np.nan}
                 continue
             rho, _p, _lo, _hi = _sp(sub[m], sub[ref_col])
             table[(m, tag)] = {"rho": float(rho)}
-    return table, n_total
+    return table, len(pooled)
 
 
 def render_per_sector_panels(table, metrics, sector_tags, panels, *, title,
@@ -1972,13 +2034,14 @@ def render_per_sector_panels(table, metrics, sector_tags, panels, *, title,
                       row=1, col=ci)
     pub_style.apply_theme(fig, title=title, width=width, height=height,
                           legend_top=True, font_bump=font_bump)
+    pub_style.clear_subplot_titles(fig)
     fig.update_yaxes(autorange="reversed")
     return fig
 
 
 def ranking_per_sector_figure(pooled, sector_specs, *, title, k=10):
-    """Per-sector Kendall τ / weighted τ / rNDCG@k* / rP@k* (4 panels).
-    ``title`` may contain ``{n}`` for the total-sector sample size. k* is
+    """Per-sector Kendall τ / rNDCG@k* / rP@k* (3 panels).
+    ``title`` may contain ``{n}`` for the pooled component count. k* is
     the per-slice cutoff (top quintile, 5..k); the r-prefixed measures are
     random-baseline-normalised so slices of different size are comparable
     (0 = chance, negative = worse than random)."""
@@ -1987,7 +2050,6 @@ def ranking_per_sector_figure(pooled, sector_specs, *, title, k=10):
         return go.Figure()
     table, n_total = per_sector_ranking_table(pooled, sector_specs, metrics, k)
     panels = [("kendall", "Kendall τ", [-1.0, 1.0]),
-              ("wtau", "Weighted τ (top-heavy)", [-1.0, 1.0]),
               ("rndcg", "rNDCG@k*", [-1.0, 1.0]),
               ("rprec", "rP@k*", [-1.0, 1.0])]
     tags = [t for t, _, _ in sector_specs]
@@ -2000,7 +2062,7 @@ def ranking_per_sector_figure(pooled, sector_specs, *, title, k=10):
 
 def ranking_per_sector_delta_figure(pooled, specs_a, specs_b, *, title, k=10,
                                     drange=1.0):
-    """Δ (B − A) of the per-sector ranking measures, same 4-panel form (used for
+    """Δ (B − A) of the per-sector ranking measures, same 3-panel form (used for
     MC − analytical). ``specs_a``/``specs_b`` are sector-spec lists sharing the
     same tags but different reference columns."""
     metrics = _rank_metrics_present(pooled)
@@ -2023,7 +2085,6 @@ def ranking_per_sector_delta_figure(pooled, specs_a, specs_b, *, title, k=10,
             for mk in _RANK_MEASURE_KEYS
         }
     panels = [("kendall", "Δ|Kendall τ|", [-drange, drange]),
-              ("wtau", "Δ|Weighted τ|", [-drange, drange]),
               ("rndcg", "Δ rNDCG@k*", [-drange, drange]),
               ("rprec", "Δ rP@k*", [-drange, drange])]
     tags = [t for t, _, _ in specs_a]
@@ -2154,16 +2215,19 @@ def _e16_load_merged(merged_files: Sequence[Path]) -> pd.DataFrame:
 
 
 def _e16_ranking_per_sector_aggregated(merged_files: Sequence[Path],
-                                       k: int = 10) -> go.Figure:
+                                       k: int = 10,
+                                       conn: bool = False) -> go.Figure:
     """Analytical per-sector ranking accuracy pooled across scenarios (thin
     wrapper around the shared :func:`ranking_per_sector_figure`)."""
     pooled = _e16_load_merged(merged_files)
-    if pooled.empty:
+    if pooled.empty or (conn and not e16_has_conn(pooled)):
         return go.Figure()
+    view = e16_shed_view(conn)
+    specs = ANALYTICAL_SECTOR_SPECS_CONN if conn else ANALYTICAL_SECTOR_SPECS
     return ranking_per_sector_figure(
-        pooled, ANALYTICAL_SECTOR_SPECS, k=k,
+        pooled, specs, k=k,
         title="Pooled across scenarios (n={n}): per-sector ranking accuracy "
-              "vs analytical shed")
+              f"vs {view['label']} — {SINGLE_REMOVAL_HINT}")
 
 
 def cp_pooled_across_scenarios_figure(merged_files: Sequence[Path]) -> go.Figure:
@@ -2228,8 +2292,8 @@ def cp_pooled_across_scenarios_figure(merged_files: Sequence[Path]) -> go.Figure
     df = df.sort_values("rho_shed", ascending=True, na_position="first")
 
     fig = go.Figure()
-    for key, label, color in [("shed", "vs analytical shed", "#7e57c2"),
-                              ("mc",   "vs MC actual",       "#00897b")]:
+    for key, label, color in [("shed", "vs single-removal shed", "#7e57c2"),
+                              ("mc",   "vs RQMC actual",        "#00897b")]:
         rho_col = f"rho_{key}"
         if rho_col not in df.columns or not df[rho_col].notna().any():
             continue
@@ -2261,29 +2325,32 @@ def cp_pooled_across_scenarios_figure(merged_files: Sequence[Path]) -> go.Figure
     return fig
 
 
-def _e16_per_sector_heatmap(df: pd.DataFrame) -> go.Figure:
+def _e16_per_sector_heatmap(df: pd.DataFrame, conn: bool = False) -> go.Figure:
     """Extended E16 heatmap with per-sector y-axis resolution.
 
-    Each scenario expands into 5 rows (total / multi / electricity / heat /
-    gas). Cells = Spearman ρ for that (scenario, sector, metric) combination.
-    Horizontal separators are drawn between scenario blocks so the
-    grouped structure is visually obvious.
+    Each scenario expands into one row per sector slice (overall / multi /
+    electricity / heat / gas). Cells = Spearman ρ for that (scenario, sector,
+    metric) combination. Horizontal separators are drawn between scenario
+    blocks so the grouped structure is visually obvious.
 
     Input is the E16_metric_vs_shed.csv frame; the per-sector ρ values
     live in ``rho_vs_<tag>_shed`` columns.
     """
     if df is None or df.empty:
         return go.Figure()
+    view = e16_shed_view(conn)
+    sfx = view["sfx"]
 
     # Filtered by column presence so pre-"ranked" CSVs don't render an
     # all-NaN row block per scenario.
     sector_tags = [
-        t for t in ("total", "ranked", "multi", "power", "heat", "gas")
-        if f"rho_vs_{t}_shed" in df.columns
+        t for t in SECTOR_ORDER
+        if f"rho_vs_{t}_shed{sfx}" in df.columns
     ]
+    if not sector_tags:
+        return go.Figure()
     sector_short = {
-        "total":  "Total",
-        "ranked": "Pooled-rank",
+        "ranked": "Overall",
         "multi":  "Multi",
         "power":  "Electricity",
         "heat":   "Heat",
@@ -2291,7 +2358,10 @@ def _e16_per_sector_heatmap(df: pd.DataFrame) -> go.Figure:
     }
 
     scenarios = _scenario_order(df["scenario"].unique())
-    metrics = list(df["metric"].drop_duplicates())
+    # Canonical CORE_METRICS order, and CORE metrics only — the axis has to
+    # agree with the per-sector ρ bars and the ranking panels.
+    present = set(df["metric"])
+    metrics = [m for m in _core_metric_cols() if m in present]
     if not scenarios or not metrics:
         return go.Figure()
 
@@ -2309,13 +2379,13 @@ def _e16_per_sector_heatmap(df: pd.DataFrame) -> go.Figure:
     # column order. Replaces a triple-nested Python loop over
     # ``df_idx.loc[(s, m), col]`` that did ~scenarios × sectors × metrics
     # individual MultiIndex lookups.
-    sector_rho_cols = [f"rho_vs_{t}_shed" for t in sector_tags]
+    sector_rho_cols = [f"rho_vs_{t}_shed{sfx}" for t in sector_tags]
     sector_rho_cols = [c for c in sector_rho_cols if c in df.columns]
     z = np.full((len(row_labels), len(metrics)), np.nan, dtype=float)
     # ``scenario`` ordered against the resolved ``scenarios`` list so
     # ``row_keys`` and the matrix rows stay aligned 1-to-1.
     for col_name in sector_rho_cols:
-        tag = col_name[len("rho_vs_"):-len("_shed")]
+        tag = col_name[len("rho_vs_"):-len(f"_shed{sfx}")]
         pivot = (
             df.pivot_table(
                 index="scenario", columns="metric",
@@ -2377,8 +2447,8 @@ def _e16_per_sector_heatmap(df: pd.DataFrame) -> go.Figure:
 
     heat.update_layout(**_e16_layout(
         title=(
-            "Spearman ρ between metric and analytical shed, "
-            "per scenario × sector"
+            f"Spearman ρ between metric and {view['label']}, "
+            f"per scenario × sector — {SINGLE_REMOVAL_HINT}"
         ),
         xaxis=dict(title="Metric", automargin=True),
         yaxis=dict(
@@ -2386,6 +2456,9 @@ def _e16_per_sector_heatmap(df: pd.DataFrame) -> go.Figure:
             # Gridlines between every category for per-sector resolution
             # (in addition to the heavier scenario-boundary separators).
             showgrid=True, gridcolor="#eeeeee", gridwidth=1,
+            # Pin every category tick: plotly thins them on short figures,
+            # which silently mislabels which sector a row belongs to.
+            dtick=1, tick0=0,
         ),
         # +8 px per row over the previous 28 → 36 px row pitch so the
         # extended figure has more vertical breathing room.
@@ -2434,16 +2507,21 @@ def _stem_label(scenario: str) -> str:
     return label
 
 
-def _e16_ceiling_rho_combined(ceil: pd.DataFrame) -> go.Figure:
+def _e16_ceiling_rho_combined(ceil: pd.DataFrame,
+                              conn: bool = False) -> go.Figure:
     """All-strategy ceiling comparison: grouped horizontal bars of
     ρ(N-1 shed, MC actual) with one bar per family at each density, so
     all families (eval_common.FAMILY_ORDER) sit on one shared axis instead of one
     figure each."""
+    rho_col = "rho_shed_conn_vs_mc" if conn else "rho_shed_vs_mc"
+    lo_col, hi_col = ("ci_lo_conn", "ci_hi_conn") if conn else ("ci_lo", "ci_hi")
+    if rho_col not in ceil.columns:
+        return go.Figure()
     df = ceil.copy()
     df["family"] = df["scenario"].map(scenario_family)
     df["stem"] = df["scenario"].map(scenario_stem)
     df = df[df["family"] != "other"]
-    if df.empty:
+    if df.empty or not df[rho_col].notna().any():
         return go.Figure()
     stems: List[str] = []
     for s in _scenario_order(df["scenario"]):
@@ -2458,12 +2536,12 @@ def _e16_ceiling_rho_combined(ceil: pd.DataFrame) -> go.Figure:
     fig = go.Figure()
     for fam in fams:
         sub = df[df["family"] == fam].set_index("stem")
-        rho = sub["rho_shed_vs_mc"].reindex(stems)
-        err_hi = (sub["ci_hi"].reindex(stems) - rho).clip(lower=0)
-        err_lo = (rho - sub["ci_lo"].reindex(stems)).clip(lower=0)
+        rho = sub[rho_col].reindex(stems)
+        err_hi = (sub[hi_col].reindex(stems) - rho).clip(lower=0)
+        err_lo = (rho - sub[lo_col].reindex(stems)).clip(lower=0)
         fig.add_trace(go.Bar(
             y=[stem_labels[st] for st in stems],
-            x=rho.values, orientation="h", name=fam,
+            x=rho.values, orientation="h", name=family_label(fam),
             error_x=dict(type="data", symmetric=False,
                          array=err_hi.values, arrayminus=err_lo.values,
                          thickness=1.2, width=3, color=pub_style.MUTED_COLOR),
@@ -2471,14 +2549,15 @@ def _e16_ceiling_rho_combined(ceil: pd.DataFrame) -> go.Figure:
                 _FAMILY_BAR_COLOR[fam],
                 pattern_shape=_FAMILY_BAR_PATTERN.get(fam, ""),
             ),
-            hovertemplate=("<b>%{y}</b> (" + fam + ")"
+            hovertemplate=("<b>%{y}</b> (" + family_label(fam) + ")"
                            "<br>ρ = %{x:+.3f}<extra></extra>"),
         ))
     fig.update_layout(barmode="group")
     fig.update_yaxes(autorange="reversed", title="")
     fig.update_xaxes(title="Spearman ρ", range=[0, 1.0])
+    label = "N-1 connected-load shed" if conn else "N-1 shed"
     pub_style.apply_theme(
-        fig, title="ρ between N-1 shed and MC — all strategies",
+        fig, title=f"ρ between {label} and RQMC actual — all strategies",
         height=pub_style.hbar_height(len(stems), len(fams)),
         width=pub_style.BAR_FIG_WIDTH, font_bump=6, legend_top=True,
     )
@@ -2525,6 +2604,11 @@ def plot_e16_single_removal(input_dir: Path, output_dir: Path) -> Optional[Path]
         subset. Returns the pivot_shed.index used for the heatmap so the
         per-scenario per-sector bar loop later can reuse the same order."""
 
+        # Connected-load twin of every analytical figure below — same
+        # builders, ``*_shed_conn`` reference columns. Skipped when the shed
+        # CSVs predate the connected columns.
+        conn_views = [False, True] if e16_has_conn(sub_df) else [False]
+
         # ρ vs analytical shed — extended per-sector heatmap whose y-axis
         # lists (scenario, sector) pairs so every combination is visible in
         # one matrix. Falls back to the legacy total-only heatmap when there
@@ -2536,16 +2620,18 @@ def plot_e16_single_removal(input_dir: Path, output_dir: Path) -> Optional[Path]
         z = pivot_shed.values
         if z.size:
             if pivot_shed.shape[0] >= 2:
-                heat = _e16_per_sector_heatmap(sub_df)
-                if heat.data:
-                    figs.append(heat)
-                    titles.append(
-                        f"ρ vs analytical shed — per scenario × sector"
-                        f"{_title_suffix(class_label)}"
-                    )
-                    slugs.append(
-                        _slug("e16_rho_vs_shed_heatmap_per_sector", class_label)
-                    )
+                for _conn in conn_views:
+                    _v = e16_shed_view(_conn)
+                    heat = _e16_per_sector_heatmap(sub_df, conn=_conn)
+                    if heat.data:
+                        figs.append(heat)
+                        titles.append(
+                            f"ρ vs {_v['label']} — per scenario × sector"
+                            f"{_title_suffix(class_label)}"
+                        )
+                        slugs.append(_slug(
+                            f"e16_rho_vs_shed{_v['slug']}_heatmap_per_sector",
+                            class_label))
             else:
                 # Single-scenario fallback: legacy total-only heatmap.
                 text = np.where(np.isfinite(z),
@@ -2569,7 +2655,8 @@ def plot_e16_single_removal(input_dir: Path, output_dir: Path) -> Optional[Path]
                 ))
                 heat.update_layout(**_e16_layout(
                     title=(
-                        "Spearman ρ between metric and analytical single-removal shed"
+                        "Spearman ρ between metric and analytical shed — "
+                        + SINGLE_REMOVAL_HINT
                         + _title_suffix(class_label)
                     ),
                     xaxis=dict(title="Metric", tickangle=30), yaxis=dict(title=""),
@@ -2582,28 +2669,32 @@ def plot_e16_single_removal(input_dir: Path, output_dir: Path) -> Optional[Path]
 
         # Aggregated (pooled across this class's scenarios) per-sector ρ bar.
         if sub_pooled_files:
-            agg_bar = _e16_rho_per_sector_bar_aggregated(sub_pooled_files)
-            if agg_bar.data:
-                figs.append(agg_bar)
-                titles.append(
-                    f"ρ vs analytical shed — pooled across scenarios"
-                    f"{_title_suffix(class_label)}"
-                )
-                slugs.append(
-                    _slug("e16_rho_vs_shed_per_sector_pooled", class_label)
-                )
-            # Per-sector top-of-ranking accuracy (Kendall τ / NDCG@k /
-            # precision@k), the deployment-relevant complement to the ρ bar.
-            rank_bar = _e16_ranking_per_sector_aggregated(sub_pooled_files)
-            if rank_bar.data:
-                figs.append(rank_bar)
-                titles.append(
-                    f"ranking accuracy per sector — pooled across scenarios"
-                    f"{_title_suffix(class_label)}"
-                )
-                slugs.append(
-                    _slug("e16_ranking_per_sector_pooled", class_label)
-                )
+            for _conn in conn_views:
+                _v = e16_shed_view(_conn)
+                agg_bar = _e16_rho_per_sector_bar_aggregated(
+                    sub_pooled_files, conn=_conn)
+                if agg_bar.data:
+                    figs.append(agg_bar)
+                    titles.append(
+                        f"ρ vs {_v['label']} — pooled across scenarios"
+                        f"{_title_suffix(class_label)}"
+                    )
+                    slugs.append(_slug(
+                        f"e16_rho_vs_shed{_v['slug']}_per_sector_pooled",
+                        class_label))
+                # Per-sector top-of-ranking accuracy (Kendall τ / NDCG@k /
+                # precision@k), the deployment-relevant complement to the ρ bar.
+                rank_bar = _e16_ranking_per_sector_aggregated(
+                    sub_pooled_files, conn=_conn)
+                if rank_bar.data:
+                    figs.append(rank_bar)
+                    titles.append(
+                        f"ranking accuracy per sector vs {_v['label']} — "
+                        f"pooled across scenarios{_title_suffix(class_label)}"
+                    )
+                    slugs.append(_slug(
+                        f"e16_ranking_per_sector{_v['slug']}_pooled",
+                        class_label))
             # Cross-scenario pooled CP ranking — the statistically usable
             # replacement for the per-scenario "multi" bars (n≈14 each).
             cp_fig = cp_pooled_across_scenarios_figure(sub_pooled_files)
@@ -2625,25 +2716,26 @@ def plot_e16_single_removal(input_dir: Path, output_dir: Path) -> Optional[Path]
                     (ranking_per_sector_figure(
                         _pool_m, MC_SECTOR_SPECS,
                         title="Pooled across scenarios (n={n}): per-sector "
-                              "ranking accuracy vs MC actual impact"),
+                              "ranking accuracy vs MC actual impact — "
+                              f"{RQMC_HINT}"),
                      "ranking accuracy per sector vs MC",
                      "e16_ranking_per_sector_mc_pooled"),
                     (ranking_per_sector_delta_figure(
                         _pool_m, ANALYTICAL_SECTOR_SPECS, MC_SECTOR_SPECS,
                         title="Pooled across scenarios (n={n}): per-sector "
-                              "ranking accuracy Δ (MC − analytical)"),
+                              "ranking accuracy Δ (RQMC − single-removal)"),
                      "ranking accuracy per sector Δ (MC − analytical)",
                      "e16_ranking_per_sector_delta_pooled"),
                     (spearman_per_sector_delta_figure(
                         _pool_m, ANALYTICAL_SECTOR_SPECS, MC_SECTOR_SPECS,
                         title="Pooled across scenarios (n={n}): per-sector "
-                              "Spearman ρ Δ (MC − analytical)"),
+                              "Spearman ρ Δ (RQMC − single-removal)"),
                      "per-sector Spearman ρ Δ (MC − analytical)",
                      "e16_rho_per_sector_delta_pooled"),
                     (rho_per_network_type_figure(
                         _pool_m, "total_shed",
-                        title="Spearman ρ per network type (analytical shed) "
-                              "— check for heterogeneity"),
+                        title="Spearman ρ per network type vs analytical shed "
+                              f"({SINGLE_REMOVAL_HINT}) — heterogeneity check"),
                      "ρ per network type (analytical)",
                      "e16_rho_per_network_type"),
                 ]
@@ -2665,22 +2757,22 @@ def plot_e16_single_removal(input_dir: Path, output_dir: Path) -> Optional[Path]
                     (ranking_per_sector_figure(
                         _one, ANALYTICAL_SECTOR_SPECS,
                         title=f"{_lbl} (n={{n}}): per-sector ranking accuracy "
-                              "vs analytical shed"),
+                              f"vs analytical shed — {SINGLE_REMOVAL_HINT}"),
                      "e16_ranking_per_sector"),
                     (ranking_per_sector_figure(
                         _one, MC_SECTOR_SPECS,
                         title=f"{_lbl} (n={{n}}): per-sector ranking accuracy "
-                              "vs MC actual impact"),
+                              f"vs MC actual impact — {RQMC_HINT}"),
                      "e16_ranking_per_sector_mc"),
                     (ranking_per_sector_delta_figure(
                         _one, ANALYTICAL_SECTOR_SPECS, MC_SECTOR_SPECS,
                         title=f"{_lbl} (n={{n}}): per-sector ranking accuracy "
-                              "Δ (MC − analytical)"),
+                              "Δ (RQMC − single-removal)"),
                      "e16_ranking_per_sector_delta"),
                     (spearman_per_sector_delta_figure(
                         _one, ANALYTICAL_SECTOR_SPECS, MC_SECTOR_SPECS,
                         title=f"{_lbl} (n={{n}}): per-sector Spearman ρ "
-                              "Δ (MC − analytical)"),
+                              "Δ (RQMC − single-removal)"),
                      "e16_rho_per_sector_delta"),
                 ]
                 for _f, _slug_name in _ps:
@@ -2748,37 +2840,50 @@ def plot_e16_single_removal(input_dir: Path, output_dir: Path) -> Optional[Path]
 
         # Ceiling: how well does the analytical shed itself predict MC?
         if sub_ceil is not None and not sub_ceil.empty:
-            c = sub_ceil.sort_values("rho_shed_vs_mc", ascending=True)
-            err_hi = (c["ci_hi"] - c["rho_shed_vs_mc"]).clip(lower=0)
-            err_lo = (c["rho_shed_vs_mc"] - c["ci_lo"]).clip(lower=0)
-            fig2 = go.Figure(go.Bar(
-                y=[pretty_scenario(s) for s in c["scenario"]],
-                x=c["rho_shed_vs_mc"], orientation="h",
-                error_x=dict(type="data", symmetric=False,
-                             array=err_hi, arrayminus=err_lo,
-                             thickness=1.2, width=4, color=pub_style.MUTED_COLOR),
-                marker=pub_style.bar_marker("#00897b"),
-                text=[f"ρ={v:+.2f}" for v in c["rho_shed_vs_mc"]],
-                textposition="outside", cliponaxis=False,
-                hovertemplate=("<b>%{y}</b><br>ρ = %{x:+.3f}"
-                               "<br>n = %{customdata[0]}<extra></extra>"),
-                customdata=np.c_[c["n"].values],
-                showlegend=False,
-            ))
-            pub_style.apply_theme(
-                fig2,
-                title=(
-                    "ρ between N-1 shed and MC"
-                    + _title_suffix(class_label)
-                ),
-                height=pub_style.hbar_height(len(c)),
-                width=pub_style.BAR_FIG_WIDTH, font_bump=6, no_legend=True,
-            )
-            fig2.update_xaxes(title="Spearman ρ", range=[0, 1.0])
-            fig2.update_yaxes(title="")
-            figs.append(fig2)
-            titles.append(f"Ceiling ρ{_title_suffix(class_label)}")
-            slugs.append(_slug("e16_ceiling_rho", class_label))
+            for _conn in ([False, True]
+                          if "rho_shed_conn_vs_mc" in sub_ceil.columns
+                          else [False]):
+                rho_col = "rho_shed_conn_vs_mc" if _conn else "rho_shed_vs_mc"
+                lo_col, hi_col = (("ci_lo_conn", "ci_hi_conn") if _conn
+                                  else ("ci_lo", "ci_hi"))
+                n_col = "n_conn" if _conn else "n"
+                _v = e16_shed_view(_conn)
+                c = sub_ceil.dropna(subset=[rho_col]).sort_values(
+                    rho_col, ascending=True)
+                if c.empty:
+                    continue
+                err_hi = (c[hi_col] - c[rho_col]).clip(lower=0)
+                err_lo = (c[rho_col] - c[lo_col]).clip(lower=0)
+                fig2 = go.Figure(go.Bar(
+                    y=[pretty_scenario(s) for s in c["scenario"]],
+                    x=c[rho_col], orientation="h",
+                    error_x=dict(type="data", symmetric=False,
+                                 array=err_hi, arrayminus=err_lo,
+                                 thickness=1.2, width=4,
+                                 color=pub_style.MUTED_COLOR),
+                    marker=pub_style.bar_marker("#00897b"),
+                    text=[f"ρ={v:+.2f}" for v in c[rho_col]],
+                    textposition="outside", cliponaxis=False,
+                    hovertemplate=("<b>%{y}</b><br>ρ = %{x:+.3f}"
+                                   "<br>n = %{customdata[0]}<extra></extra>"),
+                    customdata=np.c_[c[n_col].values],
+                    showlegend=False,
+                ))
+                label = "N-1 connected-load shed" if _conn else "N-1 shed"
+                pub_style.apply_theme(
+                    fig2,
+                    title=(f"ρ between {label} and RQMC actual"
+                           + _title_suffix(class_label)),
+                    height=pub_style.hbar_height(len(c)),
+                    width=pub_style.BAR_FIG_WIDTH, font_bump=6, no_legend=True,
+                )
+                fig2.update_xaxes(title="Spearman ρ", range=[0, 1.0])
+                fig2.update_yaxes(title="")
+                figs.append(fig2)
+                titles.append(
+                    f"Ceiling ρ vs {_v['label']}{_title_suffix(class_label)}")
+                slugs.append(
+                    _slug(f"e16_ceiling_rho{_v['slug']}", class_label))
 
         return pivot_shed.index if z.size else None
 
@@ -2812,11 +2917,16 @@ def plot_e16_single_removal(input_dir: Path, output_dir: Path) -> Optional[Path]
         # "Ceiling ρ" bars, but with all strategies on one shared density
         # axis so they can be compared directly.
         if not ceil.empty:
-            comb = _e16_ceiling_rho_combined(ceil)
-            if comb.data:
-                figs.append(comb)
-                titles.append("Ceiling ρ — all strategies")
-                slugs.append("e16_ceiling_rho_combined")
+            for _conn in ([False, True]
+                          if "rho_shed_conn_vs_mc" in ceil.columns
+                          else [False]):
+                _v = e16_shed_view(_conn)
+                comb = _e16_ceiling_rho_combined(ceil, conn=_conn)
+                if comb.data:
+                    figs.append(comb)
+                    titles.append(
+                        f"Ceiling ρ vs {_v['label']} — all strategies")
+                    slugs.append(f"e16_ceiling_rho{_v['slug']}_combined")
         # Concatenate the per-class orders so the per-scenario bars below
         # still iterate every scenario in a stable, class-grouped order.
         if seen_orders:
@@ -2828,12 +2938,18 @@ def plot_e16_single_removal(input_dir: Path, output_dir: Path) -> Optional[Path]
     # the per-sector ρ view is always available, regardless of family.
     # Order matches the cross-scenario figures above (baseline block first,
     # per-family blocks in mixed runs).
+    bar_views = [False, True] if e16_has_conn(df) else [False]
     for scenario in scenario_order_for_bars:
-        bar = _e16_rho_per_sector_bar(df, scenario)
-        if bar.data:
-            figs.append(bar)
-            titles.append(f"{pretty_scenario(scenario)} — ρ vs shed, per sector")
-            slugs.append(f"e16_{scenario}_rho_vs_shed_per_sector")
+        for _conn in bar_views:
+            _v = e16_shed_view(_conn)
+            bar = _e16_rho_per_sector_bar(df, scenario, conn=_conn)
+            if bar.data:
+                figs.append(bar)
+                titles.append(
+                    f"{pretty_scenario(scenario)} — ρ vs {_v['label']}, "
+                    "per sector")
+                slugs.append(
+                    f"e16_{scenario}_rho_vs_shed{_v['slug']}_per_sector")
 
     # ── Per-scenario raw scatter + top-K overlap (only if the
     #    refactored experiment emitted merged CSVs) ────────────────────────

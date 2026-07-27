@@ -905,6 +905,16 @@ def _e16_join_id(cp_id, cp_type) -> str:
     return cp_id_str
 
 
+#: Shed columns carried through the E16 join. The ``_conn`` twins hold the
+#: curtailment of loads that stay *connected* after the removal — the part
+#: dispatch (and therefore CP capacity) can influence, as opposed to the
+#: topologically islanded nameplate that dominates the plain columns. They
+#: are absent from legacy shed CSVs, so every consumer must tolerate that.
+_E16_SHED_COLS = ["total_shed", "power_shed", "heat_shed", "gas_shed"]
+E16_CONN_SUFFIX = "_conn"
+_E16_SHED_COLS_CONN = [c + E16_CONN_SUFFIX for c in _E16_SHED_COLS]
+
+
 def _load_shed_csv(shed_csv: Path) -> pd.DataFrame:
     """Load a single-removal shed CSV, baseline-subtracted.
 
@@ -917,7 +927,7 @@ def _load_shed_csv(shed_csv: Path) -> pd.DataFrame:
     subtraction are solver noise — clipped to 0.
     """
     shed = pd.read_csv(shed_csv)
-    shed_cols = ["total_shed", "power_shed", "heat_shed", "gas_shed"]
+    shed_cols = _E16_SHED_COLS + _E16_SHED_COLS_CONN
     base_rows = shed[shed["cp_id"] == "_baseline_"]
     if not base_rows.empty:
         for col in shed_cols:
@@ -966,7 +976,9 @@ def _e16_merge_one(art: "ScenarioArtefacts", shed_csv: Path) -> pd.DataFrame:
     df["_join_cp_id"] = df.apply(
         lambda r: _e16_join_id(r["cp_id"], r.get("cp_type", "")), axis=1
     )
-    keep = ["cp_id", "kind", "total_shed", "power_shed", "heat_shed", "gas_shed"]
+    keep = ["cp_id", "kind"] + [
+        c for c in _E16_SHED_COLS + _E16_SHED_COLS_CONN if c in shed.columns
+    ]
     return df.merge(
         shed[keep], left_on="_join_cp_id", right_on="cp_id", how="inner",
         suffixes=("", "_shed"),
@@ -1013,14 +1025,13 @@ def experiment_e16_single_removal_validation(
     out_dir.mkdir(exist_ok=True, parents=True)
     if shed_dir is None:
         shed_dir = out_dir.parent / "single_removal_shed"
-    # Default to the canonical 10-metric set (kept in sync with the
-    # cp_cn_evaluation figures) plus the carrier-matched per-sector
-    # predictors — the composite mixes incomparable per-carrier scales, so
-    # each carrier's own predictor is evaluated alongside it. Override with
-    # the ``metrics`` argument when probing a one-off subset.
-    metrics = metrics or (
-        list(_ec.CORE_METRIC_COLS) + list(_ec.MATCHED_METRIC_COLS)
-    )
+    # The canonical 10-metric set, kept in sync with the cp_cn_evaluation
+    # figures. The carrier-matched per-sector predictors (predicted_power /
+    # _heat / _gas) are deliberately excluded: each is defined only on its own
+    # carrier's slice, so on the per-sector figures it is one bar plus four
+    # blanks and cannot be compared row-wise against a general predictor.
+    # Override with the ``metrics`` argument when probing a one-off subset.
+    metrics = metrics or list(_ec.CORE_METRIC_COLS)
 
     rows: List[dict] = []
     ceiling_rows: List[dict] = []
@@ -1046,12 +1057,32 @@ def experiment_e16_single_removal_validation(
                     merged.loc[cmask, "total_shed"],
                     merged.loc[cmask, "actual_total"],
                 )
-                ceiling_rows.append({
+                ceil_row = {
                     "scenario": art.label,
                     "rho_shed_vs_mc": rho, "p_shed_vs_mc": p,
                     "ci_lo": lo, "ci_hi": hi,
                     "n": int(cmask.sum()),
-                })
+                }
+                # Connected-load twin: the same ceiling measured against the
+                # recoverable shed only. The plain number is dominated by the
+                # islanded nameplate, which is CP-invariant and therefore
+                # inflates the agreement for reasons unrelated to the metric.
+                conn_col = "total_shed" + E16_CONN_SUFFIX
+                if conn_col in merged.columns:
+                    cmask_c = cmask & merged[conn_col].notna()
+                    if (cmask_c.sum() >= 3
+                            and merged.loc[cmask_c, conn_col].nunique() >= 2):
+                        rho_c, p_c, lo_c, hi_c = _spearman_with_ci(
+                            merged.loc[cmask_c, conn_col],
+                            merged.loc[cmask_c, "actual_total"],
+                        )
+                        ceil_row.update({
+                            "rho_shed_conn_vs_mc": rho_c,
+                            "p_shed_conn_vs_mc": p_c,
+                            "ci_lo_conn": lo_c, "ci_hi_conn": hi_c,
+                            "n_conn": int(cmask_c.sum()),
+                        })
+                ceiling_rows.append(ceil_row)
 
         # Full-surface ceiling: the merge above is an inner join on df_eval,
         # so score-less child targets (generation outages) never reach it.
@@ -1100,13 +1131,24 @@ def experiment_e16_single_removal_validation(
         # Each per-carrier ρ is conditioned on that carrier's shed being
         # non-zero — otherwise a component that never affects (say) heat
         # would drag every metric's heat-ρ toward zero.
-        sector_specs = [
-            ("total", "total_shed", None),
-            ("multi", "total_shed", "cp"),
-            ("power", "power_shed", "branch"),
-            ("heat",  "heat_shed",  "branch"),
-            ("gas",   "gas_shed",   "branch"),
-        ]
+        def _sector_specs(suffix: str):
+            return [
+                ("total", "total_shed" + suffix, None),
+                ("multi", "total_shed" + suffix, "cp"),
+                ("power", "power_shed" + suffix, "branch"),
+                ("heat",  "heat_shed" + suffix,  "branch"),
+                ("gas",   "gas_shed" + suffix,   "branch"),
+            ]
+
+        # Both shed views: the plain columns (which include the islanded
+        # nameplate) and, when the sweep recorded them, the connected-load
+        # columns. Result keys are suffixed the same way so a plot can pick
+        # a view by column name.
+        views = [""]
+        if all(c + E16_CONN_SUFFIX in merged.columns
+               for c in ("total_shed", "power_shed", "heat_shed", "gas_shed")):
+            views.append(E16_CONN_SUFFIX)
+
         # Carrier-rank pooled frame: within-carrier percentile ranks pooled
         # across carriers. The de-confounded "overall" reference — pooling
         # *raw* sheds across carriers flips ρ negative (Simpson: CP rows +
@@ -1117,9 +1159,17 @@ def experiment_e16_single_removal_validation(
             merged["kind"] == "branch" if "kind" in merged.columns
             else pd.Series(True, index=merged.index)
         )
-        ranked_pool = _ec.carrier_rank_pooled(
-            merged, ["power_shed", "heat_shed", "gas_shed"], branch_mask
-        )
+        _member = [_ec.carrier_member_mask(merged, t)
+                   for t in _ec.CARRIER_TAG_ORDER]
+        ranked_pools = {
+            sfx: _ec.carrier_rank_pooled(
+                merged,
+                [f"power_shed{sfx}", f"heat_shed{sfx}", f"gas_shed{sfx}"],
+                branch_mask,
+                member_masks=_member,
+            )
+            for sfx in views
+        }
 
         # Cross-scenario CP pool: CP rows with within-scenario percentile
         # ranks of both references, so the tiny per-scenario CP population
@@ -1145,69 +1195,77 @@ def experiment_e16_single_removal_validation(
             if len(sub_base) < 3:
                 continue
             row: dict = {"scenario": art.label, "metric": m, "n": int(len(sub_base))}
-            for tag, col, kind_filter in sector_specs:
-                rho_key, p_key = f"rho_vs_{tag}_shed", f"p_vs_{tag}_shed"
-                lo_key, hi_key, n_key = f"ci_lo_{tag}_shed", f"ci_hi_{tag}_shed", f"n_{tag}"
-                if col not in sub_base.columns:
-                    row[rho_key] = row[p_key] = row[lo_key] = row[hi_key] = float("nan")
-                    row[n_key] = 0
-                    continue
-                sub = sub_base
-                if kind_filter == "branch" and "kind" in sub.columns:
-                    sub = sub[sub["kind"] == "branch"]
-                elif kind_filter == "cp" and "kind" in sub.columns:
-                    sub = sub[sub["kind"] != "branch"]
-                # Drop NaN and below-noise-floor values for per-carrier
-                # slices (``> SHED_EPS``, not ``> 0`` — MIPGap-level sheds
-                # are solver noise and their inclusion inflates carrier-
-                # aware predictors; see eval_common.SHED_EPS). Keep all
-                # rows for the "total" view so it can be compared 1-to-1
-                # with the rest of the eval pipeline.
-                if tag != "total":
-                    sub = sub[sub[col].notna() & (sub[col] > _ec.SHED_EPS)]
-                else:
-                    sub = sub[sub[col].notna()]
-                if len(sub) < 3 or sub[m].nunique() < 2 or sub[col].nunique() < 2:
-                    row[rho_key] = row[p_key] = row[lo_key] = row[hi_key] = float("nan")
+            for sfx in views:
+                for tag, col, kind_filter in _sector_specs(sfx):
+                    rho_key = f"rho_vs_{tag}_shed{sfx}"
+                    p_key = f"p_vs_{tag}_shed{sfx}"
+                    lo_key, hi_key = f"ci_lo_{tag}_shed{sfx}", f"ci_hi_{tag}_shed{sfx}"
+                    n_key = f"n_{tag}{sfx}"
+                    if col not in sub_base.columns:
+                        row[rho_key] = row[p_key] = row[lo_key] = row[hi_key] = float("nan")
+                        row[n_key] = 0
+                        continue
+                    sub = sub_base
+                    if kind_filter == "branch" and "kind" in sub.columns:
+                        sub = sub[sub["kind"] == "branch"]
+                    elif kind_filter == "cp" and "kind" in sub.columns:
+                        sub = sub[sub["kind"] != "branch"]
+                    # Per-carrier slices select on component *membership*,
+                    # not on the outcome being non-zero — see
+                    # eval_common.CARRIER_MEMBER_TYPES. Values are clipped at
+                    # 0 (sub-MIPGap negatives are solver noise) instead of
+                    # thresholded, so the analytical and RQMC slices are the
+                    # same population and their difference is interpretable.
+                    if tag in _ec.CARRIER_MEMBER_TYPES:
+                        sub = sub[_ec.carrier_member_mask(sub, tag)
+                                  & sub[col].notna()]
+                        sub = sub.assign(**{col: sub[col].clip(lower=0.0)})
+                    else:
+                        sub = sub[sub[col].notna()]
+                    if len(sub) < 3 or sub[m].nunique() < 2 or sub[col].nunique() < 2:
+                        row[rho_key] = row[p_key] = row[lo_key] = row[hi_key] = float("nan")
+                        row[n_key] = int(len(sub))
+                        continue
+                    rho, p, lo, hi = _spearman_with_ci(sub[m], sub[col])
+                    row[rho_key] = rho
+                    row[p_key] = p
+                    row[lo_key] = lo
+                    row[hi_key] = hi
                     row[n_key] = int(len(sub))
-                    continue
-                rho, p, lo, hi = _spearman_with_ci(sub[m], sub[col])
-                row[rho_key] = rho
-                row[p_key] = p
-                row[lo_key] = lo
-                row[hi_key] = hi
-                row[n_key] = int(len(sub))
-                # Incremental ranking value beyond the 0-hop local-demand
-                # baseline: partial ρ | self_score. A metric can post a high
-                # raw per-carrier ρ purely by proxying demand mass — this
-                # column is what structure/physics adds on top.
-                if (kind_filter == "branch" and m != "self_score"
-                        and "self_score" in sub.columns and len(sub) >= 4):
-                    prho, pp = _ec.partial_spearman(
-                        sub[m], sub[col], sub["self_score"]
-                    )
-                    row[f"partial_rho_vs_{tag}_shed"] = prho
-                    row[f"partial_p_vs_{tag}_shed"] = pp
+                    # Incremental ranking value beyond the 0-hop local-demand
+                    # baseline: partial ρ | self_score. A metric can post a high
+                    # raw per-carrier ρ purely by proxying demand mass — this
+                    # column is what structure/physics adds on top.
+                    if (kind_filter == "branch" and m != "self_score"
+                            and "self_score" in sub.columns and len(sub) >= 4):
+                        prho, pp = _ec.partial_spearman(
+                            sub[m], sub[col], sub["self_score"]
+                        )
+                        row[f"partial_rho_vs_{tag}_shed{sfx}"] = prho
+                        row[f"partial_p_vs_{tag}_shed{sfx}"] = pp
 
-            # Carrier-rank pooled slice (tag "ranked"): the legitimate
-            # overall number, same column naming scheme as the raw sectors.
-            rsub = ranked_pool[ranked_pool[m].notna()] if m in ranked_pool.columns \
-                else ranked_pool.iloc[0:0]
-            if len(rsub) >= 3 and rsub[m].nunique() >= 2:
-                rho, p, lo, hi = _spearman_with_ci(rsub[m], rsub["_ranked_ref"])
-                row["rho_vs_ranked_shed"] = rho
-                row["p_vs_ranked_shed"] = p
-                row["ci_lo_ranked_shed"] = lo
-                row["ci_hi_ranked_shed"] = hi
-            else:
-                row["rho_vs_ranked_shed"] = row["p_vs_ranked_shed"] = float("nan")
-                row["ci_lo_ranked_shed"] = row["ci_hi_ranked_shed"] = float("nan")
-            row["n_ranked"] = int(len(rsub))
-            # Back-compat aliases so existing plot code keeps working.
-            row["rho_vs_shed"] = row["rho_vs_total_shed"]
-            row["p_vs_shed"] = row["p_vs_total_shed"]
-            row["ci_lo_shed"] = row["ci_lo_total_shed"]
-            row["ci_hi_shed"] = row["ci_hi_total_shed"]
+                # Carrier-rank pooled slice (tag "ranked"): the legitimate
+                # overall number, same column naming scheme as the raw sectors.
+                ranked_pool = ranked_pools[sfx]
+                rsub = (ranked_pool[ranked_pool[m].notna()]
+                        if m in ranked_pool.columns else ranked_pool.iloc[0:0])
+                if len(rsub) >= 3 and rsub[m].nunique() >= 2:
+                    rho, p, lo, hi = _spearman_with_ci(rsub[m], rsub["_ranked_ref"])
+                    row[f"rho_vs_ranked_shed{sfx}"] = rho
+                    row[f"p_vs_ranked_shed{sfx}"] = p
+                    row[f"ci_lo_ranked_shed{sfx}"] = lo
+                    row[f"ci_hi_ranked_shed{sfx}"] = hi
+                else:
+                    row[f"rho_vs_ranked_shed{sfx}"] = float("nan")
+                    row[f"p_vs_ranked_shed{sfx}"] = float("nan")
+                    row[f"ci_lo_ranked_shed{sfx}"] = float("nan")
+                    row[f"ci_hi_ranked_shed{sfx}"] = float("nan")
+                row[f"n_ranked{sfx}"] = int(len(rsub))
+                # Back-compat aliases so existing plot code keeps working.
+                row[f"rho_vs_shed{sfx}"] = row[f"rho_vs_total_shed{sfx}"]
+                row[f"p_vs_shed{sfx}"] = row[f"p_vs_total_shed{sfx}"]
+                row[f"ci_lo_shed{sfx}"] = row[f"ci_lo_total_shed{sfx}"]
+                row[f"ci_hi_shed{sfx}"] = row[f"ci_hi_total_shed{sfx}"]
             # Also compare to MC for cross-reference. ``actual_total`` may not
             # exist if df_eval came from a non-MC source — guard either way.
             if "actual_total" in sub_base.columns:
