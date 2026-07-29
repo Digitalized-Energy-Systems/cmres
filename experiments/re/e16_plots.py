@@ -1,7 +1,9 @@
 """Thin CLI wrapper around the canonical E16 pipeline.
 
 For each grid with both
-  - ``<input-dir>/MoneeResilienceExperiment-<grid>/network.p``  (post-solve net)
+  - ``<input-dir>/MoneeResilienceExperiment-<grid>/network_solved.p`` (baseline
+    operating point; ``baseline_operating_point.py`` writes it — ``network.p``
+    is the *unsolved* build and must not be used for metrics)
   - ``<shed-dir>/single_removal_shed_<grid>.csv``               (shed ground truth)
 
 this script:
@@ -29,7 +31,6 @@ import traceback
 from pathlib import Path
 from typing import List
 
-import dill
 import pandas
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -59,8 +60,7 @@ def _load_grid_dfs(grid: str, input_dir: Path):
     exp = input_dir / f"MoneeResilienceExperiment-{grid}"
     perf_path = exp / "performance.csv"
     fail_path = exp / "failure.csv"
-    net_path = exp / "network.p"
-    for p in (perf_path, fail_path, net_path):
+    for p in (perf_path, fail_path):
         if not p.exists():
             raise FileNotFoundError(p)
 
@@ -72,8 +72,11 @@ def _load_grid_dfs(grid: str, input_dir: Path):
     fail_df["experiment"] = str(exp)
     fail_df["network_type"] = grid
 
-    with open(net_path, "rb") as f:
-        monee_net = dill.load(f)
+    # network_solved.p, not network.p — the metric path downstream needs an
+    # operating point (see baseline_operating_point).
+    from baseline_operating_point import load_operating_point
+
+    monee_net = load_operating_point(exp)
 
     return perf_df, fail_df, monee_net
 

@@ -971,8 +971,13 @@ def _pooled_mean_shed_by_carrier_row(
     pub_style.apply_theme(
         fig, title=("Mean per-component load shed by carrier, per density and "
                     f"strategy — {SINGLE_REMOVAL_HINT}"),
-        width=1180, height=430, legend_top=True, font_bump=2)
+        width=1180, height=430, legend_top=True, font_bump=8)
     pub_style.clear_subplot_titles(fig)
+    # Same bottom-margin correction as the E1 row twin: apply_theme sizes the
+    # bottom margin for the unbumped axis typography, so at this bump the
+    # x-axis title runs off the canvas unless margin and height grow together.
+    fig.update_layout(height=(fig.layout.height or 430) + 44,
+                      margin=dict(b=(fig.layout.margin.b or 64) + 44))
     # One value scale across the panels: the row layout exists to compare a
     # density across strategies, which per-panel autoranging defeats.
     all_grids = [g for _f, subset in fams for g in subset]

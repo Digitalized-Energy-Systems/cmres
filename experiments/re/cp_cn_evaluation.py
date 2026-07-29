@@ -6,7 +6,6 @@ import traceback
 from pathlib import PurePath, Path
 from statistics import mean
 
-import dill
 import cmres.evaluation.evaluation as eval
 from monee import Network, run_energy_flow, run_energy_flow_optimization, PyomoSolver
 from monee.model.core import Node
@@ -478,10 +477,14 @@ def load_dfs(folder_id):
         network_type = experiment_desc_name.split("-", 1)[1]
 
         if network_type not in net_type_to_net:
-            with open(Path(experiment_desc) / Path("network.p"), "rb") as network_file:
-                monee_net = dill.load(network_file)
-                print(monee_net.statistics())
-                net_type_to_net[network_type] = monee_net
+            # network_solved.p, not network.p: the raw dump has no operating
+            # point (see baseline_operating_point), and the criticality
+            # metrics silently compute on the initial guesses if given it.
+            from baseline_operating_point import load_operating_point
+
+            monee_net = load_operating_point(Path(experiment_desc))
+            print(monee_net.statistics())
+            net_type_to_net[network_type] = monee_net
 
         # failure
         failure_path = Path(experiment_desc) / Path("failure.csv")
@@ -2172,8 +2175,13 @@ def _pooled_resilience_row(pooled, classes, view=None):
         fig,
         title=(f"Mean per-carrier {view['loss']}, per density and strategy "
                f"— {RQMC_HINT}"),
-        width=1180, height=430, legend_top=True)
+        width=1180, height=430, legend_top=True, font_bump=6)
     pub_style.clear_subplot_titles(fig)
+    # apply_theme's bottom margin is sized for the unbumped axis typography;
+    # at this bump the x-axis title falls off the canvas. Grow the margin and
+    # the height together so the panels keep their size.
+    fig.update_layout(height=(fig.layout.height or 430) + 44,
+                      margin=dict(b=(fig.layout.margin.b or 64) + 44))
     # One value scale across the panels: the whole point of the row layout is
     # reading a density across strategies, which per-panel autoranging breaks
     # (a shorter bar can render longer than a bigger one next to it).
@@ -2557,7 +2565,7 @@ def pooled_resilience_grouped_capacity(
                f"({RQMC_HINT}) —<br>"
                "solid: absolute; lightened: × installed-capacity weight "
                "(sector capacity ÷ leanest grid)"),
-        width=1180, height=520, legend_top=True,
+        width=1180, height=520, legend_top=True, font_bump=6,
     )
     # One shared value scale so bar lengths compare across the panels.
     fig.update_xaxes(range=[0, x_max * 1.06])
@@ -3237,7 +3245,7 @@ def cross_carrier_density_matrix(impact_df: pandas.DataFrame, output_dir: str,
         fig,
         title=(f"Cross-sector {harm_label} vs coupling points<br>"
                "rows: failed sector · columns: impacted sector"),
-        width=1180, height=780, font_bump=1, legend_top=True,
+        width=1180, height=780, font_bump=7, legend_top=True,
     )
     # Axis dressing after apply_theme: the theme broadcast resets zerolines
     # and would otherwise override these.
@@ -3259,13 +3267,13 @@ def cross_carrier_density_matrix(impact_df: pandas.DataFrame, output_dir: str,
             textangle=-90, xref="paper", x=-0.045,
             yref="paper", y=(dom[0] + dom[1]) / 2,
             xanchor="center", yanchor="middle", showarrow=False,
-            font=dict(size=15),
+            font=dict(size=21),
         )
     fig.add_annotation(
         text=f"Excess {harm_label} vs no-CP grid (MW)",
         textangle=-90, xref="paper", x=-0.085, yref="paper", y=0.5,
         xanchor="center", yanchor="middle", showarrow=False,
-        font=dict(size=17, color=pub_style.MUTED_COLOR),
+        font=dict(size=23, color=pub_style.MUTED_COLOR),
     )
     notes = []
     if "control" in fams:
@@ -3282,7 +3290,7 @@ def cross_carrier_density_matrix(impact_df: pandas.DataFrame, output_dir: str,
             text=" · ".join(notes),
             xref="paper", x=1.0, xanchor="right",
             yref="paper", y=-0.075, yanchor="top", showarrow=False,
-            font=dict(size=12, color=pub_style.MUTED_COLOR),
+            font=dict(size=18, color=pub_style.MUTED_COLOR),
         )
 
     Path(output_dir).mkdir(exist_ok=True, parents=True)

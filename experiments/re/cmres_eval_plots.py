@@ -1557,8 +1557,14 @@ def _e16_sector_hbar(metric_labels: List[str], traces: list, *,
     pub_style.apply_theme(
         bar, title=title,
         height=pub_style.hbar_height(len(metric_labels), n_series),
-        width=pub_style.WIDE_BAR_FIG_WIDTH, font_bump=4, legend_top=True,
+        width=pub_style.WIDE_BAR_FIG_WIDTH, font_bump=16, legend_top=True,
     )
+    # The legend does not follow the bump all the way. At the bumped metric-label
+    # size the y-axis eats a third of the canvas, and past ~26 pt plotly wraps the
+    # top strip onto extra rows that ``apply_theme`` did not reserve height for —
+    # the plot area is squeezed instead. Widening the canvas would fix the wrap
+    # but cancels the bump, since this figure is printed at a fixed 0.49\linewidth.
+    bar.update_layout(legend=dict(font=dict(size=26)))
     bar.update_xaxes(title="Spearman ρ", range=[-1.10, 1.10])
     bar.update_yaxes(title="", autorange="reversed")
     return bar
@@ -2289,7 +2295,10 @@ def cp_pooled_across_scenarios_figure(merged_files: Sequence[Path]) -> go.Figure
     df = pd.DataFrame(recs)
     if "rho_shed" not in df.columns:
         return go.Figure()
-    df = df.sort_values("rho_shed", ascending=True, na_position="first")
+    # ``recs`` is built by iterating _E16_RANK_METRICS, so the frame already
+    # carries the canonical CORE_METRICS order — no ρ-sort here, so this axis
+    # reads the same top-to-bottom as the per-sector ρ bars, the ranking panels
+    # and the heatmap.
 
     fig = go.Figure()
     for key, label, color in [("shed", "vs single-removal shed", "#7e57c2"),
@@ -2321,7 +2330,7 @@ def cp_pooled_across_scenarios_figure(merged_files: Sequence[Path]) -> go.Figure
         width=pub_style.BAR_FIG_WIDTH, legend_top=True, font_bump=4,
     )
     fig.update_xaxes(title="Spearman ρ", range=[-1.05, 1.05])
-    fig.update_yaxes(title="")
+    fig.update_yaxes(title="", autorange="reversed")
     return fig
 
 

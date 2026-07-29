@@ -192,6 +192,62 @@ def _is_finite(v) -> bool:
         return False
 
 
+class UnsolvedNetworkError(RuntimeError):
+    """Raised when a network carries no operating point.
+
+    ``monee`` solvers write results back in place into ``Var.value``, so an
+    un-injected ``Var`` is indistinguishable from a solved one by type — it
+    just still holds its construction-time initial guess. ``_val`` returns
+    that guess, it is finite, and every downstream margin / PTDF / loading
+    term therefore computes silently on a constant. See
+    :func:`assert_solved_operating_point`.
+    """
+
+
+#: Branch attribute holding the operating-point flow, per carrier class name.
+_FLOW_ATTR_BY_CLASS = {
+    "GenericPowerBranch": "p_from_mw",
+    "GasPipe": "mass_flow_kgs",
+    "WaterPipe": "mass_flow_kgs",
+}
+
+
+def assert_solved_operating_point(monee_net, min_branches: int = 4) -> None:
+    """Raise :class:`UnsolvedNetworkError` unless *monee_net* has been solved.
+
+    The detector is degeneracy, not a magic number: on a solved grid the
+    branch flows of a carrier are essentially never all identical, whereas an
+    un-injected network reports each ``Var``'s initial guess — one constant
+    for every branch of the carrier (``p_from_mw`` and ``q_from_mvar`` both
+    ``1`` for power, ``mass_flow_kgs`` ``0.1`` for gas and water). Carriers
+    with fewer than *min_branches* branches are skipped, since a genuinely
+    uniform flow is possible on a tiny one.
+    """
+    degenerate = []
+    for cls_name, attr in _FLOW_ATTR_BY_CLASS.items():
+        flows = [
+            _val(getattr(b.model, attr), default=None)
+            for b in monee_net.branches
+            if type(b.model).__name__ == cls_name and hasattr(b.model, attr)
+        ]
+        flows = [f for f in flows if _is_finite(f)]
+        if len(flows) < min_branches:
+            continue
+        if len(set(np.round(flows, 9))) == 1:
+            degenerate.append(f"{cls_name}.{attr} = {flows[0]!r} on all {len(flows)}")
+    if degenerate:
+        raise UnsolvedNetworkError(
+            "network has no operating point — every branch flow of a carrier is "
+            "identical, which means the model variables still hold their initial "
+            "guesses: " + "; ".join(degenerate) + ". Metrics computed from this "
+            "network would silently use a constant flow, collapsing every branch "
+            "margin onto MIN_MARGIN and stripping all loading information from "
+            "the PTDF-stress and device-local scores. Solve the base case first "
+            "(see experiments/re/baseline_operating_point.py) and pass the "
+            "solved network."
+        )
+
+
 def _first_attr(obj, names: List[str], default=None):
     """Return the first attribute on *obj* whose value is finite.
 
@@ -2569,6 +2625,10 @@ def _row_from_detail(
 
 
 def mes_cp_metric(monee_net, cfg: CPMetricConfig = CPMetricConfig()):
+    # The stress, stress-BC and device-local scores read the operating-point
+    # flow; on an unsolved network that read silently returns a constant.
+    assert_solved_operating_point(monee_net)
+
     fail_prob = cfg.CP_FAIL_PROB or DEFAULT_FAIL_PROB
 
     # topology — three variants, all emitted in parallel so downstream eval

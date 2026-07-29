@@ -200,8 +200,26 @@ def run_experiment(grid_name: str, shard: int = 0, n_shards: int = 1):
         # dill, not stdlib pickle: monee node models carry local lambdas
         # (e.g. Bus.va_degree PostProcess) that pickle can't serialize —
         # stdlib pickle leaves a 0-byte file. Readers must load with dill.
+        #
+        # This is the *unsolved* net: every model variable still holds its
+        # construction-time initial guess. It is fine for topology and
+        # nameplate consumers, but the criticality metrics need an operating
+        # point, so the solved twin is written alongside it. Best-effort — a
+        # failed baseline solve must not take down the campaign.
         with (out_dir / "network.p").open("wb") as fp:
             dill.dump(net, fp)
+        try:
+            from baseline_operating_point import write_baseline_network
+
+            if write_baseline_network(grid_name, out_dir) is None:
+                log.warning(
+                    "baseline operating point unavailable for %s; criticality "
+                    "metrics will refuse to run until it is regenerated with "
+                    "baseline_operating_point.py",
+                    grid_name,
+                )
+        except Exception:
+            log.exception("baseline operating-point solve raised; continuing")
 
     # ── RQMC setup ───────────────────────────────────────────────────────────
     registry = ComponentRegistry(net)
