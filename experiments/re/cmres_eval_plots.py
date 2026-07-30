@@ -1509,6 +1509,14 @@ def _e16_scatter(merged: pd.DataFrame, metric: str, scenario: str) -> go.Figure:
     return fig
 
 
+# Legend-only shortening of the sector names. Plotly sizes the horizontal legend
+# strip in uniform columns off the widest entry, so at this figure's bumped legend
+# font the full "Overall (carrier-rank)" is what breaks the strip onto one item per
+# row. The caption defines the term, so the parenthetical is redundant here. Legend
+# text only — ``SECTOR_PRETTY`` is shared with the ranking panels and stays as is.
+_HBAR_LEGEND_NAME = {"ranked": "Overall"}
+
+
 def _e16_sector_hbar(metric_labels: List[str], traces: list, *,
                      title: str) -> go.Figure:
     """Render a horizontal grouped per-sector ρ bar in the shared scare style.
@@ -1538,14 +1546,15 @@ def _e16_sector_hbar(metric_labels: List[str], traces: list, *,
                  thickness=1.2, width=4, color=pub_style.MUTED_COLOR)
             if err_hi is not None else None
         )
+        pretty = pub_style.SECTOR_PRETTY.get(tag, tag)
         bar.add_trace(go.Bar(
-            name=pub_style.SECTOR_PRETTY.get(tag, tag),
+            name=_HBAR_LEGEND_NAME.get(tag, pretty),
             y=metric_labels, x=rho, orientation="h",
             marker=pub_style.sector_marker(tag),
             error_x=err_x,
             customdata=np.c_[n_arr.values] if n_arr is not None else None,
             hovertemplate=(
-                f"<b>{pub_style.SECTOR_PRETTY.get(tag, tag)}</b><br>"
+                f"<b>{pretty}</b><br>"
                 "metric = %{y}<br>ρ = %{x:+.3f}<br>n = %{customdata[0]}<extra></extra>"
             ),
         ))
@@ -1554,17 +1563,29 @@ def _e16_sector_hbar(metric_labels: List[str], traces: list, *,
     bar.add_vline(x=0, line=dict(color="#444", width=1, dash="dot"))
     bar.update_layout(barmode="group")
     n_series = len(bar.data)
+    # ``apply_theme``'s ``fit_font`` shrinks a single-line title until it fits the
+    # canvas width, which at this title's length pins it near 21 pt however large
+    # ``font_bump`` is. Breaking before the experiment hint halves the longest line so
+    # the title can follow the bump; ``apply_theme`` reserves top margin per ``<br>``.
+    title = "<br>".join(title.rsplit(" — ", 1))
+    # ``hbar_height`` is sized for unbumped typography and caps at 720 px, which
+    # here leaves the bars as ~8 px slivers under a 33 pt metric label. Printed
+    # width is pinned at 0.49\linewidth, so height costs nothing but page space:
+    # take the per-row room the bumped labels need instead of the cap.
     pub_style.apply_theme(
         bar, title=title,
-        height=pub_style.hbar_height(len(metric_labels), n_series),
-        width=pub_style.WIDE_BAR_FIG_WIDTH, font_bump=16, legend_top=True,
+        height=150 + (18 * n_series + 16) * len(metric_labels),
+        width=pub_style.WIDE_BAR_FIG_WIDTH, font_bump=22, legend_top=True,
     )
-    # The legend does not follow the bump all the way. At the bumped metric-label
-    # size the y-axis eats a third of the canvas, and past ~26 pt plotly wraps the
-    # top strip onto extra rows that ``apply_theme`` did not reserve height for —
-    # the plot area is squeezed instead. Widening the canvas would fix the wrap
-    # but cancels the bump, since this figure is printed at a fixed 0.49\linewidth.
-    bar.update_layout(legend=dict(font=dict(size=26)))
+    # The legend does not follow the bump either, so pin it. At 33 pt the four-sector
+    # case (no CP rows) stays on a single horizontal row only because
+    # ``_HBAR_LEGEND_NAME`` shortens the widest entry; with the full sector names
+    # plotly's uniform columns collapse to one item per row. Five sectors still wrap,
+    # to a 2-column/3-row block — the column pitch is set by the widest entry, and
+    # "Electricity" is as wide as "Multi (CPs)", so shortening further does not help.
+    # No height correction: ``apply_theme``'s own reservation leaves the wrapped strip
+    # ~35 px short of its ideal, which costs a little plot height but never collides.
+    bar.update_layout(legend=dict(font=dict(size=33)))
     bar.update_xaxes(title="Spearman ρ", range=[-1.10, 1.10])
     bar.update_yaxes(title="", autorange="reversed")
     return bar

@@ -2112,7 +2112,11 @@ def cp_only_pooled_metric_comparison(
 
 _RES_SIZE_LABEL = {"no": "LV-no", "low": "LV-s", "mid": "LV-m",
                    "high": "LV-l", "xl": "LV-xl", "xxl": "LV-xxl"}
-_RES_FAMILY_ORDER = {"backup": 0, "loadbearing": 1, "decoupled": 2, "control": 3}
+# Panel order for the side-by-side row figures: each treatment immediately left
+# of its own control (backup ↔ no-reserve, loadbearing ↔ decoupled), so the pair
+# a reader is meant to contrast is adjacent. Deliberately *not*
+# eval_common.FAMILY_ORDER, which groups the two treatments first.
+_RES_FAMILY_ORDER = {"backup": 0, "control": 1, "loadbearing": 2, "decoupled": 3}
 _RES_CARRIER_TO_SECTOR = {"electricity": "power", "heat": "heat", "gas": "gas"}
 
 
@@ -3381,13 +3385,20 @@ def pooled_metric_comparison(pooled_df, output_dir, class_label: str = ""):
     # ── 1. Scatter panels (one per metric, colored by network type) ────────
     # Per-metric x-axis formula annotations — falls back to the metric
     # label when no special formula has been registered.
+    # These are the per-panel x-axis *formulas*; the panel title already carries
+    # the canonical eval_common.CORE_METRICS label. So they must describe the
+    # quantity, never restate a label and never leak a column name — the
+    # dissertation cites these figures, and a raw identifier or a third naming
+    # vocabulary in a published panel is a defect. Keep each under ~40 chars:
+    # the panel is 420 px wide. Notation follows the composite's definition
+    # (γ throughput, σ_s carrier stress, w_s carrier weights, BC_grp).
     _METRIC_FORMULAS = {
-        "predicted_score":          "τ · PTDF_stress · (1 + α·BC_phys) · adequacy",
-        "predicted_score_cp_aware": "CP-aware variant of predicted_score",
-        "predicted_score_balanced": "Balanced S1 + C1 + C2 + C3 composite",
-        "predicted_stress":         "PTDF stress (carrier-weighted)",
-        "topo_bc":                  "Phys. betweenness centrality",
-        "stress_bc":                "Stress-weighted betweenness centrality",
+        "predicted_score":          "γ · Σ w_s·σ_s · (1 + α·BC_grp) · adequacy",
+        "predicted_score_cp_aware": "as PTDF stress + phys. BC, CP-aware BC",
+        "predicted_score_balanced": "median-normalized stress + 3 corrections",
+        "predicted_stress":         "carrier-weighted Σ w_s · σ_s",
+        "topo_bc":                  "BC_grp (physical graph)",
+        "stress_bc":                "BC_grp, stress-weighted edges",
         "katz_score":               "Katz centrality (phys. graph)",
         "vitality_score":           "W(G) − W(G\\v) (phys. graph)",
         "local_score":              "loading · (1 + crit.nbrs) · n_carriers",

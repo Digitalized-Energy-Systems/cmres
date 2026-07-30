@@ -49,7 +49,11 @@ DEFAULT_DIR = Path("data/out/single_removal_shed")
 # label so the three strategies can sit in one row.
 _SIZE_LABEL = {"no": "LV-no", "low": "LV-s", "mid": "LV-m",
                "high": "LV-l", "xl": "LV-xl", "xxl": "LV-xxl"}
-_FAMILY_ORDER = {"backup": 0, "loadbearing": 1, "decoupled": 2, "control": 3}
+# Panel order for the row figure — treatment immediately left of its own control
+# (backup ↔ no-reserve, loadbearing ↔ decoupled) so the contrasted pair is
+# adjacent. Kept in step with cp_cn_evaluation._RES_FAMILY_ORDER, and
+# deliberately not eval_common.FAMILY_ORDER.
+_FAMILY_ORDER = {"backup": 0, "control": 1, "loadbearing": 2, "decoupled": 3}
 
 
 def _short_grid(grid: str) -> str:
